@@ -1,0 +1,20 @@
+adapter: workday
+
+listing:
+  item_href_contains: "/jobs/"
+  exclude_exact_urls: []
+  initial_wait_for: null
+  session_id: "job_miner_workday_session"
+  load_more:
+    enabled: false
+    max_clicks: 0
+    click_js: ""
+    wait_for_js: ""
+
+detail:
+  wait_for: "css:h1"
+  instruction: |
+    Extract exactly one job posting from this page.
+    Return valid JSON matching the schema.
+    Use null for missing scalar fields and [] for missing list fields.
+    Do not invent values.

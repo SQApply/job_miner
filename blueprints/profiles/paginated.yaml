@@ -1,0 +1,269 @@
+adapter: paginated
+
+listing:
+  item_href_contains: ""
+  detail_text_patterns:
+    - "learn more"
+    - "details"
+    - "view job"
+  exclude_exact_urls: []
+
+  initial_wait_for: |
+    js:() => {
+      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const visible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.display !== 'none' &&
+               style.visibility !== 'hidden' &&
+               rect.width > 0 &&
+               rect.height > 0;
+      };
+
+      const nodes = [...document.querySelectorAll('a, button, [role="button"], span, div, li')]
+        .filter(visible);
+
+      const hasDetailLink = nodes.some(el => {
+        const t = norm(el.innerText || el.textContent || el.value);
+        return t.includes('learn more') || t.includes('details') || t.includes('view job');
+      });
+
+      const numericPageCount = nodes.filter(el => /^\d+$/.test(norm(el.innerText || el.textContent || el.value))).length;
+
+      const bodyText = norm(document.body.innerText || '');
+      return hasDetailLink && numericPageCount >= 2 && bodyText.length > 300;
+    }
+
+  session_id: "job_miner_paginated_session"
+
+  load_more:
+    enabled: false
+    max_clicks: 0
+    click_js: ""
+    wait_for_js: ""
+
+  pagination:
+    enabled: true
+    type: "numbered"
+    max_turns: 250
+    stop_after_stable_rounds: 3
+
+    click_js: |
+      (() => {
+        const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+        const visible = (el) => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return style.display !== 'none' &&
+                 style.visibility !== 'hidden' &&
+                 rect.width > 0 &&
+                 rect.height > 0;
+        };
+
+        const toClickable = (el) => {
+          if (!el) return null;
+          if (el.matches('button, a, [role="button"]')) return el;
+          return el.querySelector('button, a, [role="button"]') || el;
+        };
+
+        const nodes = [...document.querySelectorAll('a, button, [role="button"], span, div, li')]
+          .filter(visible);
+
+        const textOf = (el) => norm(el.innerText || el.textContent || el.value);
+
+        // Try to detect currently active page
+        const activeEl = nodes.find(el => {
+          const cls = (el.className || '').toString().toLowerCase();
+          const aria = (el.getAttribute('aria-current') || '').toLowerCase();
+          return aria === 'page' || cls.includes('active') || cls.includes('current') || cls.includes('selected');
+        });
+
+        let activeNum = null;
+        if (activeEl) {
+          const directText = textOf(activeEl);
+          if (/^\d+$/.test(directText)) {
+            activeNum = parseInt(directText, 10);
+          } else {
+            const innerClickable = toClickable(activeEl);
+            const innerText = textOf(innerClickable);
+            if (/^\d+$/.test(innerText)) {
+              activeNum = parseInt(innerText, 10);
+            } else {
+              const dataPage = activeEl.getAttribute('data-page') || innerClickable?.getAttribute?.('data-page');
+              if (dataPage && /^\d+$/.test(dataPage)) {
+                activeNum = parseInt(dataPage, 10);
+              }
+            }
+          }
+        }
+
+        // Build numeric page candidates
+        const numericCandidates = nodes
+          .map(el => {
+            const clickable = toClickable(el);
+            const txt = textOf(clickable);
+            if (/^\d+$/.test(txt)) {
+              return { num: parseInt(txt, 10), el: clickable };
+            }
+
+            const dataPage = el.getAttribute('data-page') || clickable?.getAttribute?.('data-page');
+            if (dataPage && /^\d+$/.test(dataPage)) {
+              return { num: parseInt(dataPage, 10), el: clickable };
+            }
+
+            return null;
+          })
+          .filter(Boolean);
+
+        const uniqNums = [...new Set(numericCandidates.map(x => x.num))].sort((a, b) => a - b);
+
+        let target = null;
+
+        // Normal path: active page is known
+        if (activeNum !== null) {
+          const desired = uniqNums.find(n => n > activeNum);
+          if (desired !== undefined) {
+            target = numericCandidates.find(x => x.num === desired)?.el || null;
+          }
+        }
+
+        // Generic fallback: no active marker on initial load
+        // Assume this is initial state and click the second visible numeric page
+        if (!target && uniqNums.length >= 2) {
+          const first = uniqNums[0];
+          const second = uniqNums.find(n => n > first);
+          if (second !== undefined) {
+            target = numericCandidates.find(x => x.num === second)?.el || null;
+          }
+        }
+
+        // Final fallback: structural/data-next or text-next controls
+        if (!target) {
+          target =
+            document.querySelector('[data-next] button, [data-next], .pagination-next button, .pagination-next, .next button, .next') ||
+            nodes.find(el => {
+              const t = textOf(el);
+              return t === 'next' || t === '>' || t === '»' || t === '→';
+            }) ||
+            null;
+          target = toClickable(target);
+        }
+
+        window.__jm_prev_url = location.href;
+        window.__jm_prev_body_sig = (document.body.innerText || '').slice(0, 10000);
+
+        const firstDataNode = document.querySelector('[data-id], [data-job-id], [data-page]');
+        window.__jm_prev_first_data_id = firstDataNode
+          ? (firstDataNode.getAttribute('data-id') || firstDataNode.getAttribute('data-job-id') || firstDataNode.getAttribute('data-page'))
+          : null;
+
+        window.__jm_prev_active_num = activeNum;
+        window.__jm_clicked_pagination = !!target;
+
+        if (target) {
+          target.scrollIntoView({ behavior: 'instant', block: 'center' });
+          target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+          target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+          if (typeof target.click === 'function') target.click();
+        }
+      })();
+
+    wait_for_js: |
+      js:() => {
+        const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+        const visible = (el) => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return style.display !== 'none' &&
+                 style.visibility !== 'hidden' &&
+                 rect.width > 0 &&
+                 rect.height > 0;
+        };
+
+        const toClickable = (el) => {
+          if (!el) return null;
+          if (el.matches('button, a, [role="button"]')) return el;
+          return el.querySelector('button, a, [role="button"]') || el;
+        };
+
+        const nodes = [...document.querySelectorAll('a, button, [role="button"], span, div, li')]
+          .filter(visible);
+
+        const textOf = (el) => norm(el.innerText || el.textContent || el.value);
+
+        const activeEl = nodes.find(el => {
+          const cls = (el.className || '').toString().toLowerCase();
+          const aria = (el.getAttribute('aria-current') || '').toLowerCase();
+          return aria === 'page' || cls.includes('active') || cls.includes('current') || cls.includes('selected');
+        });
+
+        let activeNum = null;
+        if (activeEl) {
+          const directText = textOf(activeEl);
+          if (/^\d+$/.test(directText)) {
+            activeNum = parseInt(directText, 10);
+          } else {
+            const innerClickable = toClickable(activeEl);
+            const innerText = textOf(innerClickable);
+            if (/^\d+$/.test(innerText)) {
+              activeNum = parseInt(innerText, 10);
+            } else {
+              const dataPage = activeEl.getAttribute('data-page') || innerClickable?.getAttribute?.('data-page');
+              if (dataPage && /^\d+$/.test(dataPage)) {
+                activeNum = parseInt(dataPage, 10);
+              }
+            }
+          }
+        }
+
+        const currentBody = (document.body.innerText || '').slice(0, 10000);
+
+        const firstDataNode = document.querySelector('[data-id], [data-job-id], [data-page]');
+        const currentFirstDataId = firstDataNode
+          ? (firstDataNode.getAttribute('data-id') || firstDataNode.getAttribute('data-job-id') || firstDataNode.getAttribute('data-page'))
+          : null;
+
+        if (window.__jm_clicked_pagination === false) return true;
+
+        return (
+          location.href !== (window.__jm_prev_url || location.href) ||
+          currentBody !== (window.__jm_prev_body_sig || '') ||
+          currentFirstDataId !== window.__jm_prev_first_data_id ||
+          activeNum !== window.__jm_prev_active_num
+        );
+      }
+
+detail:
+  wait_for: "css:h1"
+  instruction: |
+    Extract exactly one job posting from this page.
+
+    Return only valid JSON.
+    Do not return markdown.
+    Do not use code fences.
+    Do not add explanations.
+
+    Rules:
+    - title: exact job title from the page
+    - job_url: canonical detail page URL
+    - apply_url: apply link if visible, else null
+    - company: company name if stated, else null
+    - location_text: displayed location text, else null
+    - employment_type: displayed type such as Contract, Permanent, Full-time, etc.
+    - duration: contract duration if stated
+    - compensation_text: pay/rate/salary text if stated
+    - summary: concise role summary from the page
+    - responsibilities: list of responsibilities found on page
+    - required_skills: list of required skills and experience
+    - preferred_skills: list of preferred or nice-to-have items
+    - job_reference: job id or reference if present
+
+    Use null for missing scalar fields.
+    Use [] for missing list fields.
+    Never invent values.

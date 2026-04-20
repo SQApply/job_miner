@@ -1,0 +1,45 @@
+sites:
+  - id: strategic_staff_jobs
+    label: Strategic Staffing Solutions Jobs
+    profile: load_more
+    page_url: "https://careers.strategicstaff.com/#/jobs"
+    allowed_hosts:
+      - careers.strategicstaff.com
+    output_file: "strategic_staff_jobs.json"
+    item_href_contains: "/jobs/"
+    exclude_exact_urls:
+      - "https://careers.strategicstaff.com/jobs"
+      - "https://careers.strategicstaff.com/#/jobs"
+    session_id: "strategic_staff_jobs_session"
+
+  - id: jobdiva_jobs
+    label: JobDiva Jobs
+    profile: paginated
+    override: jobdiva
+    page_url: "https://www2.jobdiva.com/portal/?a=5zjdnwgz9rgt98nybpazqo8bw8rfbl00caqs4j4fd2bztzkfucovot2hjp1hm9he&compid=0#/"
+    allowed_hosts:
+      - www2.jobdiva.com
+    output_file: "jobdiva_jobs.json"
+    item_href_contains: ""
+    detail_text_patterns:
+      - "details"
+      - "view details"
+    exclude_exact_urls:
+      - "https://www2.jobdiva.com/portal/?a=5zjdnwgz9rgt98nybpazqo8bw8rfbl00caqs4j4fd2bztzkfucovot2hjp1hm9he&compid=0#/"
+    session_id: "jobdiva_jobs_session"
+
+  - id: judge_jobs
+    label: Judge Jobs
+    profile: paginated
+    page_url: "https://www.judge.com/jobs/"
+    allowed_hosts:
+      - www.judge.com
+    output_file: "judge_jobs.json"
+    item_href_contains: "/jobs/details/"
+    detail_text_patterns:
+      - "learn more"
+      - "view job"
+      - "details"
+    exclude_exact_urls:
+      - "https://www.judge.com/jobs/"
+    session_id: "judge_jobs_session"

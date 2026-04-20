@@ -1,0 +1,106 @@
+adapter: load_more
+
+listing:
+  item_href_contains: "/jobs/"
+  exclude_exact_urls: []
+  initial_wait_for: 'js:() => document.querySelectorAll("a[href*=\"/jobs/\"]").length > 0'
+  session_id: "job_miner_load_more_session"
+
+  load_more:
+    enabled: true
+    max_clicks: 200
+    click_js: |
+      (() => {
+        const countJobs = () => document.querySelectorAll('a[href*="/jobs/"]').length;
+
+        const isVisible = (el) => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return style.display !== 'none' &&
+                 style.visibility !== 'hidden' &&
+                 rect.width > 0 &&
+                 rect.height > 0;
+        };
+
+        const clickables = [
+          ...document.querySelectorAll('button, a, [role="button"], input[type="button"], div, span')
+        ];
+
+        const btn = clickables.find(el => {
+          const text = (el.innerText || el.textContent || el.value || '').trim();
+          return /load\s*more/i.test(text) && isVisible(el);
+        });
+
+        window.__jm_prev_job_count = countJobs();
+        window.__jm_had_load_more = !!btn;
+
+        if (btn) {
+          btn.scrollIntoView({ behavior: 'instant', block: 'center' });
+          btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+          btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+          if (typeof btn.click === 'function') btn.click();
+        }
+      })();
+
+    wait_for_js: |
+      js:() => {
+        const countJobs = () => document.querySelectorAll('a[href*="/jobs/"]').length;
+
+        const hasLoadMore = () => {
+          const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' &&
+                   style.visibility !== 'hidden' &&
+                   rect.width > 0 &&
+                   rect.height > 0;
+          };
+
+          const clickables = [
+            ...document.querySelectorAll('button, a, [role="button"], input[type="button"], div, span')
+          ];
+
+          return clickables.some(el => {
+            const text = (el.innerText || el.textContent || el.value || '').trim();
+            return /load\s*more/i.test(text) && isVisible(el);
+          });
+        };
+
+        const now = countJobs();
+        const prev = window.__jm_prev_job_count || 0;
+        const buttonGone = (window.__jm_had_load_more || false) && !hasLoadMore();
+
+        return now > prev || buttonGone;
+      }
+
+detail:
+  wait_for: "css:h1"
+  instruction: |
+    Extract exactly one job posting from this page.
+
+    Return only valid JSON.
+    Do not return markdown.
+    Do not use code fences.
+    Do not add explanations.
+
+    Rules:
+    - title: exact job title from the page
+    - job_url: canonical detail page URL
+    - apply_url: apply link if visible, else null
+    - company: company name if stated, else null
+    - location_text: displayed location text, else null
+    - employment_type: displayed type such as Contract, Permanent, Full-time, etc.
+    - duration: contract duration if stated
+    - compensation_text: pay/rate/salary text if stated
+    - summary: concise role summary from the page
+    - responsibilities: list of responsibilities found on page
+    - required_skills: list of required skills and experience
+    - preferred_skills: list of preferred or nice-to-have items
+    - job_reference: job id or reference if present
+
+    Use null for missing scalar fields.
+    Use [] for missing list fields.
+    Never invent values.

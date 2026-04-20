@@ -1,0 +1,32 @@
+browser:
+  headless: true
+  verbose: false
+
+  # Built-in Crawl4AI defenses for consent/overlay problems
+  remove_overlay_elements: true
+  remove_consent_popups: true
+
+  # Use persistent context only if you want cookies/local storage across runs
+  use_persistent_context: false
+  user_data_dir: null
+
+  # Keep these for infinite-scroll style sites; harmless for paginated sites
+  scan_full_page: true
+  max_scroll_steps: 20
+  scroll_delay: 0.25
+
+  delay_before_return_html: 1.0
+  listing_wait_for_timeout: 45000
+  detail_wait_for_timeout: 15000
+
+llm:
+  provider: "ollama/qwen2.5:3b"
+  base_url: "http://127.0.0.1:11434"
+  api_token: "ollama"
+  temperature: 0.0
+  max_tokens: 1400
+  chunk_token_threshold: 1400
+  overlap_rate: 0.05
+
+output:
+  dir: "data/processed"

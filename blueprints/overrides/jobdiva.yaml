@@ -1,0 +1,162 @@
+listing:
+  detail_capture_mode: "click_buttons"
+
+  detail_wait_for: |
+    js:() => {
+      const txt = (document.body.innerText || "").toLowerCase();
+      return (
+        location.href !== (window.__jm_prev_url || location.href) ||
+        txt.includes("job details") ||
+        txt.includes("job summary") ||
+        txt.includes("job title") ||
+        txt.includes("job id") ||
+        txt.includes("position")
+      );
+    }
+
+  detail_click_js_template: |
+    (() => {
+      const idx = __INDEX__;
+
+      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const isVisible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.display !== 'none' &&
+               style.visibility !== 'hidden' &&
+               rect.width > 0 &&
+               rect.height > 0;
+      };
+
+      const candidates = [...document.querySelectorAll('a, button, [role="button"], span, div')]
+        .filter(isVisible)
+        .filter(el => {
+          const text = norm(el.innerText || el.textContent || el.value);
+          return text === 'details' || text.includes('details');
+        });
+
+      const target = candidates[idx] || null;
+
+      window.__jm_prev_url = location.href;
+      window.__jm_prev_body_sig = (document.body.innerText || '').slice(0, 6000);
+
+      if (target) {
+        target.scrollIntoView({ behavior: 'instant', block: 'center' });
+        target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+        target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+        target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        if (typeof target.click === 'function') target.click();
+      }
+    })();
+
+  back_to_listing_js: |
+    (() => {
+      window.__jm_prev_url = location.href;
+      history.back();
+    })();
+
+  back_to_listing_wait_for: |
+    js:() => {
+      const txt = (document.body.innerText || "").toLowerCase();
+      return txt.includes("details") || txt.includes("results");
+    }
+
+  pagination:
+    click_js_override: |
+      (() => {
+        const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const isVisible = (el) => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return style.display !== 'none' &&
+                 style.visibility !== 'hidden' &&
+                 rect.width > 0 &&
+                 rect.height > 0;
+        };
+
+        const nodes = [...document.querySelectorAll('a, button, [role="button"], li, span, div')]
+          .filter(isVisible);
+
+        const textOf = (el) => norm(el.innerText || el.textContent || el.value);
+
+        const active = nodes.find(el => {
+          const t = textOf(el);
+          const cls = (el.className || '').toString().toLowerCase();
+          const aria = (el.getAttribute('aria-current') || '').toLowerCase();
+          return aria === 'page' || cls.includes('active') || cls.includes('current') || cls.includes('selected');
+        });
+
+        let activeNum = null;
+        if (active) {
+          const t = textOf(active);
+          if (/^\d+$/.test(t)) activeNum = parseInt(t, 10);
+        }
+
+        let target = null;
+
+        if (activeNum !== null) {
+          target = nodes.find(el => {
+            const t = textOf(el);
+            return /^\d+$/.test(t) && parseInt(t, 10) === activeNum + 1;
+          });
+        }
+
+        if (!target) {
+          target = nodes.find(el => {
+            const t = textOf(el);
+            return t === '»' || t === '>' || t === 'next';
+          });
+        }
+
+        window.__jm_prev_url = location.href;
+        window.__jm_prev_body_sig = (document.body.innerText || '').slice(0, 8000);
+
+        if (target) {
+          target.scrollIntoView({ behavior: 'instant', block: 'center' });
+          target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+          target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+          if (typeof target.click === 'function') target.click();
+        }
+      })();
+
+    wait_for_js_override: |
+      js:() => {
+        const currentBody = (document.body.innerText || '').slice(0, 8000);
+        return (
+          location.href !== (window.__jm_prev_url || location.href) ||
+          currentBody !== (window.__jm_prev_body_sig || '')
+        );
+      }
+    initial_wait_for: |
+      js:() => {
+        const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const visible = (el) => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                rect.width > 0 &&
+                rect.height > 0;
+        };
+
+        const nodes = [...document.querySelectorAll('a, button, [role="button"], span, div, li')]
+          .filter(visible);
+
+        const hasDetails = nodes.some(el => {
+          const t = norm(el.innerText || el.textContent || el.value);
+          return t === 'details' || t.includes('details');
+        });
+
+        const hasPagination = nodes.some(el => {
+          const t = norm(el.innerText || el.textContent || el.value);
+          return /^\d+$/.test(t) || t === '»' || t === '>' || t === 'next';
+        });
+
+        const bodyText = norm(document.body.innerText || '');
+
+        return hasDetails && hasPagination && bodyText.length > 200;
+      }
