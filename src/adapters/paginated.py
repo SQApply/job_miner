@@ -721,9 +721,232 @@
 #         return urls
 
 
+# from __future__ import annotations
+
+# from ..crawl.browser_lane import close_session, interaction_run_config, listing_run_config
+# from ..crawl.link_collector import (
+#     collect_job_links,
+#     page_has_multiple_pages,
+#     page_has_pagination,
+# )
+# from ..utils import unique_keep_order
+# from .base import BaseAdapter
+
+
+# def _build_cookie_dismiss_js() -> str:
+#     return """
+#     (() => {
+#       const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+
+#       const isVisible = (el) => {
+#         if (!el) return false;
+#         const style = window.getComputedStyle(el);
+#         const rect = el.getBoundingClientRect();
+#         return style.display !== 'none' &&
+#                style.visibility !== 'hidden' &&
+#                rect.width > 0 &&
+#                rect.height > 0;
+#       };
+
+#       const patterns = ['accept', 'accept all', 'allow all', 'agree', 'i agree', 'got it', 'continue', 'ok'];
+
+#       const nodes = [...document.querySelectorAll('button, a, [role="button"], input[type="button"], span, div')]
+#         .filter(isVisible);
+
+#       const btn = nodes.find(el => {
+#         const t = norm(el.innerText || el.textContent || el.value);
+#         return patterns.some(p => t === p || t.includes(p));
+#       });
+
+#       if (btn) {
+#         btn.scrollIntoView({ behavior: 'instant', block: 'center' });
+#         btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+#         btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+#         btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+#         if (typeof btn.click === 'function') btn.click();
+#       }
+#     })();
+#     """
+
+
+# class PaginatedAdapter(BaseAdapter):
+#     async def discover_job_urls(self, crawler, blueprint, system_config, session_logger=None) -> list[str]:
+#         settings = system_config.browser
+#         listing = blueprint.listing
+
+#         if session_logger:
+#             session_logger.log(
+#                 "listing_start",
+#                 page_url=listing.page_url,
+#                 browser_session_id=listing.session_id,
+#             )
+
+#         initial_result = await crawler.arun(
+#             url=listing.page_url,
+#             config=listing_run_config(settings, listing.session_id, listing.initial_wait_for),
+#         )
+
+#         if not initial_result.success:
+#             if session_logger:
+#                 session_logger.log(
+#                     "listing_initial_failed",
+#                     page_url=listing.page_url,
+#                     error_message=initial_result.error_message,
+#                 )
+#             raise RuntimeError(f"Initial listing crawl failed: {initial_result.error_message}")
+
+#         # Dismiss cookies once in same session
+#         try:
+#             await crawler.arun(
+#                 url=listing.page_url,
+#                 config=interaction_run_config(
+#                     settings,
+#                     listing.session_id,
+#                     _build_cookie_dismiss_js(),
+#                     'js:() => true',
+#                 ),
+#             )
+#         except Exception:
+#             pass
+
+#         latest_result = await crawler.arun(
+#             url=listing.page_url,
+#             config=listing_run_config(settings, listing.session_id, listing.initial_wait_for),
+#         )
+
+#         urls = collect_job_links(
+#             latest_result,
+#             page_url=listing.page_url,
+#             allowed_hosts=blueprint.allowed_hosts,
+#             href_contains=listing.item_href_contains,
+#             detail_text_patterns=listing.detail_text_patterns,
+#             exclude_exact_urls=listing.exclude_exact_urls,
+#         )
+
+#         initial_count = len(urls)
+#         has_pagination = page_has_pagination(latest_result)
+#         has_multiple_pages = page_has_multiple_pages(latest_result)
+
+#         if session_logger:
+#             session_logger.log(
+#                 "listing_initial_complete",
+#                 page_url=listing.page_url,
+#                 discovered_urls=initial_count,
+#                 has_pagination=has_pagination,
+#                 has_multiple_pages=has_multiple_pages,
+#             )
+
+#         stable_rounds = 0
+#         turns = 0
+#         any_growth = False
+
+#         while listing.pagination.enabled and turns < listing.pagination.max_turns:
+#             turns += 1
+
+#             if session_logger:
+#                 session_logger.log(
+#                     "pagination_click_start",
+#                     page_url=listing.page_url,
+#                     page_turn=turns,
+#                     discovered_urls=len(urls),
+#                 )
+
+#             result = await crawler.arun(
+#                 url=listing.page_url,
+#                 config=interaction_run_config(
+#                     settings,
+#                     listing.session_id,
+#                     listing.pagination.click_js,
+#                     listing.pagination.wait_for_js,
+#                 ),
+#             )
+
+#             if not result.success:
+#                 stable_rounds += 1
+#                 if session_logger:
+#                     session_logger.log(
+#                         "pagination_click_failed",
+#                         page_url=listing.page_url,
+#                         page_turn=turns,
+#                         stable_rounds=stable_rounds,
+#                         error_message=result.error_message,
+#                     )
+#                 if stable_rounds >= listing.pagination.stop_after_stable_rounds:
+#                     break
+#                 continue
+
+#             latest_result = result
+
+#             new_urls = collect_job_links(
+#                 latest_result,
+#                 page_url=listing.page_url,
+#                 allowed_hosts=blueprint.allowed_hosts,
+#                 href_contains=listing.item_href_contains,
+#                 detail_text_patterns=listing.detail_text_patterns,
+#                 exclude_exact_urls=listing.exclude_exact_urls,
+#             )
+
+#             merged = unique_keep_order(urls + new_urls)
+
+#             if len(merged) > len(urls):
+#                 urls = merged
+#                 stable_rounds = 0
+#                 any_growth = True
+#                 if session_logger:
+#                     session_logger.log(
+#                         "pagination_click_growth",
+#                         page_url=listing.page_url,
+#                         page_turn=turns,
+#                         discovered_urls=len(urls),
+#                     )
+#             else:
+#                 stable_rounds += 1
+#                 if session_logger:
+#                     session_logger.log(
+#                         "pagination_click_no_growth",
+#                         page_url=listing.page_url,
+#                         page_turn=turns,
+#                         stable_rounds=stable_rounds,
+#                         discovered_urls=len(urls),
+#                     )
+#                 if stable_rounds >= listing.pagination.stop_after_stable_rounds:
+#                     break
+
+#         await close_session(crawler, listing.session_id)
+
+#         # Important: stop before detail extraction if pagination is present but stalled
+#         if listing.pagination.enabled and has_multiple_pages and initial_count > 0 and not any_growth:
+#             message = (
+#                 "Pagination detected on listing page, but no new URLs were discovered "
+#                 "after pagination attempts. Aborting before detail extraction."
+#             )
+#             if session_logger:
+#                 session_logger.log(
+#                     "pagination_stalled_abort",
+#                     page_url=listing.page_url,
+#                     discovered_urls=len(urls),
+#                     pagination_turns=turns,
+#                     message=message,
+#                 )
+#             raise RuntimeError(message)
+
+#         if session_logger:
+#             session_logger.log(
+#                 "listing_complete",
+#                 page_url=listing.page_url,
+#                 discovered_urls=len(urls),
+#                 pagination_turns=turns,
+#             )
+
+#         return urls
+
+
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from ..crawl.browser_lane import close_session, interaction_run_config, listing_run_config
+from ..crawl.consent import build_accept_all_cookies_js
 from ..crawl.link_collector import (
     collect_job_links,
     page_has_multiple_pages,
@@ -769,7 +992,184 @@ def _build_cookie_dismiss_js() -> str:
     """
 
 
+def _build_detail_button_click_js(index: int, text_patterns: list[str]) -> str:
+    patterns_js = "[" + ", ".join(repr(p.lower()) for p in text_patterns) + "]"
+    return f"""
+    (() => {{
+      const idx = {index};
+      const patterns = {patterns_js};
+
+      const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      const visible = (el) => {{
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.display !== 'none' &&
+               style.visibility !== 'hidden' &&
+               rect.width > 0 &&
+               rect.height > 0;
+      }};
+
+      const buttons = [...document.querySelectorAll('a, button, [role="button"], span, div')]
+        .filter(visible)
+        .filter(el => {{
+          const t = norm(el.innerText || el.textContent || el.value);
+          return patterns.some(p => t === p || t.includes(p));
+        }});
+
+      const target = buttons[idx] || null;
+
+      window.__jm_prev_url = location.href;
+      window.__jm_prev_body_sig = (document.body.innerText || '').slice(0, 8000);
+      window.__jm_listing_url = location.href;
+
+      if (target) {{
+        target.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+        target.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true }}));
+        target.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true }}));
+        target.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true, view: window }}));
+        if (typeof target.click === 'function') target.click();
+      }}
+    }})();
+    """
+
+
+def _build_detail_button_wait_js() -> str:
+    return """
+    js:() => {
+      const currentBody = (document.body.innerText || '').slice(0, 8000);
+      const detailsButtons = [...document.querySelectorAll('button, a, [role="button"]')]
+        .filter(el => ((el.innerText || el.textContent || '').trim().toLowerCase() === 'details'));
+
+      return (
+        location.href !== (window.__jm_prev_url || location.href) ||
+        currentBody !== (window.__jm_prev_body_sig || '') ||
+        detailsButtons.length === 0
+      );
+    }
+    """
+
+
+def _build_back_to_listing_js(page_url: str) -> str:
+    page_url_js = repr(page_url)
+    return f"""
+    (() => {{
+      const pageUrl = {page_url_js};
+      const prev = location.href;
+
+      history.back();
+
+      setTimeout(() => {{
+        if (location.href === prev) {{
+          location.href = window.__jm_listing_url || pageUrl;
+        }}
+      }}, 900);
+    }})();
+    """
+
+
 class PaginatedAdapter(BaseAdapter):
+    def _pagination_click_js(self, listing) -> str:
+        return listing.pagination.click_js_override or listing.pagination.click_js
+
+    def _pagination_wait_js(self, listing) -> str:
+        return listing.pagination.wait_for_js_override or listing.pagination.wait_for_js
+
+    def _detail_click_js(self, listing, index: int) -> str:
+        if listing.detail_click_js_template:
+            return listing.detail_click_js_template.replace("__INDEX__", str(index))
+        return _build_detail_button_click_js(index, listing.detail_text_patterns)
+
+    def _detail_wait_js(self, listing) -> str:
+        return listing.detail_wait_for or _build_detail_button_wait_js()
+
+    def _back_js(self, listing) -> str:
+        return listing.back_to_listing_js or _build_back_to_listing_js(listing.page_url)
+
+    def _back_wait_for(self, listing) -> str:
+        return listing.back_to_listing_wait_for or listing.initial_wait_for or 'js:() => document.body && document.body.innerText.length > 0'
+
+    async def _collect_by_clicking_detail_buttons(self, crawler, blueprint, system_config, session_logger=None) -> list[str]:
+        settings = system_config.browser
+        listing = blueprint.listing
+        urls: list[str] = []
+
+        for idx in range(100):
+            try:
+                result = await crawler.arun(
+                    url=listing.page_url,
+                    config=interaction_run_config(
+                        settings,
+                        listing.session_id,
+                        self._detail_click_js(listing, idx),
+                        self._detail_wait_js(listing),
+                    ),
+                )
+            except Exception as exc:
+                if session_logger:
+                    session_logger.log(
+                        "detail_button_click_exception",
+                        page_url=listing.page_url,
+                        button_index=idx,
+                        error_message=str(exc),
+                    )
+                break
+
+            if not result.success:
+                if session_logger:
+                    session_logger.log(
+                        "detail_button_click_failed",
+                        page_url=listing.page_url,
+                        button_index=idx,
+                        error_message=result.error_message,
+                    )
+                break
+
+            final_url = (getattr(result, "url", None) or getattr(result, "final_url", None) or "").strip()
+
+            if final_url and final_url.rstrip("/") != listing.page_url.rstrip("/"):
+                parsed = urlparse(final_url)
+                if parsed.netloc in blueprint.allowed_hosts:
+                    urls.append(final_url.rstrip("/"))
+                    if session_logger:
+                        session_logger.log(
+                            "detail_button_captured",
+                            page_url=listing.page_url,
+                            button_index=idx,
+                            captured_url=final_url.rstrip("/"),
+                        )
+
+            try:
+                back_result = await crawler.arun(
+                    url=listing.page_url,
+                    config=interaction_run_config(
+                        settings,
+                        listing.session_id,
+                        self._back_js(listing),
+                        self._back_wait_for(listing),
+                    ),
+                )
+                if not back_result.success:
+                    if session_logger:
+                        session_logger.log(
+                            "back_to_listing_failed",
+                            page_url=listing.page_url,
+                            button_index=idx,
+                            error_message=back_result.error_message,
+                        )
+                    break
+            except Exception as exc:
+                if session_logger:
+                    session_logger.log(
+                        "back_to_listing_exception",
+                        page_url=listing.page_url,
+                        button_index=idx,
+                        error_message=str(exc),
+                    )
+                break
+
+        return unique_keep_order(urls)
+
     async def discover_job_urls(self, crawler, blueprint, system_config, session_logger=None) -> list[str]:
         settings = system_config.browser
         listing = blueprint.listing
@@ -795,14 +1195,14 @@ class PaginatedAdapter(BaseAdapter):
                 )
             raise RuntimeError(f"Initial listing crawl failed: {initial_result.error_message}")
 
-        # Dismiss cookies once in same session
         try:
             await crawler.arun(
                 url=listing.page_url,
                 config=interaction_run_config(
                     settings,
                     listing.session_id,
-                    _build_cookie_dismiss_js(),
+                    # _build_cookie_dismiss_js(),
+                    build_accept_all_cookies_js(),
                     'js:() => true',
                 ),
             )
@@ -814,14 +1214,22 @@ class PaginatedAdapter(BaseAdapter):
             config=listing_run_config(settings, listing.session_id, listing.initial_wait_for),
         )
 
-        urls = collect_job_links(
-            latest_result,
-            page_url=listing.page_url,
-            allowed_hosts=blueprint.allowed_hosts,
-            href_contains=listing.item_href_contains,
-            detail_text_patterns=listing.detail_text_patterns,
-            exclude_exact_urls=listing.exclude_exact_urls,
-        )
+        if listing.detail_capture_mode == "click_buttons":
+            urls = await self._collect_by_clicking_detail_buttons(
+                crawler,
+                blueprint,
+                system_config,
+                session_logger=session_logger,
+            )
+        else:
+            urls = collect_job_links(
+                latest_result,
+                page_url=listing.page_url,
+                allowed_hosts=blueprint.allowed_hosts,
+                href_contains=listing.item_href_contains,
+                detail_text_patterns=listing.detail_text_patterns,
+                exclude_exact_urls=listing.exclude_exact_urls,
+            )
 
         initial_count = len(urls)
         has_pagination = page_has_pagination(latest_result)
@@ -834,6 +1242,7 @@ class PaginatedAdapter(BaseAdapter):
                 discovered_urls=initial_count,
                 has_pagination=has_pagination,
                 has_multiple_pages=has_multiple_pages,
+                detail_capture_mode=listing.detail_capture_mode,
             )
 
         stable_rounds = 0
@@ -848,7 +1257,7 @@ class PaginatedAdapter(BaseAdapter):
                     "pagination_click_start",
                     page_url=listing.page_url,
                     page_turn=turns,
-                    discovered_urls=len(urls),
+                    current_discovered_urls=len(urls),
                 )
 
             result = await crawler.arun(
@@ -856,8 +1265,8 @@ class PaginatedAdapter(BaseAdapter):
                 config=interaction_run_config(
                     settings,
                     listing.session_id,
-                    listing.pagination.click_js,
-                    listing.pagination.wait_for_js,
+                    self._pagination_click_js(listing),
+                    self._pagination_wait_js(listing),
                 ),
             )
 
@@ -877,28 +1286,63 @@ class PaginatedAdapter(BaseAdapter):
 
             latest_result = result
 
-            new_urls = collect_job_links(
-                latest_result,
-                page_url=listing.page_url,
-                allowed_hosts=blueprint.allowed_hosts,
-                href_contains=listing.item_href_contains,
-                detail_text_patterns=listing.detail_text_patterns,
-                exclude_exact_urls=listing.exclude_exact_urls,
-            )
+            if listing.detail_capture_mode == "click_buttons":
+                new_urls = await self._collect_by_clicking_detail_buttons(
+                    crawler,
+                    blueprint,
+                    system_config,
+                    session_logger=session_logger,
+                )
+            else:
+                new_urls = collect_job_links(
+                    latest_result,
+                    page_url=listing.page_url,
+                    allowed_hosts=blueprint.allowed_hosts,
+                    href_contains=listing.item_href_contains,
+                    detail_text_patterns=listing.detail_text_patterns,
+                    exclude_exact_urls=listing.exclude_exact_urls,
+                )
 
             merged = unique_keep_order(urls + new_urls)
 
+            # if len(merged) > len(urls):
+            #     urls = merged
+            #     stable_rounds = 0
+            #     any_growth = True
+            #     if session_logger:
+            #         session_logger.log(
+            #             "pagination_click_growth",
+            #             page_url=listing.page_url,
+            #             page_turn=turns,
+            #             discovered_urls=len(urls),
+            #         )
+
             if len(merged) > len(urls):
+                previous_count = len(urls)
+                discovered_new_urls = merged[previous_count:]
+
                 urls = merged
                 stable_rounds = 0
                 any_growth = True
+
                 if session_logger:
                     session_logger.log(
                         "pagination_click_growth",
                         page_url=listing.page_url,
                         page_turn=turns,
-                        discovered_urls=len(urls),
+                        previous_discovered_urls=previous_count,
+                        new_urls_found=len(discovered_new_urls),
+                        total_discovered_urls=len(urls),
+                        discovered_urls=discovered_new_urls,
                     )
+
+                    for discovered_url in discovered_new_urls:
+                        session_logger.log(
+                            "pagination_discovered_job_url",
+                            page_url=listing.page_url,
+                            page_turn=turns,
+                            job_url=discovered_url,
+                        )
             else:
                 stable_rounds += 1
                 if session_logger:
@@ -914,7 +1358,6 @@ class PaginatedAdapter(BaseAdapter):
 
         await close_session(crawler, listing.session_id)
 
-        # Important: stop before detail extraction if pagination is present but stalled
         if listing.pagination.enabled and has_multiple_pages and initial_count > 0 and not any_growth:
             message = (
                 "Pagination detected on listing page, but no new URLs were discovered "

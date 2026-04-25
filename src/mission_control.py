@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +14,12 @@ from .gpu_monitor import query_gpu_snapshot
 from .logger import build_session_logger
 from .router import get_adapter
 from .schemas import RunResult
-from .store.storefront import save_jobs_json, save_run_summary
+from .store.storefront import (
+    save_jobs_csv,
+    save_jobs_json,
+    save_jobs_markdown,
+    save_run_summary,
+)
 
 
 def _slugify(url: str) -> str:
@@ -76,94 +82,166 @@ async def run_target(root: Path, target_id: str) -> RunResult:
             discovered_urls=len(job_urls),
         )
 
-        jobs = []
-        for idx, job_url in enumerate(job_urls, start=1):
-            session_logger.log(
-                "extract_start",
-                job_url=job_url,
-                item_index=idx,
-            )
+        concurrency = system_config.browser.detail_extraction_concurrency
+        semaphore = asyncio.Semaphore(concurrency)
 
-            gpu_before = query_gpu_snapshot()
-            session_logger.log(
-                "gpu_before_extract",
-                job_url=job_url,
-                item_index=idx,
-                gpu=gpu_before,
-            )
-
-            t0 = time.perf_counter()
-
-            detail_session_id = f"{target_id}_detail_session"
-
-            result = await crawler.arun(
-                url=job_url,
-                config=detail_run_config(
-                    system_config.browser,
-                    blueprint.detail.wait_for,
-                    llm_strategy,
-                    session_id=detail_session_id,
-                ),
-            )
-
-            elapsed = round(time.perf_counter() - t0, 3)
-
-            gpu_after = query_gpu_snapshot()
-            session_logger.log(
-                "gpu_after_extract",
-                job_url=job_url,
-                item_index=idx,
-                elapsed_seconds=elapsed,
-                gpu=gpu_after,
-            )
-
-            if not result.success:
-                _save_failed_payload(root, target_id, _slugify(job_url), f"CRAWL FAILED: {result.error_message}")
+        async def extract_one_job(job_url: str, item_index: int):
+            async with semaphore:
                 session_logger.log(
-                    "extract_failed",
+                    "extract_start",
                     job_url=job_url,
-                    item_index=idx,
-                    elapsed_seconds=elapsed,
-                    error_message=result.error_message,
+                    item_index=item_index,
                 )
-                continue
 
-            raw_content = result.extracted_content
-            job = parse_extracted_jobs(raw_content, job_url)
-
-            if job is None:
-                _save_failed_payload(root, target_id, _slugify(job_url), raw_content)
+                gpu_before = query_gpu_snapshot()
                 session_logger.log(
-                    "parse_failed",
+                    "gpu_before_extract",
                     job_url=job_url,
-                    item_index=idx,
-                    elapsed_seconds=elapsed,
+                    item_index=item_index,
+                    gpu=gpu_before,
                 )
-                continue
 
-            if is_valid_job(job):
-                jobs.append(job)
+                t0 = time.perf_counter()
+                detail_session_id = f"{target_id}_detail_session_{item_index}"
+
+                try:
+                    result = await crawler.arun(
+                        url=job_url,
+                        config=detail_run_config(
+                            system_config.browser,
+                            blueprint.detail.wait_for,
+                            llm_strategy,
+                            session_id=detail_session_id,
+                        ),
+                    )
+                except Exception as exc:
+                    elapsed = round(time.perf_counter() - t0, 3)
+                    _save_failed_payload(
+                        root,
+                        target_id,
+                        _slugify(job_url),
+                        f"CRAWL EXCEPTION: {exc}",
+                    )
+                    session_logger.log(
+                        "extract_exception",
+                        job_url=job_url,
+                        item_index=item_index,
+                        elapsed_seconds=elapsed,
+                        error_message=str(exc),
+                    )
+                    return None
+
+                elapsed = round(time.perf_counter() - t0, 3)
+
+                gpu_after = query_gpu_snapshot()
                 session_logger.log(
-                    "extract_saved",
+                    "gpu_after_extract",
                     job_url=job_url,
-                    item_index=idx,
+                    item_index=item_index,
                     elapsed_seconds=elapsed,
-                    title=job.title,
+                    gpu=gpu_after,
                 )
-            else:
+
+                if not result.success:
+                    _save_failed_payload(
+                        root,
+                        target_id,
+                        _slugify(job_url),
+                        f"CRAWL FAILED: {result.error_message}",
+                    )
+                    session_logger.log(
+                        "extract_failed",
+                        job_url=job_url,
+                        item_index=item_index,
+                        elapsed_seconds=elapsed,
+                        error_message=result.error_message,
+                    )
+                    return None
+
+                raw_content = result.extracted_content
+                job = parse_extracted_jobs(raw_content, job_url)
+
+                if job is None:
+                    _save_failed_payload(root, target_id, _slugify(job_url), raw_content)
+                    session_logger.log(
+                        "parse_failed",
+                        job_url=job_url,
+                        item_index=item_index,
+                        elapsed_seconds=elapsed,
+                    )
+                    return None
+
+                if is_valid_job(job):
+                    session_logger.log(
+                        "extract_saved",
+                        job_url=job_url,
+                        item_index=item_index,
+                        elapsed_seconds=elapsed,
+                        title=job.title,
+                    )
+                    return job
+
                 _save_failed_payload(root, target_id, _slugify(job_url), raw_content)
                 session_logger.log(
                     "validation_failed",
                     job_url=job_url,
-                    item_index=idx,
+                    item_index=item_index,
                     elapsed_seconds=elapsed,
                     parsed_title=job.title,
                 )
+                return None
+
+        session_logger.log(
+            "parallel_extraction_start",
+            total_job_urls=len(job_urls),
+            concurrency=concurrency,
+        )
+
+        extraction_results = await asyncio.gather(
+            *(
+                extract_one_job(job_url, idx)
+                for idx, job_url in enumerate(job_urls, start=1)
+            ),
+            return_exceptions=True,
+        )
+
+        jobs = []
+
+        for item in extraction_results:
+            if isinstance(item, Exception):
+                session_logger.log(
+                    "extract_task_exception",
+                    error_message=str(item),
+                )
+                continue
+
+            if item is not None:
+                jobs.append(item)
+
+        session_logger.log(
+            "parallel_extraction_complete",
+            attempted_urls=len(job_urls),
+            extracted_jobs=len(jobs),
+        )
 
     total_elapsed_seconds = round(time.perf_counter() - website_t0, 3)
 
     output_dir = root / system_config.output.dir
     output_path = save_jobs_json(output_dir, blueprint.output_file, jobs, run_session_id)
+
+    save_jobs_csv(
+        output_dir=output_dir,
+        output_file=blueprint.output_file,
+        jobs=jobs,
+        run_session_id=run_session_id,
+    )
+
+    save_jobs_markdown(
+        output_dir=output_dir,
+        output_file=blueprint.output_file,
+        jobs=jobs,
+        run_session_id=run_session_id,
+    )
 
     summary_path = save_run_summary(
         output_dir,

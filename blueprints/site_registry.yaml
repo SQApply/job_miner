@@ -43,3 +43,30 @@ sites:
     exclude_exact_urls:
       - "https://www.judge.com/jobs/"
     session_id: "judge_jobs_session"
+
+  - id: experis_jobs
+    label: Experis Jobs
+    profile: paginated
+    page_url: "https://www.experis.com/en/search?page=1"
+    allowed_hosts:
+      - "www.experis.com"
+    item_href_contains: "/en/job/"
+    detail_text_patterns:
+      - "View More Details Of Job"
+      - "View More Details"
+    output_file: "experis_jobs.json"
+    override: experis
+    
+  - id: randstad_jobs
+    label: Randstad Jobs
+    profile: load_more
+    page_url: "https://www.randstad.com/jobs/"
+    allowed_hosts:
+      - "www.randstad.com"
+    item_href_contains: "/jobs/"
+    detail_text_patterns:
+      - "job details"
+      - "view job"
+      - "read more"
+    output_file: "randstad_jobs.json"
+    override: randstad

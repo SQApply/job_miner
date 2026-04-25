@@ -170,10 +170,12 @@
 #         return urls
 from __future__ import annotations
 
-from ..crawl.browser_lane import close_session, listing_run_config, load_more_run_config
+from ..crawl.browser_lane import close_session, interaction_run_config, listing_run_config, load_more_run_config
+from ..crawl.consent import build_accept_all_cookies_js
 from ..crawl.continuation import should_continue
 from ..crawl.link_collector import collect_job_links, page_has_load_more
 from .base import BaseAdapter
+
 
 
 class LoadMoreAdapter(BaseAdapter):
@@ -201,8 +203,24 @@ class LoadMoreAdapter(BaseAdapter):
                     error_message=initial_result.error_message,
                 )
             raise RuntimeError(f"Initial listing crawl failed: {initial_result.error_message}")
+        try:
+            await crawler.arun(
+                url=listing.page_url,
+                config=interaction_run_config(
+                    settings,
+                    listing.session_id,
+                    build_accept_all_cookies_js(),
+                    "js:() => true",
+                ),
+            )
+        except Exception:
+            pass
 
-        latest_result = initial_result
+        latest_result = await crawler.arun(
+            url=listing.page_url,
+            config=listing_run_config(settings, listing.session_id, listing.initial_wait_for),
+        )
+        # latest_result = initial_result
         urls = collect_job_links(
             latest_result,
             page_url=listing.page_url,

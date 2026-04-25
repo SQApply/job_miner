@@ -1,0 +1,26 @@
+listing:
+  initial_wait_for: "css:#search-results"
+
+  load_more:
+    enabled: true
+    max_clicks: 3
+
+    click_js: |
+      (() => {
+        const button = document.querySelector('#search-results button.button.button--dark-blue')
+          || Array.from(document.querySelectorAll('button'))
+            .find(btn => (btn.innerText || '').toLowerCase().includes('view 30 more'));
+
+        if (button) {
+          button.scrollIntoView({ behavior: 'instant', block: 'center' });
+          button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+          button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+          if (typeof button.click === 'function') button.click();
+          return 'clicked randstad view 30 more';
+        }
+
+        return 'randstad view 30 more not found';
+      })();
+
+    wait_for_js: "js:() => document.querySelectorAll('a[href*=\"/jobs/\"]').length > 30"

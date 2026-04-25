@@ -18,6 +18,13 @@ class BrowserSettings(BaseModel):
     delay_before_return_html: float = 1.0
     listing_wait_for_timeout: int = 45000
     detail_wait_for_timeout: int = 15000
+    # Generic location permission handling for Crawl4AI / Playwright
+    geolocation_enabled: bool = True
+    geolocation_latitude: float = 39.8283
+    geolocation_longitude: float = -98.5795
+    geolocation_accuracy: float = 50000.0
+    #parallel extraction limit
+    detail_extraction_concurrency: int = 5
 
 
 class LLMSettings(BaseModel):
