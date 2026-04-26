@@ -56,7 +56,7 @@ sites:
       - "View More Details"
     output_file: "experis_jobs.json"
     override: experis
-    
+
   - id: randstad_jobs
     label: Randstad Jobs
     profile: load_more
@@ -70,3 +70,16 @@ sites:
       - "read more"
     output_file: "randstad_jobs.json"
     override: randstad
+
+  - id: opensystems_jobs
+    label: Open Systems Technologies Jobs
+    profile: paginated
+    page_url: "https://www.opensystemstech.com/search"
+    allowed_hosts:
+      - "www.opensystemstech.com"
+    item_href_contains: "/job/"
+    detail_text_patterns:
+      - "job title"
+      - "details"
+    output_file: "opensystems_jobs.json"
+    override: opensystems

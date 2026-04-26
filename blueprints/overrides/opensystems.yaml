@@ -1,0 +1,21 @@
+listing:
+  initial_wait_for: "js:() => document.querySelectorAll('table.job-search-results a[href]').length > 5"
+
+  pagination:
+    enabled: true
+    max_turns: 5
+    stop_after_stable_rounds: 2
+
+    click_js: |
+      (() => {
+        const current = document.querySelector('.pagination .active, [aria-current="page"]');
+        const currentPage = current ? parseInt(current.innerText.trim(), 10) : 1;
+        const nextPage = currentPage + 1;
+
+        const nextUrl = `/api/requisitions/search?page=${nextPage}`;
+        window.location.href = nextUrl;
+
+        return `navigating to ${nextUrl}`;
+      })();
+
+    wait_for_js: "css:table.job-search-results a[href]"

@@ -2,28 +2,30 @@ browser:
   headless: true
   verbose: false
 
-  # Built-in Crawl4AI defenses for consent/overlay problems
   remove_overlay_elements: true
   remove_consent_popups: true
 
-  # Use persistent context only if you want cookies/local storage across runs
   use_persistent_context: false
   user_data_dir: null
 
-  # Keep these for infinite-scroll style sites; harmless for paginated sites
   scan_full_page: true
   max_scroll_steps: 20
   scroll_delay: 0.25
 
+  enable_stealth: true
+  user_agent_mode: "random"
+
   delay_before_return_html: 1.0
   listing_wait_for_timeout: 45000
   detail_wait_for_timeout: 15000
+
   geolocation_enabled: true
   geolocation_latitude: 39.8283
   geolocation_longitude: -98.5795
   geolocation_accuracy: 50000.0
-  detail_extraction_concurrency: 5
 
+  detail_extraction_concurrency: 3
+  
 llm:
   provider: "ollama/qwen2.5:3b"
   base_url: "http://127.0.0.1:11434"

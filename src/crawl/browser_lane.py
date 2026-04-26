@@ -132,6 +132,8 @@ def build_browser_config(settings: BrowserSettings):
         verbose=settings.verbose,
         use_persistent_context=settings.use_persistent_context,
         user_data_dir=settings.user_data_dir,
+        enable_stealth=settings.enable_stealth,
+        user_agent_mode=settings.user_agent_mode,
     )
 
 

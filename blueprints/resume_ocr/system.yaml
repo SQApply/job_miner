@@ -1,0 +1,32 @@
+ocr:
+  backend: "glmocr_sdk"          # glmocr_sdk | ollama_image
+  ollama_base_url: "http://127.0.0.1:11434"
+  ollama_model: "glm-ocr-optimized"
+  glmocr_config_path: "configs/glm_ocr_ollama.yaml"
+  layout_device: "cpu"           # cpu keeps the single GPU free for GLM-OCR generation
+  prompt: "Text Recognition:"
+  max_pages: 8                    # resumes should rarely exceed this; fail-fast for abuse
+  pdf_dpi: 140
+  max_image_dimension: 1400
+  jpeg_quality: 88
+  ocr_concurrency: 1              # keep 1 for one local GPU/Ollama instance
+  min_native_text_chars: 1200     # if a PDF has enough embedded text, OCR can be skipped
+  prefer_native_pdf_text: true
+  request_timeout_seconds: 900
+
+llm:
+  provider: "qwen2.5:3b"
+  base_url: "http://127.0.0.1:11434"
+  temperature: 0.0
+  max_tokens: 4096
+  request_timeout_seconds: 600
+
+parser:
+  enabled: true
+  min_markdown_chars: 200
+  max_markdown_chars_for_extraction: 24000
+
+output:
+  dir: "data/processed"
+  failed_dir: "data/failed"
+  log_dir: "data/logs"

@@ -25,6 +25,8 @@ class BrowserSettings(BaseModel):
     geolocation_accuracy: float = 50000.0
     #parallel extraction limit
     detail_extraction_concurrency: int = 5
+    enable_stealth: bool = False
+    user_agent_mode: str | None = None
 
 
 class LLMSettings(BaseModel):
