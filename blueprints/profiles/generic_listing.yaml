@@ -1,23 +1,15 @@
-adapter: search_first
+adapter: generic_listing
 
 listing:
   item_href_contains: ""
   detail_text_patterns:
-    - "learn more"
     - "details"
+    - "view details"
+    - "learn more"
     - "view job"
   exclude_exact_urls: []
   initial_wait_for: 'js:() => document.body && document.body.innerText.length > 300'
-  session_id: "job_miner_search_first_session"
-
-  search:
-    enabled: true
-
-  pagination:
-    enabled: true
-    type: "anchor"
-    max_turns: 100
-    stop_after_stable_rounds: 3
+  session_id: "job_miner_generic_listing_session"
 
 detail:
   wait_for: "css:h1"

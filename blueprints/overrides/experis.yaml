@@ -1,36 +1,11 @@
 listing:
   initial_wait_for: "css:.search-job-results"
-
   pagination:
     enabled: true
+    type: "url_param"
+    page_param: "page"
+    start_page: 1
+    step: 1
     max_turns: 500
     stop_after_stable_rounds: 2
-
-    click_js: |
-      (() => {
-        const active = document.querySelector('.pagination .page-item.active a.page-link');
-        const currentPage = active ? parseInt((active.innerText || '').trim(), 10) : 1;
-        const nextPage = currentPage + 1;
-
-        const nextLink =
-          Array.from(document.querySelectorAll('a.page-link'))
-            .find(a => (a.innerText || '').trim() === String(nextPage));
-
-        if (nextLink && nextLink.href) {
-          window.location.href = nextLink.href;
-          return `navigating to page ${nextPage}: ${nextLink.href}`;
-        }
-
-        const fallbackNext =
-          Array.from(document.querySelectorAll('a.page-link'))
-            .find(a => (a.innerText || '').trim().toLowerCase() === 'next');
-
-        if (fallbackNext && fallbackNext.href) {
-          window.location.href = fallbackNext.href;
-          return `navigating using next link: ${fallbackNext.href}`;
-        }
-
-        return 'no next pagination link found';
-      })();
-
     wait_for_js: "css:.search-job-results"

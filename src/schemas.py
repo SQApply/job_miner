@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -18,12 +18,10 @@ class BrowserSettings(BaseModel):
     delay_before_return_html: float = 1.0
     listing_wait_for_timeout: int = 45000
     detail_wait_for_timeout: int = 15000
-    # Generic location permission handling for Crawl4AI / Playwright
     geolocation_enabled: bool = True
     geolocation_latitude: float = 39.8283
     geolocation_longitude: float = -98.5795
     geolocation_accuracy: float = 50000.0
-    #parallel extraction limit
     detail_extraction_concurrency: int = 5
     enable_stealth: bool = False
     user_agent_mode: str | None = None
@@ -54,38 +52,100 @@ class LoadMoreConfig(BaseModel):
     max_clicks: int = 0
     click_js: str = ""
     wait_for_js: str = ""
+    click_js_override: Optional[str] = None
+    wait_for_js_override: Optional[str] = None
+    stop_after_stable_rounds: int = 3
+    button_text_patterns: list[str] = Field(
+        default_factory=lambda: [
+            "load more",
+            "view more",
+            "view 30 more",
+            "show more",
+            "see more",
+            "more jobs",
+        ]
+    )
 
 
 class PaginationConfig(BaseModel):
     enabled: bool = False
     max_pages: int = 500
-    type: str = "numbered"  # numbered | next_button
+    type: Literal["anchor", "numbered", "next_button", "url_param", "button"] = "anchor"
     max_turns: int = 250
     stop_after_stable_rounds: int = 3
     next_text_patterns: list[str] = Field(default_factory=lambda: ["»", ">", "next"])
+
+    # URL-param pagination, for pages such as /search?page=1 -> /search?page=2.
+    page_param: str = "page"
+    start_page: int = 1
+    step: int = 1
+    url_template: Optional[str] = None
+
     click_js: str = ""
     wait_for_js: str = ""
-
-    # optional site-specific override JS
     click_js_override: Optional[str] = None
     wait_for_js_override: Optional[str] = None
+
+
+class InfiniteScrollConfig(BaseModel):
+    enabled: bool = False
+    max_scrolls: int = 50
+    scroll_delay_ms: int = 800
+    stop_after_stable_rounds: int = 3
+    wait_for_js: str = ""
+
+
+class DetailButtonConfig(BaseModel):
+    selector: str = "a, button, [role='button'], span, div"
+    text_patterns: list[str] = Field(default_factory=lambda: ["details", "view details", "view job"])
+    exact_text: Optional[str] = None
+    max_buttons: int = 100
+    click_js_template: Optional[str] = None
+    wait_for: Optional[str] = None
+    back_to_listing_js: Optional[str] = None
+    back_to_listing_wait_for: Optional[str] = None
+
+
+class SearchConfig(BaseModel):
+    enabled: bool = False
+    query: str = ""
+    input_selector: str = ""
+    submit_selector: str = ""
+    submit_js: str = ""
+    wait_for_js: str = ""
+
+
+class ModalConfig(BaseModel):
+    enabled: bool = False
+    open_button_selector: str = ""
+    close_button_selector: str = ""
+    wait_for: str = ""
+    max_items: int = 100
+
 
 class ListingConfig(BaseModel):
     page_url: str = ""
     item_href_contains: str = ""
-    detail_text_patterns: list[str] = Field(default_factory=lambda: ["details", "view details","learn more", "view job"])
+    detail_text_patterns: list[str] = Field(default_factory=lambda: ["details", "view details", "learn more", "view job"])
     exclude_exact_urls: list[str] = Field(default_factory=list)
     initial_wait_for: Optional[str] = None
     session_id: str = "job_miner_session"
+
     load_more: LoadMoreConfig = Field(default_factory=LoadMoreConfig)
     pagination: PaginationConfig = Field(default_factory=PaginationConfig)
+    infinite_scroll: InfiniteScrollConfig = Field(default_factory=InfiniteScrollConfig)
+    detail_button: DetailButtonConfig = Field(default_factory=DetailButtonConfig)
+    search: SearchConfig = Field(default_factory=SearchConfig)
+    modal: ModalConfig = Field(default_factory=ModalConfig)
+    # card_click: CardClickConfig = Field(default_factory=CardClickConfig)
 
-    # detail capture modes for paginated sites
-    detail_capture_mode: str = "direct_links"   # direct_links | click_buttons
+    # Backward-compatible fields used by the older paginated implementation and existing overrides.
+    detail_capture_mode: str = "direct_links"  # direct_links | click_buttons | modal
     detail_wait_for: Optional[str] = None
     detail_click_js_template: Optional[str] = None
     back_to_listing_js: Optional[str] = None
     back_to_listing_wait_for: Optional[str] = None
+
 
 class DetailConfig(BaseModel):
     wait_for: str = "css:h1"
@@ -109,13 +169,10 @@ class SiteEntry(BaseModel):
     detail_text_patterns: list[str] = Field(default_factory=list)
     exclude_exact_urls: list[str] = Field(default_factory=list)
     session_id: Optional[str] = None
-
-    # optional site override file name, without .yaml
     override: Optional[str] = None
-
-    # optional site-level values
     detail_capture_mode: Optional[str] = None
     detail_wait_for: Optional[str] = None
+
 
 class SiteRegistry(BaseModel):
     sites: list[SiteEntry]
@@ -155,3 +212,21 @@ class RunResult(BaseModel):
     extracted_jobs: int
     total_elapsed_seconds: float
     jobs: list[JobPosting]
+
+
+class CardClickConfig(BaseModel):
+    enabled: bool = False
+    max_cards: int = 10
+    card_text_patterns: list[str] = Field(default_factory=lambda: [
+        "hourly",
+        "contractor",
+        "permanent",
+        "contract",
+        "full time",
+        "part time",
+    ])
+    exclude_text_patterns: list[str] = Field(default_factory=lambda: [
+        "contact us",
+        "about us",
+        "resources",
+    ])

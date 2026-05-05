@@ -22,6 +22,11 @@ listing:
 
   detail_capture_mode: "click_buttons"
 
+  detail_button:
+    selector: 'button[type="button"]'
+    exact_text: "details"
+    max_buttons: 100
+
   detail_wait_for: |
     js:() => {
       const currentBody = (document.body.innerText || '').slice(0, 8000);

@@ -1,4 +1,4 @@
-adapter: search_first
+adapter: paginated_anchor
 
 listing:
   item_href_contains: ""
@@ -7,17 +7,18 @@ listing:
     - "details"
     - "view job"
   exclude_exact_urls: []
-  initial_wait_for: 'js:() => document.body && document.body.innerText.length > 300'
-  session_id: "job_miner_search_first_session"
-
-  search:
-    enabled: true
+  initial_wait_for: 'js:() => document.body && document.body.innerText.length > 300 && document.querySelectorAll("a, button, [role=button]").length > 0'
+  session_id: "job_miner_paginated_anchor_session"
 
   pagination:
     enabled: true
     type: "anchor"
-    max_turns: 100
+    max_turns: 250
     stop_after_stable_rounds: 3
+    next_text_patterns:
+      - "next"
+      - ">"
+      - "»"
 
 detail:
   wait_for: "css:h1"

@@ -71,8 +71,17 @@ def _normalize_payload(payload: dict[str, Any], fallback_url: str) -> dict[str, 
     if "applyUrl" in payload and "apply_url" not in payload:
         payload["apply_url"] = payload["applyUrl"]
 
-    return payload
+    for list_field in ("responsibilities", "required_skills", "preferred_skills"):
+        value = payload.get(list_field)
 
+        if value is None:
+            payload[list_field] = []
+        elif isinstance(value, str):
+            payload[list_field] = [value]
+        elif not isinstance(value, list):
+            payload[list_field] = []
+
+    return payload
 
 def _score_candidate(payload: dict[str, Any]) -> int:
     score = 0

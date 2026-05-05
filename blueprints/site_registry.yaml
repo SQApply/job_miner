@@ -1,7 +1,7 @@
 sites:
   - id: strategic_staff_jobs
     label: Strategic Staffing Solutions Jobs
-    profile: load_more
+    profile: load_more_button
     page_url: "https://careers.strategicstaff.com/#/jobs"
     allowed_hosts:
       - careers.strategicstaff.com
@@ -14,7 +14,7 @@ sites:
 
   - id: jobdiva_jobs
     label: JobDiva Jobs
-    profile: paginated
+    profile: detail_button_capture
     override: jobdiva
     page_url: "https://www2.jobdiva.com/portal/?a=5zjdnwgz9rgt98nybpazqo8bw8rfbl00caqs4j4fd2bztzkfucovot2hjp1hm9he&compid=0#/"
     allowed_hosts:
@@ -30,7 +30,7 @@ sites:
 
   - id: judge_jobs
     label: Judge Jobs
-    profile: paginated
+    profile: paginated_anchor
     page_url: "https://www.judge.com/jobs/"
     allowed_hosts:
       - www.judge.com
@@ -46,7 +46,7 @@ sites:
 
   - id: experis_jobs
     label: Experis Jobs
-    profile: paginated
+    profile: paginated_url_param
     page_url: "https://www.experis.com/en/search?page=1"
     allowed_hosts:
       - "www.experis.com"
@@ -59,7 +59,7 @@ sites:
 
   - id: randstad_jobs
     label: Randstad Jobs
-    profile: load_more
+    profile: load_more_button
     page_url: "https://www.randstad.com/jobs/"
     allowed_hosts:
       - "www.randstad.com"
@@ -73,8 +73,8 @@ sites:
 
   - id: opensystems_jobs
     label: Open Systems Technologies Jobs
-    profile: paginated
-    page_url: "https://www.opensystemstech.com/search"
+    profile: paginated_url_param
+    page_url: "https://www.opensystemstech.com/search?page=1"
     allowed_hosts:
       - "www.opensystemstech.com"
     item_href_contains: "/job/"
@@ -83,3 +83,165 @@ sites:
       - "details"
     output_file: "opensystems_jobs.json"
     override: opensystems
+
+  - id: tandym_jobs
+    label: Tandym Group Jobs
+    profile: paginated_anchor
+    page_url: "https://careers.tandymgroup.com/#/"
+    allowed_hosts:
+      - "careers.tandymgroup.com"
+      - "www.careers.tandymgroup.com"
+    output_file: "tandym_jobs.json"
+
+    item_href_contains: "/job-details/"
+
+    detail_text_patterns:
+      - "apply"
+      - "details"
+      - "view job"
+      - "learn more"
+      - "contractor"
+      - "permanent"
+      - "hourly"
+
+    exclude_exact_urls:
+      - "https://careers.tandymgroup.com/#/"
+      - "https://careers.tandymgroup.com/"
+      - "https://www.careers.tandymgroup.com/#/"
+      - "https://www.careers.tandymgroup.com/"
+      - "https://careers.tandymgroup.com/home-old"
+      - "https://www.careers.tandymgroup.com/home-old"
+
+    session_id: "tandym_jobs_session"
+
+  - id: beaconhill_jobs
+    label: Beacon Hill Staffing Jobs
+    profile: paginated_anchor
+    override: beaconhill
+    page_url: "https://jobs.beaconhillstaffing.com/jobs/job-search/"
+    allowed_hosts:
+      - "jobs.beaconhillstaffing.com"
+      - "bhsg.com"
+      - "www.bhsg.com"
+    output_file: "beaconhill_jobs.json"
+
+    item_href_contains: "/jobs/job/"
+
+    detail_text_patterns:
+      - "details & apply"
+      - "details and apply"
+      - "details"
+      - "apply"
+      - "view job"
+
+    exclude_exact_urls:
+      - "https://jobs.beaconhillstaffing.com/jobs/"
+      - "https://jobs.beaconhillstaffing.com/jobs/job-search/"
+      - "https://jobs.beaconhillstaffing.com/"
+      - "https://bhsg.com/jobs/"
+      - "https://www.bhsg.com/jobs/"
+
+    session_id: "beaconhill_jobs_session"
+
+  - id: yorksolutions_jobs
+    label: York Solutions Jobs
+    profile: generic_listing
+    override: yorksolutions
+    page_url: "https://jobs.yorksolutions.net/yorkjobs_york3.asp"
+    allowed_hosts:
+      - "jobs.yorksolutions.net"
+    output_file: "yorksolutions_jobs.json"
+
+    item_href_contains: "viewjob_york3.asp?id="
+
+    detail_text_patterns:
+      - "engineer"
+      - "developer"
+      - "manager"
+      - "architect"
+      - "technician"
+      - "analyst"
+      - "consultant"
+      - "product"
+      - "support"
+
+    exclude_exact_urls:
+      - "https://jobs.yorksolutions.net/yorkjobs_york3.asp"
+
+    session_id: "yorksolutions_jobs_session"
+
+  - id: ctg_jobs
+    label: CTG Jobs
+    profile: paginated_url_param
+    page_url: "https://careers.ctg.com/na/jobs?page=1"
+    allowed_hosts:
+      - "careers.ctg.com"
+    output_file: "ctg_jobs.json"
+
+    item_href_contains: "/na/jobs/"
+
+    detail_text_patterns:
+      - "apply now"
+      - "apply"
+      - "job id"
+      - "featured job"
+      - "information technology"
+      - "healthcare it"
+
+    exclude_exact_urls:
+      - "https://careers.ctg.com/na/jobs"
+      - "https://careers.ctg.com/na/jobs?page=1"
+
+    session_id: "ctg_jobs_session"
+  
+  - id: akkodis_jobs
+    label: Akkodis Jobs
+    profile: paginated_anchor
+    override: akkodis
+    page_url: "https://www.akkodis.com/en-us/careers/job-results"
+    allowed_hosts:
+      - "www.akkodis.com"
+      - "akkodis.com"
+    output_file: "akkodis_jobs.json"
+
+    item_href_contains: "/en-us/careers/jobs/"
+
+    detail_text_patterns:
+      - "apply"
+      - "apply now"
+      - "reference number"
+      - "contractor"
+      - "contract to hire"
+      - "full time"
+
+    exclude_exact_urls:
+      - "https://www.akkodis.com/en-us/careers/job-results"
+      - "https://akkodis.com/en-us/careers/job-results"
+
+    session_id: "akkodis_jobs_session"
+
+  - id: huxley_jobs
+    label: Huxley Jobs
+    profile: generic_listing
+    page_url: "https://www.huxley.com/en-us/job-search/all-jobs/"
+    allowed_hosts:
+      - "www.huxley.com"
+      - "huxley.com"
+    output_file: "huxley_jobs.json"
+
+    item_href_contains: "/en-us/job-search/"
+
+    detail_text_patterns:
+      - "salary"
+      - "start date"
+      - "remote friendly"
+      - "role type"
+      - "permanent"
+      - "contract"
+      - "updated"
+
+    exclude_exact_urls:
+      - "https://www.huxley.com/en-us/job-search/all-jobs/"
+      - "https://huxley.com/en-us/job-search/all-jobs/"
+
+    session_id: "huxley_jobs_session"

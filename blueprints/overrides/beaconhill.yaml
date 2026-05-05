@@ -1,0 +1,94 @@
+listing:
+  initial_wait_for: 'js:() => {
+    const hasJobs = document.querySelectorAll("a[href*=\"/jobs/job/\"]").length >= 5;
+    const hasPagination = document.querySelectorAll(".facetwp-page[data-page]").length >= 2;
+    return hasJobs && hasPagination;
+  }'
+
+  pagination:
+    enabled: true
+    type: "anchor"
+    max_turns: 100
+    stop_after_stable_rounds: 2
+
+    click_js_override: |
+      (() => {
+        const beforeJobs = Array.from(document.querySelectorAll('a[href*="/jobs/job/"]'))
+          .map(a => a.href)
+          .slice(0, 10);
+
+        const active = document.querySelector('.facetwp-page.active[data-page]');
+        const currentPage = active
+          ? parseInt(active.getAttribute('data-page') || '1', 10)
+          : 1;
+
+        const nextPage = currentPage + 1;
+
+        window.__jm_prev_jobs = beforeJobs;
+        window.__jm_prev_active_page = currentPage;
+        window.__jm_target_page = nextPage;
+        window.__jm_clicked_at = Date.now();
+
+        const candidates = Array.from(document.querySelectorAll('.facetwp-page[data-page]'));
+
+        let target = candidates.find(el => {
+          const page = parseInt(el.getAttribute('data-page') || '0', 10);
+          return page === nextPage && !el.classList.contains('active');
+        });
+
+        if (!target) {
+          target = document.querySelector('.facetwp-page.next');
+        }
+
+        if (!target) {
+          return {
+            ok: false,
+            reason: "pagination_target_not_found",
+            currentPage,
+            nextPage,
+            candidates: candidates.map(el => ({
+              text: (el.innerText || el.textContent || "").trim(),
+              dataPage: el.getAttribute("data-page"),
+              className: el.className,
+              href: el.getAttribute("href")
+            }))
+          };
+        }
+
+        target.scrollIntoView({ block: "center", inline: "center" });
+
+        target.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+        target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+        target.click();
+
+        return {
+          ok: true,
+          method: "dom_click_only",
+          currentPage,
+          nextPage,
+          clickedText: (target.innerText || target.textContent || "").trim(),
+          clickedDataPage: target.getAttribute("data-page"),
+          clickedHref: target.getAttribute("href"),
+          beforeJobs
+        };
+      })();
+
+    wait_for_js_override: |
+      js:() => {
+        const active = document.querySelector('.facetwp-page.active[data-page]');
+        const activePage = active
+          ? parseInt(active.getAttribute('data-page') || '1', 10)
+          : 1;
+
+        const afterJobs = Array.from(document.querySelectorAll('a[href*="/jobs/job/"]'))
+          .map(a => a.href)
+          .slice(0, 10);
+
+        const beforeJobs = window.__jm_prev_jobs || [];
+
+        const pageChanged = activePage === window.__jm_target_page;
+        const jobsChanged = JSON.stringify(afterJobs) !== JSON.stringify(beforeJobs);
+
+        return pageChanged || jobsChanged;
+      }

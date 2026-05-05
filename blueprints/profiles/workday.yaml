@@ -1,20 +1,49 @@
 adapter: workday
 
 listing:
-  item_href_contains: "/jobs/"
+  item_href_contains: ""
+  detail_text_patterns:
+    - "view job"
+    - "job details"
+    - "apply"
   exclude_exact_urls: []
-  initial_wait_for: null
+  initial_wait_for: 'js:() => document.body && document.body.innerText.length > 300'
   session_id: "job_miner_workday_session"
-  load_more:
-    enabled: false
-    max_clicks: 0
-    click_js: ""
-    wait_for_js: ""
+
+  pagination:
+    enabled: true
+    type: "url_param"
+    page_param: "page"
+    start_page: 1
+    step: 1
+    max_turns: 100
+    stop_after_stable_rounds: 2
 
 detail:
   wait_for: "css:h1"
   instruction: |
     Extract exactly one job posting from this page.
-    Return valid JSON matching the schema.
-    Use null for missing scalar fields and [] for missing list fields.
-    Do not invent values.
+
+    Return only valid JSON.
+    Do not return markdown.
+    Do not use code fences.
+    Do not add explanations.
+
+    Rules:
+    - title: exact job title from the page
+    - job_url: canonical detail page URL
+    - apply_url: apply link if visible, else null
+    - company: company name if stated, else null
+    - location_text: displayed location text, else null
+    - employment_type: displayed type such as Contract, Permanent, Full-time, etc.
+    - duration: contract duration if stated
+    - compensation_text: pay/rate/salary text if stated
+    - summary: concise role summary from the page
+    - responsibilities: list of responsibilities found on page
+    - required_skills: list of required skills and experience
+    - preferred_skills: list of preferred or nice-to-have items
+    - job_reference: job id or reference if present
+
+    Use null for missing scalar fields.
+    Use [] for missing list fields.
+    Never invent values.

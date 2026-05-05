@@ -1,23 +1,33 @@
-adapter: search_first
+adapter: detail_button_capture
 
 listing:
   item_href_contains: ""
   detail_text_patterns:
-    - "learn more"
     - "details"
+    - "view details"
     - "view job"
   exclude_exact_urls: []
   initial_wait_for: 'js:() => document.body && document.body.innerText.length > 300'
-  session_id: "job_miner_search_first_session"
+  session_id: "job_miner_detail_button_capture_session"
+  detail_capture_mode: "click_buttons"
 
-  search:
-    enabled: true
+  detail_button:
+    selector: "a, button, [role='button'], span, div"
+    text_patterns:
+      - "details"
+      - "view details"
+      - "view job"
+    max_buttons: 100
 
   pagination:
     enabled: true
-    type: "anchor"
-    max_turns: 100
+    type: "button"
+    max_turns: 250
     stop_after_stable_rounds: 3
+    next_text_patterns:
+      - "next"
+      - ">"
+      - "»"
 
 detail:
   wait_for: "css:h1"

@@ -32,11 +32,11 @@ def collect_job_links(
     page_url: str,
     allowed_hosts: list[str],
     href_contains: str,
-    detail_text_patterns: list[str],
-    exclude_exact_urls: list[str],
+    detail_text_patterns: list[str] | None = None,
+    exclude_exact_urls: list[str] | None = None,
 ) -> list[str]:
     links: list[str] = []
-    excluded = {_normalized(url) for url in exclude_exact_urls}
+    excluded = {_normalized(url) for url in (exclude_exact_urls or [])}
     allowed = set(allowed_hosts)
     page_url_norm = _normalized(page_url)
 
@@ -62,7 +62,7 @@ def collect_job_links(
         text = link.get("text") or link.get("title") or ""
 
         href_match = href_contains in norm if href_contains else True
-        text_match = _text_matches_any(text, detail_text_patterns)
+        text_match = _text_matches_any(text, detail_text_patterns or [])
 
         if href_match or text_match:
             links.append(norm)

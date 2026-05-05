@@ -1,23 +1,29 @@
-adapter: search_first
+adapter: load_more_button
 
 listing:
-  item_href_contains: ""
+  item_href_contains: "/jobs/"
   detail_text_patterns:
-    - "learn more"
     - "details"
+    - "view details"
+    - "learn more"
     - "view job"
+    - "job details"
+    - "read more"
   exclude_exact_urls: []
-  initial_wait_for: 'js:() => document.body && document.body.innerText.length > 300'
-  session_id: "job_miner_search_first_session"
+  initial_wait_for: 'js:() => document.querySelectorAll("a[href]").length > 0 && document.body.innerText.length > 300'
+  session_id: "job_miner_load_more_button_session"
 
-  search:
+  load_more:
     enabled: true
-
-  pagination:
-    enabled: true
-    type: "anchor"
-    max_turns: 100
+    max_clicks: 200
     stop_after_stable_rounds: 3
+    button_text_patterns:
+      - "load more"
+      - "view more"
+      - "view 30 more"
+      - "show more"
+      - "see more"
+      - "more jobs"
 
 detail:
   wait_for: "css:h1"

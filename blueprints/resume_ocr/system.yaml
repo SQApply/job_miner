@@ -1,8 +1,8 @@
 ocr:
-  backend: "glmocr_sdk"          # glmocr_sdk | ollama_image
+  backend: "ollama_image"          # glmocr_sdk | ollama_image
   ollama_base_url: "http://127.0.0.1:11434"
   ollama_model: "glm-ocr-optimized"
-  glmocr_config_path: "configs/glm_ocr_ollama.yaml"
+  glmocr_config_path: "configs/resume_ocr/glm_ocr_ollama.yaml"
   layout_device: "cpu"           # cpu keeps the single GPU free for GLM-OCR generation
   prompt: "Text Recognition:"
   max_pages: 8                    # resumes should rarely exceed this; fail-fast for abuse
@@ -27,6 +27,6 @@ parser:
   max_markdown_chars_for_extraction: 24000
 
 output:
-  dir: "data/processed"
-  failed_dir: "data/failed"
-  log_dir: "data/logs"
+  dir: "data/resumes/processed"
+  failed_dir: "data/resumes/failed"
+  log_dir: "data/resumes/logs"

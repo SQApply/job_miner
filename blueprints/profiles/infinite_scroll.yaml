@@ -1,22 +1,19 @@
-adapter: search_first
+adapter: infinite_scroll
 
 listing:
-  item_href_contains: ""
+  item_href_contains: "/jobs/"
   detail_text_patterns:
-    - "learn more"
     - "details"
+    - "view details"
+    - "learn more"
     - "view job"
   exclude_exact_urls: []
   initial_wait_for: 'js:() => document.body && document.body.innerText.length > 300'
-  session_id: "job_miner_search_first_session"
+  session_id: "job_miner_infinite_scroll_session"
 
-  search:
+  infinite_scroll:
     enabled: true
-
-  pagination:
-    enabled: true
-    type: "anchor"
-    max_turns: 100
+    max_scrolls: 50
     stop_after_stable_rounds: 3
 
 detail:

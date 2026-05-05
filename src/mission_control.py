@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .blueprint_hub import BlueprintHub
-from .crawl.browser_lane import build_browser_config, detail_run_config
+from .crawl.browser_lane import build_browser_config, detail_run_config, close_session
 from .extract.model_lane import build_llm_strategy, parse_extracted_jobs
 from .extract.promptforge import build_instruction
 from .extract.validator import is_valid_job
@@ -104,6 +104,18 @@ async def run_target(root: Path, target_id: str) -> RunResult:
                 t0 = time.perf_counter()
                 detail_session_id = f"{target_id}_detail_session_{item_index}"
 
+                async def cleanup_detail_session() -> None:
+                    try:
+                        await close_session(crawler, detail_session_id)
+                    except Exception as cleanup_exc:
+                        session_logger.log(
+                            "detail_session_cleanup_failed",
+                            job_url=job_url,
+                            item_index=item_index,
+                            detail_session_id=detail_session_id,
+                            error_message=str(cleanup_exc),
+                        )
+
                 try:
                     result = await crawler.arun(
                         url=job_url,
@@ -114,6 +126,67 @@ async def run_target(root: Path, target_id: str) -> RunResult:
                             session_id=detail_session_id,
                         ),
                     )
+
+                    elapsed = round(time.perf_counter() - t0, 3)
+
+                    gpu_after = query_gpu_snapshot()
+                    session_logger.log(
+                        "gpu_after_extract",
+                        job_url=job_url,
+                        item_index=item_index,
+                        elapsed_seconds=elapsed,
+                        gpu=gpu_after,
+                    )
+
+                    if not result.success:
+                        _save_failed_payload(
+                            root,
+                            target_id,
+                            _slugify(job_url),
+                            f"CRAWL FAILED: {result.error_message}",
+                        )
+                        session_logger.log(
+                            "extract_failed",
+                            job_url=job_url,
+                            item_index=item_index,
+                            elapsed_seconds=elapsed,
+                            error_message=result.error_message,
+                        )
+                        return None
+
+                    raw_content = result.extracted_content
+                    job = parse_extracted_jobs(raw_content, job_url)
+
+                    if job is None:
+                        _save_failed_payload(root, target_id, _slugify(job_url), raw_content)
+                        session_logger.log(
+                            "parse_failed",
+                            job_url=job_url,
+                            item_index=item_index,
+                            elapsed_seconds=elapsed,
+                        )
+                        return None
+
+                    if is_valid_job(job):
+                        session_logger.log(
+                            "extract_saved",
+                            job_url=job_url,
+                            item_index=item_index,
+                            elapsed_seconds=elapsed,
+                            title=job.title,
+                        )
+                        return job
+
+                    _save_failed_payload(root, target_id, _slugify(job_url), raw_content)
+                    session_logger.log(
+                        "validation_failed",
+                        job_url=job_url,
+                        item_index=item_index,
+                        elapsed_seconds=elapsed,
+                        parsed_title=job.title,
+                    )
+                    return None
+
                 except Exception as exc:
                     elapsed = round(time.perf_counter() - t0, 3)
                     _save_failed_payload(
@@ -131,65 +204,8 @@ async def run_target(root: Path, target_id: str) -> RunResult:
                     )
                     return None
 
-                elapsed = round(time.perf_counter() - t0, 3)
-
-                gpu_after = query_gpu_snapshot()
-                session_logger.log(
-                    "gpu_after_extract",
-                    job_url=job_url,
-                    item_index=item_index,
-                    elapsed_seconds=elapsed,
-                    gpu=gpu_after,
-                )
-
-                if not result.success:
-                    _save_failed_payload(
-                        root,
-                        target_id,
-                        _slugify(job_url),
-                        f"CRAWL FAILED: {result.error_message}",
-                    )
-                    session_logger.log(
-                        "extract_failed",
-                        job_url=job_url,
-                        item_index=item_index,
-                        elapsed_seconds=elapsed,
-                        error_message=result.error_message,
-                    )
-                    return None
-
-                raw_content = result.extracted_content
-                job = parse_extracted_jobs(raw_content, job_url)
-
-                if job is None:
-                    _save_failed_payload(root, target_id, _slugify(job_url), raw_content)
-                    session_logger.log(
-                        "parse_failed",
-                        job_url=job_url,
-                        item_index=item_index,
-                        elapsed_seconds=elapsed,
-                    )
-                    return None
-
-                if is_valid_job(job):
-                    session_logger.log(
-                        "extract_saved",
-                        job_url=job_url,
-                        item_index=item_index,
-                        elapsed_seconds=elapsed,
-                        title=job.title,
-                    )
-                    return job
-
-                _save_failed_payload(root, target_id, _slugify(job_url), raw_content)
-                session_logger.log(
-                    "validation_failed",
-                    job_url=job_url,
-                    item_index=item_index,
-                    elapsed_seconds=elapsed,
-                    parsed_title=job.title,
-                )
-                return None
+                finally:
+                    await cleanup_detail_session()
 
         session_logger.log(
             "parallel_extraction_start",

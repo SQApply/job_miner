@@ -33,3 +33,4 @@ Thumbs.db
 /data/
 data/
 .crawl4ai/
+smoke_test/*.json

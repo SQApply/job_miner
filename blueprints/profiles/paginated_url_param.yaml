@@ -1,4 +1,4 @@
-adapter: search_first
+adapter: paginated_url_param
 
 listing:
   item_href_contains: ""
@@ -8,16 +8,16 @@ listing:
     - "view job"
   exclude_exact_urls: []
   initial_wait_for: 'js:() => document.body && document.body.innerText.length > 300'
-  session_id: "job_miner_search_first_session"
-
-  search:
-    enabled: true
+  session_id: "job_miner_paginated_url_param_session"
 
   pagination:
     enabled: true
-    type: "anchor"
+    type: "url_param"
+    page_param: "page"
+    start_page: 1
+    step: 1
     max_turns: 100
-    stop_after_stable_rounds: 3
+    stop_after_stable_rounds: 2
 
 detail:
   wait_for: "css:h1"

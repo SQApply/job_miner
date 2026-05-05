@@ -1,0 +1,124 @@
+listing:
+  initial_wait_for: 'js:() => {
+    const hasJobs = document.querySelectorAll("a[href*=\"/en-us/careers/jobs/\"]").length >= 5;
+    const hasPagination =
+      document.querySelectorAll("[class*=\"pagination\"]").length >= 3 ||
+      document.body.innerText.includes("481 Current openings");
+    return hasJobs && hasPagination;
+  }'
+
+  pagination:
+    enabled: true
+    type: "anchor"
+    max_turns: 100
+    stop_after_stable_rounds: 2
+
+    click_js_override: |
+      (() => {
+        const beforeJobs = Array.from(
+          document.querySelectorAll('a[href*="/en-us/careers/jobs/"]')
+        ).map(a => a.href).slice(0, 10);
+
+        window.__jm_prev_jobs = beforeJobs;
+        window.__jm_prev_body_sig = (document.body.innerText || "").slice(0, 10000);
+
+        const activeCandidates = Array.from(
+          document.querySelectorAll('[class*="pagination"][class*="active"], li[class*="active"], button[class*="active"]')
+        );
+
+        let currentPage = 1;
+
+        for (const el of activeCandidates) {
+          const text = (el.innerText || el.textContent || "").trim();
+          const n = parseInt(text, 10);
+          if (!Number.isNaN(n)) {
+            currentPage = n;
+            break;
+          }
+        }
+
+        const nextPage = currentPage + 1;
+        window.__jm_target_page = nextPage;
+
+        const allClickable = Array.from(
+          document.querySelectorAll('a, button, li, span, [role="button"]')
+        ).filter(el => {
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return (
+            style.display !== "none" &&
+            style.visibility !== "hidden" &&
+            rect.width > 0 &&
+            rect.height > 0
+          );
+        });
+
+        let target = allClickable.find(el => {
+          const text = (el.innerText || el.textContent || "").trim();
+          return text === String(nextPage);
+        });
+
+        if (!target) {
+          target = allClickable.find(el => {
+            const cls = String(el.className || "").toLowerCase();
+            const aria = String(el.getAttribute("aria-label") || "").toLowerCase();
+            const title = String(el.getAttribute("title") || "").toLowerCase();
+
+            return (
+              cls.includes("right-arrow") ||
+              cls.includes("next") ||
+              aria.includes("next") ||
+              title.includes("next")
+            );
+          });
+        }
+
+        if (!target) {
+          return {
+            ok: false,
+            reason: "akkodis_pagination_target_not_found",
+            currentPage,
+            nextPage,
+            candidates: allClickable.slice(0, 80).map(el => ({
+              tag: el.tagName,
+              text: (el.innerText || el.textContent || "").trim(),
+              className: String(el.className || ""),
+              aria: el.getAttribute("aria-label"),
+              title: el.getAttribute("title")
+            }))
+          };
+        }
+
+        target.scrollIntoView({ block: "center", inline: "center" });
+
+        target.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+        target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+        target.click();
+
+        return {
+          ok: true,
+          method: "akkodis_dom_click",
+          currentPage,
+          nextPage,
+          clickedText: (target.innerText || target.textContent || "").trim(),
+          clickedClass: String(target.className || ""),
+          clickedAria: target.getAttribute("aria-label"),
+          clickedTitle: target.getAttribute("title")
+        };
+      })();
+
+    wait_for_js_override: |
+      js:() => {
+        const afterJobs = Array.from(
+          document.querySelectorAll('a[href*="/en-us/careers/jobs/"]')
+        ).map(a => a.href).slice(0, 10);
+
+        const beforeJobs = window.__jm_prev_jobs || [];
+        const bodySig = (document.body.innerText || "").slice(0, 10000);
+
+        const jobsChanged = JSON.stringify(afterJobs) !== JSON.stringify(beforeJobs);
+        const bodyChanged = bodySig !== (window.__jm_prev_body_sig || "");
+
+        return jobsChanged || bodyChanged;
+      }

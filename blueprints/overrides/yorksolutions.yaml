@@ -1,0 +1,2 @@
+detail:
+  wait_for: "css:body"
