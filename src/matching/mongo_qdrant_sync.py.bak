@@ -1,0 +1,46 @@
+from __future__ import annotations
+
+from typing import Any
+
+from ..infrastructure.settings import VectorSettings
+from ..warehouse.repositories import WarehouseRepository
+from .embeddings import OllamaEmbedder
+from .qdrant_store import QdrantVectorStore
+
+
+def build_embedder(settings: VectorSettings) -> OllamaEmbedder:
+    return OllamaEmbedder(settings.embedding_model, settings.ollama_url, settings.embedding_batch_size, max_chars_per_text=settings.max_chars_per_text)
+
+
+def build_vector_store(settings: VectorSettings) -> QdrantVectorStore:
+    return QdrantVectorStore(settings.qdrant_url, settings.qdrant_api_key)
+
+
+def index_job_towers(*, repo: WarehouseRepository, store: QdrantVectorStore, embedder: OllamaEmbedder, collection_name: str, recreate: bool = False, only_pending: bool = False, limit: int | None = None) -> dict[str, Any]:
+    rows = [r for r in repo.job_towers(only_pending=only_pending, limit=limit) if str(r.get("job_embedding_text") or "").strip()]
+    if not rows:
+        return {"collection_name": collection_name, "indexed_records": 0}
+    ids = [f"job:{r['job_id']}:{embedder.model}" for r in rows]
+    texts = [str(r["job_embedding_text"]) for r in rows]
+    payloads = [{"record_type": "job", "job_id": r.get("job_id"), "target_id": r.get("target_id"), "title": r.get("title"), "company": r.get("company"), "location_text": r.get("location_text"), "job_url": r.get("job_url"), "apply_url": r.get("apply_url"), "source_content_hash": r.get("source_content_hash"), "embedding_model": embedder.model, "required_skills": r.get("required_skills") or [], "preferred_skills": r.get("preferred_skills") or []} for r in rows]
+    vectors = embedder.embed_many(texts); size = len(vectors[0])
+    store.ensure_collection(collection_name, vector_size=size, recreate=recreate)
+    point_ids = store.upsert(collection_name, ids=ids, vectors=vectors, payloads=payloads)
+    for r, pid in zip(rows, point_ids):
+        repo.mark_tower_indexed(record_type="job", record_id=str(r["job_id"]), collection_name=collection_name, embedding_model=embedder.model, source_content_hash=str(r.get("source_content_hash") or ""), vector_size=size, qdrant_point_id=pid)
+    return {"collection_name": collection_name, "indexed_records": len(rows), "vector_size": size, "embedding_model": embedder.model}
+
+
+def index_candidate_towers(*, repo: WarehouseRepository, store: QdrantVectorStore, embedder: OllamaEmbedder, collection_name: str, recreate: bool = False, only_pending: bool = False, limit: int | None = None) -> dict[str, Any]:
+    rows = [r for r in repo.candidate_towers(only_pending=only_pending, limit=limit) if str(r.get("candidate_embedding_text") or "").strip()]
+    if not rows:
+        return {"collection_name": collection_name, "indexed_records": 0}
+    ids = [f"candidate:{r['candidate_id']}:{embedder.model}" for r in rows]
+    texts = [str(r["candidate_embedding_text"]) for r in rows]
+    payloads = [{"record_type": "candidate", "candidate_id": r.get("candidate_id"), "resume_id": r.get("resume_id"), "candidate_name": r.get("full_name"), "email": r.get("email"), "location": r.get("location"), "source_content_hash": r.get("source_content_hash"), "embedding_model": embedder.model, "primary_skills": r.get("primary_skills") or []} for r in rows]
+    vectors = embedder.embed_many(texts); size = len(vectors[0])
+    store.ensure_collection(collection_name, vector_size=size, recreate=recreate)
+    point_ids = store.upsert(collection_name, ids=ids, vectors=vectors, payloads=payloads)
+    for r, pid in zip(rows, point_ids):
+        repo.mark_tower_indexed(record_type="candidate", record_id=str(r["candidate_id"]), collection_name=collection_name, embedding_model=embedder.model, source_content_hash=str(r.get("source_content_hash") or ""), vector_size=size, qdrant_point_id=pid)
+    return {"collection_name": collection_name, "indexed_records": len(rows), "vector_size": size, "embedding_model": embedder.model}

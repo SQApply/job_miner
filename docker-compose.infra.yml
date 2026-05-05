@@ -1,0 +1,22 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: job_miner_mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: job_miner
+      MONGO_INITDB_ROOT_PASSWORD: job_miner
+    volumes:
+      - ./data/mongo_storage:/data/db
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: job_miner_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./data/qdrant_storage:/qdrant/storage

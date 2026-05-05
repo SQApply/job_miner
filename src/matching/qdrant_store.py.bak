@@ -1,0 +1,63 @@
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass
+from typing import Any
+
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
+
+NS = uuid.UUID("7e19dbd6-5e8f-4c9d-9e89-589f0d75c001")
+
+
+def stable_qdrant_point_id(raw_id: str) -> str:
+    return str(uuid.uuid5(NS, raw_id))
+
+
+@dataclass(slots=True)
+class QdrantMatchResult:
+    point_id: str
+    score: float
+    payload: dict[str, Any]
+
+
+@dataclass(slots=True)
+class QdrantVectorStore:
+    url: str = "http://localhost:6333"
+    api_key: str | None = None
+
+    def __post_init__(self) -> None:
+        self.client = QdrantClient(url=self.url, api_key=self.api_key)
+
+    def healthcheck(self) -> dict[str, Any]:
+        cols = self.client.get_collections()
+        return {"ok": True, "collections": [c.name for c in cols.collections]}
+
+    def collection_exists(self, name: str) -> bool:
+        try:
+            self.client.get_collection(name); return True
+        except Exception:
+            return False
+
+    def ensure_collection(self, name: str, *, vector_size: int, recreate: bool = False) -> None:
+        if self.collection_exists(name):
+            if recreate:
+                self.client.delete_collection(name)
+            else:
+                return
+        self.client.create_collection(collection_name=name, vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE))
+
+    def upsert(self, name: str, *, ids: list[str], vectors: list[list[float]], payloads: list[dict[str, Any]], batch_size: int = 64) -> list[str]:
+        point_ids = [stable_qdrant_point_id(i) for i in ids]
+        for start in range(0, len(ids), batch_size):
+            end = min(start + batch_size, len(ids))
+            points = [models.PointStruct(id=point_ids[i], vector=vectors[i], payload=payloads[i]) for i in range(start, end)]
+            self.client.upsert(collection_name=name, points=points, wait=True)
+        return point_ids
+
+    def search(self, name: str, *, query_vector: list[float], top_n: int) -> list[QdrantMatchResult]:
+        try:
+            results = self.client.search(collection_name=name, query_vector=query_vector, limit=top_n, with_payload=True)
+        except AttributeError:
+            results = self.client.query_points(collection_name=name, query=query_vector, limit=top_n, with_payload=True).points
+        return [QdrantMatchResult(str(r.id), float(r.score), dict(r.payload or {})) for r in results]

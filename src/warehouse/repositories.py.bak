@@ -1,0 +1,126 @@
+from __future__ import annotations
+
+from typing import Any, Iterable
+
+from pymongo import UpdateOne
+from pymongo.database import Database
+
+from .base import utc_now
+from .documents import CandidateJobMatchDocument, CandidateTowerDocument, JobCurrentDocument, JobHistoryDocument, JobRawExtractionDocument, JobTowerDocument, QdrantIndexStateDocument, ResumeProfileCurrentDocument, ResumeProfileHistoryDocument, WarehouseRunSessionDocument
+from .hashing import make_candidate_id, make_job_id, make_resume_id_from_sha, stable_hash
+from .serializers import as_str_list, to_plain_data
+
+
+class WarehouseRepository:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def upsert_run_session(self, doc: WarehouseRunSessionDocument) -> None:
+        self.db[doc.collection_name].update_one({"run_session_id": doc.run_session_id}, {"$set": doc.to_mongo(), "$setOnInsert": {"created_at": doc.created_at}}, upsert=True)
+
+    def upsert_job_raw(self, doc: JobRawExtractionDocument) -> None:
+        self.db[doc.collection_name].update_one({"raw_id": doc.raw_id}, {"$set": doc.to_mongo(), "$setOnInsert": {"created_at": doc.created_at}}, upsert=True)
+
+    def upsert_job(self, job_payload: dict[str, Any], *, target_id: str, run_session_id: str | None = None) -> tuple[str, bool, bool]:
+        payload = to_plain_data(job_payload)
+        job_id = make_job_id(payload, target_id=target_id)
+        content_hash = stable_hash(payload)
+        now = utc_now()
+        existing = self.db[JobCurrentDocument.collection_name].find_one({"job_id": job_id})
+        changed = existing is None or existing.get("content_hash") != content_hash
+        version = (int((existing or {}).get("version") or 0) + 1) if changed else int(existing.get("version") or 1)
+        source_url = payload.get("source_url") or payload.get("job_url") or payload.get("url")
+        doc = JobCurrentDocument(
+            _id=job_id, job_id=job_id, target_id=target_id, source_url=source_url,
+            job_url=payload.get("job_url") or payload.get("url"), apply_url=payload.get("apply_url"),
+            title=payload.get("title"), company=payload.get("company"), location_text=payload.get("location_text") or payload.get("location"),
+            employment_type=payload.get("employment_type"), duration=payload.get("duration"), compensation_text=payload.get("compensation_text") or payload.get("salary_text"),
+            summary=payload.get("summary") or payload.get("description"), responsibilities=as_str_list(payload.get("responsibilities")), required_skills=as_str_list(payload.get("required_skills")), preferred_skills=as_str_list(payload.get("preferred_skills")),
+            job_reference=payload.get("job_reference") or payload.get("reference"), content_hash=content_hash, first_seen_at=(existing or {}).get("first_seen_at") or now, last_seen_at=now, last_run_session_id=run_session_id, is_active=True, version=version, raw_payload=payload,
+        )
+        data = doc.to_mongo(); data.pop("created_at", None)
+        self.db[JobCurrentDocument.collection_name].update_one({"job_id": job_id}, {"$set": data, "$setOnInsert": {"created_at": now}}, upsert=True)
+        if changed:
+            hid = f"jobhist_{job_id}_{content_hash[:16]}"
+            hist = JobHistoryDocument(_id=hid, history_id=hid, job_id=job_id, target_id=target_id, source_url=source_url, content_hash=content_hash, version=version, payload=payload, run_session_id=run_session_id)
+            self.db[JobHistoryDocument.collection_name].update_one({"history_id": hid}, {"$setOnInsert": hist.to_mongo()}, upsert=True)
+        raw_id = "jobraw_" + stable_hash({"target_id": target_id, "run_session_id": run_session_id, "content_hash": content_hash})[:32]
+        self.upsert_job_raw(JobRawExtractionDocument(_id=raw_id, raw_id=raw_id, run_session_id=run_session_id, target_id=target_id, source_url=source_url, payload=payload, content_hash=content_hash))
+        return job_id, existing is None, changed
+
+    def upsert_jobs(self, jobs: Iterable[dict[str, Any]], *, target_id: str, run_session_id: str | None = None) -> dict[str, int]:
+        stats = {"input": 0, "inserted": 0, "changed": 0, "unchanged": 0}
+        for job in jobs:
+            stats["input"] += 1
+            _, inserted, changed = self.upsert_job(job, target_id=target_id, run_session_id=run_session_id)
+            stats["inserted" if inserted else "changed" if changed else "unchanged"] += 1
+        return stats
+
+    def upsert_resume_profile(self, profile_payload: dict[str, Any], *, run_session_id: str | None = None) -> tuple[str, bool, bool]:
+        p = to_plain_data(profile_payload)
+        sha = str(p.get("sha256") or "")
+        if not sha:
+            raise ValueError("Resume profile payload missing sha256")
+        rid = str(p.get("resume_id") or make_resume_id_from_sha(sha))
+        ch = stable_hash(p); now = utc_now(); existing = self.db[ResumeProfileCurrentDocument.collection_name].find_one({"resume_id": rid}); changed = existing is None or existing.get("content_hash") != ch
+        doc = ResumeProfileCurrentDocument(_id=rid, resume_id=rid, sha256=sha, source_file_name=str(p.get("source_file_name") or ""), contact=p.get("contact") or {}, headline=p.get("headline"), summary=p.get("summary"), total_experience_years=p.get("total_experience_years"), current_title=p.get("current_title"), current_company=p.get("current_company"), primary_skills=as_str_list(p.get("primary_skills")), secondary_skills=as_str_list(p.get("secondary_skills")), tools_and_platforms=as_str_list(p.get("tools_and_platforms")), programming_languages=as_str_list(p.get("programming_languages")), domains=as_str_list(p.get("domains")), certifications=as_str_list(p.get("certifications")), experience=p.get("experience") or [], education=p.get("education") or [], projects=p.get("projects") or [], languages=as_str_list(p.get("languages")), raw_ocr_markdown_path=p.get("raw_ocr_markdown_path"), parse_warnings=as_str_list(p.get("parse_warnings")), content_hash=ch, first_seen_at=(existing or {}).get("first_seen_at") or now, last_seen_at=now, last_run_session_id=run_session_id, is_active=True, raw_payload=p)
+        data = doc.to_mongo(); data.pop("created_at", None)
+        self.db[ResumeProfileCurrentDocument.collection_name].update_one({"resume_id": rid}, {"$set": data, "$setOnInsert": {"created_at": now}}, upsert=True)
+        if changed:
+            hid = f"reshist_{rid}_{ch[:16]}"
+            hist = ResumeProfileHistoryDocument(_id=hid, history_id=hid, resume_id=rid, sha256=sha, source_file_name=str(p.get("source_file_name") or ""), content_hash=ch, payload=p, run_session_id=run_session_id)
+            self.db[ResumeProfileHistoryDocument.collection_name].update_one({"history_id": hid}, {"$setOnInsert": hist.to_mongo()}, upsert=True)
+        return rid, existing is None, changed
+
+    def upsert_candidate_tower(self, record_payload: dict[str, Any], *, source_content_hash: str | None = None) -> str:
+        p = to_plain_data(record_payload); sha = str(p.get("sha256") or ""); cid = str(p.get("candidate_id") or make_candidate_id(sha)); rid = str(p.get("resume_id") or make_resume_id_from_sha(sha)); sh = source_content_hash or stable_hash(p)
+        doc = CandidateTowerDocument(_id=cid, candidate_id=cid, resume_id=rid, source_file_name=str(p.get("source_file_name") or ""), sha256=sha, full_name=p.get("full_name"), email=p.get("email"), phone=p.get("phone"), location=p.get("location"), current_title=p.get("current_title"), current_company=p.get("current_company"), total_experience_years=p.get("total_experience_years"), primary_skills=as_str_list(p.get("primary_skills")), secondary_skills=as_str_list(p.get("secondary_skills")), domains=as_str_list(p.get("domains")), identity_text=str(p.get("identity_text") or ""), skills_text=str(p.get("skills_text") or ""), experience_text=str(p.get("experience_text") or ""), education_text=str(p.get("education_text") or ""), candidate_embedding_text=str(p.get("candidate_embedding_text") or ""), source_content_hash=sh)
+        data = doc.to_mongo(); data.pop("created_at", None)
+        self.db[CandidateTowerDocument.collection_name].update_one({"candidate_id": cid}, {"$set": data, "$setOnInsert": {"created_at": utc_now()}}, upsert=True)
+        return cid
+
+    def upsert_job_tower(self, doc: JobTowerDocument) -> str:
+        data = doc.to_mongo(); data.pop("created_at", None)
+        existing = self.db[JobTowerDocument.collection_name].find_one({"job_id": doc.job_id})
+        if existing and existing.get("source_content_hash") == doc.source_content_hash:
+            data["embedding_status"] = existing.get("embedding_status", "pending"); data["embedding_model"] = existing.get("embedding_model"); data["last_indexed_at"] = existing.get("last_indexed_at")
+        self.db[JobTowerDocument.collection_name].update_one({"job_id": doc.job_id}, {"$set": data, "$setOnInsert": {"created_at": utc_now()}}, upsert=True)
+        return doc.job_tower_id
+
+    def mark_tower_indexed(self, *, record_type: str, record_id: str, collection_name: str, embedding_model: str, source_content_hash: str, vector_size: int, qdrant_point_id: str) -> None:
+        now = utc_now(); index_id = f"{record_type}:{record_id}:{embedding_model}"
+        doc = QdrantIndexStateDocument(_id=index_id, index_id=index_id, record_type=record_type, record_id=record_id, collection_name_value=collection_name, embedding_model=embedding_model, source_content_hash=source_content_hash, vector_size=vector_size, qdrant_point_id=qdrant_point_id, indexed_at=now)  # type: ignore[arg-type]
+        self.db[QdrantIndexStateDocument.collection_name].update_one({"index_id": index_id}, {"$set": doc.to_mongo(), "$setOnInsert": {"created_at": now}}, upsert=True)
+        coll = JobTowerDocument.collection_name if record_type == "job" else CandidateTowerDocument.collection_name
+        key = "job_id" if record_type == "job" else "candidate_id"
+        self.db[coll].update_one({key: record_id}, {"$set": {"embedding_status": "indexed", "embedding_model": embedding_model, "last_indexed_at": now, "updated_at": now}})
+
+    def upsert_matches(self, matches: list[CandidateJobMatchDocument]) -> None:
+        if not matches: return
+        ops = [UpdateOne({"match_run_id": m.match_run_id, "candidate_id": m.candidate_id, "job_id": m.job_id}, {"$set": m.to_mongo(), "$setOnInsert": {"created_at": m.created_at}}, upsert=True) for m in matches]
+        self.db[CandidateJobMatchDocument.collection_name].bulk_write(ops, ordered=False)
+
+    def counts(self) -> dict[str, int]:
+        names = ["warehouse_run_sessions", "job_raw_extractions", "jobs_current", "jobs_history", "resume_profiles_current", "resume_profiles_history", "job_tower_records", "candidate_tower_records", "qdrant_index_state", "candidate_job_matches"]
+        return {name: self.db[name].count_documents({}) for name in names}
+
+    def active_jobs(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        cur = self.db[JobCurrentDocument.collection_name].find({"is_active": True}).sort("last_seen_at", -1)
+        return list(cur.limit(limit)) if limit else list(cur)
+
+    def active_resume_profiles(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        cur = self.db[ResumeProfileCurrentDocument.collection_name].find({"is_active": True}).sort("last_seen_at", -1)
+        return list(cur.limit(limit)) if limit else list(cur)
+
+    def job_towers(self, *, only_pending: bool = False, limit: int | None = None) -> list[dict[str, Any]]:
+        q = {"embedding_status": {"$ne": "indexed"}} if only_pending else {}
+        cur = self.db[JobTowerDocument.collection_name].find(q).sort("updated_at", -1)
+        return list(cur.limit(limit)) if limit else list(cur)
+
+    def candidate_towers(self, *, only_pending: bool = False, limit: int | None = None) -> list[dict[str, Any]]:
+        q = {"embedding_status": {"$ne": "indexed"}} if only_pending else {}
+        cur = self.db[CandidateTowerDocument.collection_name].find(q).sort("updated_at", -1)
+        return list(cur.limit(limit)) if limit else list(cur)
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        return self.db[JobCurrentDocument.collection_name].find_one({"job_id": job_id})
