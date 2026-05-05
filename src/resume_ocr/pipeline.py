@@ -8,7 +8,7 @@ from pathlib import Path
 from .gpu_monitor import query_gpu_snapshot
 from .logger import SessionLogger
 from .ocr.backends.factory import build_ocr_backend
-from .ocr.preprocess import extract_native_pdf_text
+from .ocr.preprocess import extract_native_docx_text, extract_native_pdf_text
 from .parse.quality import estimate_ocr_quality
 from .parse.resume_extractor import ResumeExtractor
 from .prepare.candidate_tower import build_candidate_tower_record
@@ -32,7 +32,15 @@ def _resume_id_from_hash(sha256: str) -> str:
     return "res_" + sha256[:24]
 
 
-def _native_text_doc(source_path: Path, *, resume_id: str, sha256: str, markdown: str) -> OcrDocument:
+def _native_text_doc(
+    source_path: Path,
+    *,
+    resume_id: str,
+    sha256: str,
+    markdown: str,
+    backend: str,
+    raw_source: str,
+) -> OcrDocument:
     now = datetime.now(timezone.utc)
     return OcrDocument(
         source_path=str(source_path),
@@ -40,10 +48,10 @@ def _native_text_doc(source_path: Path, *, resume_id: str, sha256: str, markdown
         sha256=sha256,
         file_name=source_path.name,
         file_ext=source_path.suffix.lower(),
-        backend="native_pdf_text",
+        backend=backend,
         used_native_text=True,
         markdown=markdown,
-        raw_result={"source": "embedded_pdf_text"},
+        raw_result={"source": raw_source},
         started_at=now,
         completed_at=now,
         elapsed_seconds=0.0,
@@ -64,14 +72,34 @@ class ResumeOcrPipeline:
         )
 
     def _ocr_or_native(self, source_path: Path, *, resume_id: str, sha256: str) -> OcrDocument:
-        if (
-            self.config.ocr.prefer_native_pdf_text
-            and source_path.suffix.lower() == ".pdf"
-        ):
+        suffix = source_path.suffix.lower()
+
+        if suffix == ".docx":
+            native_text = extract_native_docx_text(source_path)
+            if len(native_text) < self.config.parser.min_markdown_chars:
+                raise ValueError(f"DOCX native text too short: {len(native_text)} chars")
+            self.logger.log("native_docx_text_used", source_path=str(source_path), chars=len(native_text))
+            return _native_text_doc(
+                source_path,
+                resume_id=resume_id,
+                sha256=sha256,
+                markdown=native_text,
+                backend="native_docx_text",
+                raw_source="embedded_docx_text",
+            )
+
+        if self.config.ocr.prefer_native_pdf_text and suffix == ".pdf":
             native_text = extract_native_pdf_text(source_path, self.config.ocr.max_pages)
             if len(native_text) >= self.config.ocr.min_native_text_chars:
                 self.logger.log("native_pdf_text_used", source_path=str(source_path), chars=len(native_text))
-                return _native_text_doc(source_path, resume_id=resume_id, sha256=sha256, markdown=native_text)
+                return _native_text_doc(
+                    source_path,
+                    resume_id=resume_id,
+                    sha256=sha256,
+                    markdown=native_text,
+                    backend="native_pdf_text",
+                    raw_source="embedded_pdf_text",
+                )
 
         self.logger.log("ocr_start", source_path=str(source_path), backend=self.config.ocr.backend)
         self.logger.log("gpu_before_ocr", source_path=str(source_path), gpu=query_gpu_snapshot())

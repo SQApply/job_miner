@@ -4,7 +4,7 @@ import hashlib
 import re
 from pathlib import Path
 
-SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
 
 
 def ensure_dir(path: Path) -> Path:

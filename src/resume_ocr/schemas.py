@@ -29,6 +29,7 @@ class LlmSettings(BaseModel):
     base_url: str = "http://127.0.0.1:11434"
     temperature: float = 0.0
     max_tokens: int = 4096
+    num_ctx: int = 8192
     request_timeout_seconds: int = 600
 
 

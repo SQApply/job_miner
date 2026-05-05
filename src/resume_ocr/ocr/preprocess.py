@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from typing import Iterable
 
 import fitz  # PyMuPDF
 import pdfplumber
+from docx import Document
+from docx.document import Document as DocxDocument
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import Table, _Cell
+from docx.text.paragraph import Paragraph
 from PIL import Image, ImageOps
 
 from ..utils import compact_text, ensure_dir
@@ -23,6 +30,91 @@ def extract_native_pdf_text(path: Path, max_pages: int) -> str:
                 chunks.append(page.extract_text() or "")
     except Exception:
         return ""
+    return compact_text("\n\n".join(chunks))
+
+
+def _iter_docx_blocks(parent: DocxDocument | _Cell) -> Iterable[Paragraph | Table]:
+    """Yield DOCX paragraphs and tables in document order."""
+    if isinstance(parent, DocxDocument):
+        parent_element = parent.element.body
+    elif isinstance(parent, _Cell):
+        parent_element = parent._tc
+    else:
+        return
+
+    for child in parent_element.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, parent)
+
+
+def _paragraph_text(paragraph: Paragraph) -> str:
+    # paragraph.text keeps visible run text and is enough for resume parsing.
+    # Hyperlink visible text is also included in modern python-docx versions.
+    return compact_text(paragraph.text)
+
+
+def _table_to_markdown(table: Table) -> str:
+    rows: list[list[str]] = []
+    for row in table.rows:
+        values = [compact_text(cell.text.replace("\n", " ")) for cell in row.cells]
+        if any(values):
+            rows.append(values)
+
+    if not rows:
+        return ""
+
+    # Most resume tables in the samples are two-column skill/category tables.
+    # Markdown keeps key/value relationships clearer for the LLM parser.
+    width = max(len(row) for row in rows)
+    normalized = [row + [""] * (width - len(row)) for row in rows]
+    header = normalized[0]
+    separator = ["---"] * width
+    body = normalized[1:]
+
+    def line(values: list[str]) -> str:
+        escaped = [value.replace("|", "\\|") for value in values]
+        return "| " + " | ".join(escaped) + " |"
+
+    return "\n".join([line(header), line(separator), *(line(row) for row in body)])
+
+
+def extract_native_docx_text(path: Path) -> str:
+    """Extract readable text from a .docx resume without OCR.
+
+    DOCX resumes are text-native. This function preserves normal paragraphs,
+    table content, headers, and footers so resumes that keep skills in tables are
+    parsed correctly by the existing LLM extraction step.
+    """
+    try:
+        document = Document(path)
+    except Exception:
+        return ""
+
+    chunks: list[str] = []
+
+    for block in _iter_docx_blocks(document):
+        if isinstance(block, Paragraph):
+            text = _paragraph_text(block)
+            if text:
+                chunks.append(text)
+        elif isinstance(block, Table):
+            text = _table_to_markdown(block)
+            if text:
+                chunks.append(text)
+
+    for section in document.sections:
+        for container in (section.header, section.footer):
+            for paragraph in container.paragraphs:
+                text = _paragraph_text(paragraph)
+                if text:
+                    chunks.append(text)
+            for table in container.tables:
+                text = _table_to_markdown(table)
+                if text:
+                    chunks.append(text)
+
     return compact_text("\n\n".join(chunks))
 
 
