@@ -15,11 +15,12 @@ def _compact(parts: list[str | None]) -> str:
     return "\n".join(" ".join((part or "").split()) for part in parts if (part or "").strip())
 
 
-def build_job_tower_document(job: dict[str, Any]) -> JobTowerDocument:
+def     build_job_tower_document(job: dict[str, Any]) -> JobTowerDocument:
     job_id = str(job.get("job_id") or job.get("_id"))
     required = as_str_list(job.get("required_skills"))
     preferred = as_str_list(job.get("preferred_skills"))
     responsibilities = as_str_list(job.get("responsibilities"))
+    #title_company_location_text_embedding_section
     title_text = _compact([
         f"Title: {job.get('title')}" if job.get("title") else None,
         f"Company: {job.get('company')}" if job.get("company") else None,
@@ -27,12 +28,15 @@ def build_job_tower_document(job: dict[str, Any]) -> JobTowerDocument:
         f"Employment type: {job.get('employment_type')}" if job.get("employment_type") else None,
         f"Duration: {job.get('duration')}" if job.get("duration") else None,
     ])
+    #requirement_text_embedding_section
     req_text = _compact([
         "Required skills: " + _join(required) if required else None,
         "Preferred skills: " + _join(preferred) if preferred else None,
         "Summary: " + str(job.get("summary")) if job.get("summary") else None,
     ])
+    #responsibilities_text_embedding_section
     resp_text = "Responsibilities: " + " ".join(responsibilities) if responsibilities else ""
+    #compensation_embedding_section
     comp_text = "Compensation: " + str(job.get("compensation_text")) if job.get("compensation_text") else ""
     embedding_text = _compact([title_text, req_text, resp_text, comp_text])
     return JobTowerDocument(
@@ -57,7 +61,7 @@ def build_job_tower_document(job: dict[str, Any]) -> JobTowerDocument:
         responsibilities_text=resp_text,
         compensation_embedding_text=comp_text,
         job_embedding_text=embedding_text,
-        source_content_hash=str(job.get("content_hash") or stable_hash(job)),
+        source_content_hash=str(job.get("content_hash") or stable_hash(job)), #content hash for dedupe is calcualted here
     )
 
 
@@ -65,11 +69,13 @@ def build_candidate_tower_from_resume_profile(profile: dict[str, Any]) -> Candid
     contact = profile.get("contact") or {}
     sha256 = str(profile.get("sha256") or "")
     candidate_id = make_candidate_id(sha256)
+    #Identity_text_for_embedding
     identity_text = _compact([
         contact.get("full_name"), profile.get("headline"), profile.get("current_title"),
         profile.get("current_company"), contact.get("location"),
         f"Total experience: {profile.get('total_experience_years')} years" if profile.get("total_experience_years") is not None else None,
     ])
+    #skills_text_for_embedding
     primary = as_str_list(profile.get("primary_skills"))
     secondary = as_str_list(profile.get("secondary_skills"))
     tools = as_str_list(profile.get("tools_and_platforms"))
@@ -84,10 +90,12 @@ def build_candidate_tower_from_resume_profile(profile: dict[str, Any]) -> Candid
         "Domains: " + _join(domains) if domains else None,
         "Certifications: " + _join(certs) if certs else None,
     ])
+    #experience text for embedding
     exp_lines = []
     for exp in profile.get("experience") or []:
         if isinstance(exp, dict):
             exp_lines.append(_compact([exp.get("title"), exp.get("company"), "Responsibilities: " + " ".join(as_str_list(exp.get("responsibilities"))) if exp.get("responsibilities") else None]))
+    #education_text_for_embedding
     edu_lines = []
     for edu in profile.get("education") or []:
         if isinstance(edu, dict):

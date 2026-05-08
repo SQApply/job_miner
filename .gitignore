@@ -34,3 +34,14 @@ Thumbs.db
 data/
 .crawl4ai/
 smoke_test/*.json
+.env
+*.bak
+__pycache__/
+*.pyc
+data/debug.zip
+data/mongo_storage/
+data/qdrant_storage/
+data/processed/
+data/resumes/processed/
+data/resumes/input/
+logs/
