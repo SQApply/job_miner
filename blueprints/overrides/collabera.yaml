@@ -1,0 +1,12 @@
+listing:
+  pagination:
+    enabled: true
+    type: "url_param"
+    page_param: "q"
+    start_page: 1
+    step: 1
+    max_turns: 100
+    stop_after_stable_rounds: 2
+
+detail:
+  wait_for: "css:body"

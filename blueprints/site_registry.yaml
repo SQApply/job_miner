@@ -245,3 +245,200 @@ sites:
       - "https://huxley.com/en-us/job-search/all-jobs/"
 
     session_id: "huxley_jobs_session"
+
+  - id: libertyjobs_jobs
+    label: Liberty Jobs
+    profile: paginated_url_param
+    page_url: "https://libertyjobs.com/findjobs-results.php?search=&location=&page=1"
+    allowed_hosts:
+      - "libertyjobs.com"
+      - "www.libertyjobs.com"
+    output_file: "libertyjobs_jobs.json"
+
+    item_href_contains: "findjobs-details.php?j_id="
+
+    detail_text_patterns:
+      - "job"
+      - "location"
+      - "posted"
+      - "legal"
+      - "manager"
+      - "assistant"
+      - "engineer"
+      - "developer"
+
+    exclude_exact_urls:
+      - "https://libertyjobs.com/findjobs-results.php?search=&location="
+      - "https://libertyjobs.com/findjobs-results.php?search=&location=&page=1"
+      - "https://www.libertyjobs.com/findjobs-results.php?search=&location="
+      - "https://www.libertyjobs.com/findjobs-results.php?search=&location=&page=1"
+
+    session_id: "libertyjobs_jobs_session"
+#not working -- need fix
+  - id: sescorporation_jobs
+    label: SES Corporation Jobs
+    profile: generic_listing
+    page_url: "https://www.sescorporation.com/careers.html"
+    allowed_hosts:
+      - "www.sescorporation.com"
+      - "sescorporation.com"
+      - "app.workable.com"
+    output_file: "sescorporation_jobs.json"
+
+    item_href_contains: "app.workable.com/j/"
+
+    detail_text_patterns:
+      - "apply"
+      - "location"
+      - "creation date"
+      - "engineer"
+      - "network"
+      - "platform"
+      - "automation"
+      - "reliability"
+
+    exclude_exact_urls:
+      - "https://www.sescorporation.com/careers.html"
+      - "https://sescorporation.com/careers.html"
+
+    session_id: "sescorporation_jobs_session"
+#not working -- need fix - anit bot
+  - id: mondo_jobs
+    label: Mondo Jobs
+    profile: paginated_anchor
+    page_url: "https://mondo.com/jobs/results/"
+    allowed_hosts:
+      - "mondo.com"
+      - "www.mondo.com"
+    output_file: "mondo_jobs.json"
+
+    item_href_contains: "/jobs/job/"
+
+    detail_text_patterns:
+      - "apply"
+      - "apply now"
+      - "job title"
+      - "date posted"
+      - "type"
+      - "reference id"
+      - "location"
+      - "contract"
+      - "direct placement"
+
+    exclude_exact_urls:
+      - "https://mondo.com/jobs/results/"
+      - "https://www.mondo.com/jobs/results/"
+
+    session_id: "mondo_jobs_session"
+
+  - id: brooksource_jobs
+    label: Brooksource Jobs
+    profile: paginated_anchor
+    page_url: "https://jobs.brooksource.com/jobs/"
+    allowed_hosts:
+      - "jobs.brooksource.com"
+      - "www.brooksource.com"
+      - "brooksource.com"
+    output_file: "brooksource_jobs.json"
+
+    item_href_contains: "/jobs/"
+
+    detail_text_patterns:
+      - "view job details"
+      - "apply now"
+      - "apply"
+      - "contract"
+      - "contract to hire"
+      - "hybrid"
+      - "hour"
+
+    exclude_exact_urls:
+      - "https://jobs.brooksource.com/jobs/"
+      - "https://www.brooksource.com/jobs/"
+      - "https://brooksource.com/jobs/"
+
+    session_id: "brooksource_jobs_session"
+
+  - id: collabera_jobs
+    label: Collabera Jobs
+    profile: paginated_url_param
+    override: collabera
+    page_url: "https://collabera.com/job-search/?Posteddays=0&industry=&keyword=&location=&q=1&sort_by="
+    allowed_hosts:
+      - "collabera.com"
+      - "www.collabera.com"
+    output_file: "collabera_jobs.json"
+
+    item_href_contains: "/job-description/?post="
+
+    detail_text_patterns:
+      - "apply"
+      - "job code"
+      - "salary range"
+      - "requirement"
+      - "contract"
+      - "location"
+      - "job title"
+      - "compensation"
+
+    exclude_exact_urls:
+      - "https://collabera.com/job-search/"
+      - "https://www.collabera.com/job-search/"
+
+    session_id: "collabera_jobs_session"
+
+  - id: vaco_jobs
+    label: Vaco Jobs
+    profile: paginated_url_param
+    page_url: "https://jobs.vaco.com/api/requisitions/search?page=1"
+    allowed_hosts:
+      - "jobs.vaco.com"
+    output_file: "vaco_jobs.json"
+
+    item_href_contains: "/job/"
+
+    detail_text_patterns:
+      - "apply"
+      - "post number"
+      - "location"
+      - "pay rate"
+      - "requirements"
+      - "responsibilities"
+      - "contractor"
+      - "contract"
+      - "direct hire"
+
+    exclude_exact_urls:
+      - "https://jobs.vaco.com/home"
+      - "https://jobs.vaco.com/home-en_ca"
+      - "https://jobs.vaco.com/api/requisitions/search?page=1"
+
+    session_id: "vaco_jobs_session"
+  - id: rangam_jobs
+    label: Rangam Infotech Jobs
+    profile: paginated_anchor
+    page_url: "https://career.rangaminfotech.com/"
+    allowed_hosts:
+      - "career.rangaminfotech.com"
+    output_file: "rangam_jobs.json"
+
+    item_href_contains: "/jobs/details/"
+
+    detail_text_patterns:
+      - "apply"
+      - "posted on"
+      - "location"
+      - "months"
+      - "responsibilities"
+      - "requirements"
+      - "engineer"
+      - "developer"
+      - "analyst"
+
+    exclude_exact_urls:
+      - "https://career.rangaminfotech.com/"
+      - "https://career.rangaminfotech.com/jobs"
+      - "https://career.rangaminfotech.com/jobs/index"
+      - "https://career.rangaminfotech.com/jobs/ViewAll"
+
+    session_id: "rangam_jobs_session"
