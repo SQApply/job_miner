@@ -70,3 +70,7 @@ yarn-error.log*
 !.env.example
 data/resumes/llm_debug/
 temp_extracted_files/
+
+# Generated resume extraction/debug artifacts
+temp_extracted_files*/
+temp_extracted_files*.zip
