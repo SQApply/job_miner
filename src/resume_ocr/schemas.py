@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class OcrSettings(BaseModel):
@@ -43,6 +43,81 @@ class OutputSettings(BaseModel):
     dir: str = "data/processed"
     failed_dir: str = "data/failed"
     log_dir: str = "data/logs"
+
+
+def _optional_string(value: Any) -> str | None:
+    """Normalize LLM scalar output before Pydantic validation.
+
+    Small local LLMs sometimes emit numeric years such as 2023 instead of
+    "2023". The application schema stores dates as strings because resumes
+    often contain partial dates such as "Jan 2023", "2023", "Present", or
+    "2019 - 2023".
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return cleaned or None
+
+    if isinstance(value, bool):
+        return str(value).lower()
+
+    if isinstance(value, int):
+        return str(value)
+
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return str(value)
+
+    return str(value).strip() or None
+
+
+def _optional_float(value: Any) -> float | None:
+    """Normalize LLM total-experience output before Pydantic validation."""
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, int | float):
+        return float(value)
+
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+
+        import re
+
+        match = re.search(r"\d+(?:\.\d+)?", cleaned)
+        if match:
+            return float(match.group(0))
+
+    return None
+
+
+def _string_list(value: Any) -> list[str]:
+    """Normalize LLM list/string output into a clean list[str]."""
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",")]
+        return [part for part in parts if part]
+
+    if isinstance(value, list):
+        cleaned: list[str] = []
+        for item in value:
+            text = _optional_string(item)
+            if text:
+                cleaned.append(text)
+        return cleaned
+
+    text = _optional_string(value)
+    return [text] if text else []
 
 
 class SystemConfig(BaseModel):
@@ -84,6 +159,31 @@ class ContactInfo(BaseModel):
     github_url: str | None = None
     portfolio_url: str | None = None
 
+    @field_validator(
+        "full_name",
+        "email",
+        "phone",
+        "location",
+        "linkedin_url",
+        "github_url",
+        "portfolio_url",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_strings(cls, value: Any) -> str | None:
+        return _optional_string(value)
+
+
+class ExtractedEvidence(BaseModel):
+    source_section: str | None = None
+    block_id: str | None = None
+    evidence_text: str | None = None
+
+    @field_validator("source_section", "block_id", "evidence_text", mode="before")
+    @classmethod
+    def normalize_optional_strings(cls, value: Any) -> str | None:
+        return _optional_string(value)
+
 
 class ExperienceItem(BaseModel):
     company: str | None = None
@@ -94,6 +194,17 @@ class ExperienceItem(BaseModel):
     is_current: bool | None = None
     responsibilities: list[str] = Field(default_factory=list)
     technologies: list[str] = Field(default_factory=list)
+    evidence: ExtractedEvidence | None = None
+
+    @field_validator("company", "title", "location", "start_date", "end_date", mode="before")
+    @classmethod
+    def normalize_optional_strings(cls, value: Any) -> str | None:
+        return _optional_string(value)
+
+    @field_validator("responsibilities", "technologies", mode="before")
+    @classmethod
+    def normalize_string_lists(cls, value: Any) -> list[str]:
+        return _string_list(value)
 
 
 class EducationItem(BaseModel):
@@ -103,6 +214,20 @@ class EducationItem(BaseModel):
     start_date: str | None = None
     end_date: str | None = None
     score_or_grade: str | None = None
+    evidence: ExtractedEvidence | None = None
+
+    @field_validator(
+        "institution",
+        "degree",
+        "field_of_study",
+        "start_date",
+        "end_date",
+        "score_or_grade",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_strings(cls, value: Any) -> str | None:
+        return _optional_string(value)
 
 
 class ProjectItem(BaseModel):
@@ -110,6 +235,17 @@ class ProjectItem(BaseModel):
     description: str | None = None
     technologies: list[str] = Field(default_factory=list)
     url: str | None = None
+    evidence: ExtractedEvidence | None = None
+
+    @field_validator("name", "description", "url", mode="before")
+    @classmethod
+    def normalize_optional_strings(cls, value: Any) -> str | None:
+        return _optional_string(value)
+
+    @field_validator("technologies", mode="before")
+    @classmethod
+    def normalize_string_lists(cls, value: Any) -> list[str]:
+        return _string_list(value)
 
 
 class ResumeProfile(BaseModel):
@@ -134,6 +270,32 @@ class ResumeProfile(BaseModel):
     languages: list[str] = Field(default_factory=list)
     raw_ocr_markdown_path: str | None = None
     parse_warnings: list[str] = Field(default_factory=list)
+    extraction_quality: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("headline", "summary", "current_title", "current_company", mode="before")
+    @classmethod
+    def normalize_optional_strings(cls, value: Any) -> str | None:
+        return _optional_string(value)
+
+    @field_validator("total_experience_years", mode="before")
+    @classmethod
+    def normalize_optional_float(cls, value: Any) -> float | None:
+        return _optional_float(value)
+
+    @field_validator(
+        "primary_skills",
+        "secondary_skills",
+        "tools_and_platforms",
+        "programming_languages",
+        "domains",
+        "certifications",
+        "languages",
+        "parse_warnings",
+        mode="before",
+    )
+    @classmethod
+    def normalize_string_lists(cls, value: Any) -> list[str]:
+        return _string_list(value)
 
 
 class CandidateTowerRecord(BaseModel):

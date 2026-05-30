@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,32 @@ def _new_run_session_id() -> str:
 
 def _resume_id_from_hash(sha256: str) -> str:
     return "res_" + sha256[:24]
+
+
+def _debug_payload(value):
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return value
+    return value
+
+
+def _dump_temp_extracted_file(root: Path, resume_id: str, stage: str, payload, *, extension: str = "json") -> str | None:
+    enabled = __import__("os").getenv("JOB_MINER_TEMP_EXTRACT_DEBUG", "true").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return None
+
+    safe_stage = "".join(ch if ch.isalnum() or ch in "_.-" else "_" for ch in stage).strip("_")
+    extension = extension.lstrip(".") or "json"
+    out_path = root / "temp_extracted_files" / resume_id / f"pipeline_{safe_stage}.{extension}"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if extension in {"txt", "md"}:
+        out_path.write_text(str(payload), encoding="utf-8")
+    else:
+        out_path.write_text(json.dumps(_debug_payload(payload), ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+    return str(out_path)
 
 
 def _native_text_doc(
@@ -117,11 +144,20 @@ class ResumeOcrPipeline:
         sha256 = sha256_file(source_path)
         resume_id = _resume_id_from_hash(sha256)
         self.logger.log("file_start", source_path=str(source_path), resume_id=resume_id, sha256=sha256)
+        _dump_temp_extracted_file(
+            self.root,
+            resume_id,
+            "00_file_start",
+            {"source_path": str(source_path), "resume_id": resume_id, "sha256": sha256, "file_name": source_path.name},
+        )
 
         try:
             ocr_doc = self._ocr_or_native(source_path, resume_id=resume_id, sha256=sha256)
+            _dump_temp_extracted_file(self.root, resume_id, "01_ocr_markdown", ocr_doc.markdown, extension="md")
+            _dump_temp_extracted_file(self.root, resume_id, "02_ocr_document", ocr_doc)
             ocr_paths = save_ocr_document(self.output_dir, ocr_doc)
             quality = estimate_ocr_quality(ocr_doc.markdown)
+            _dump_temp_extracted_file(self.root, resume_id, "03_ocr_quality", quality)
             self.logger.log("ocr_quality", source_path=str(source_path), resume_id=resume_id, **quality)
 
             if len(compact_text(ocr_doc.markdown)) < self.config.parser.min_markdown_chars:
@@ -138,8 +174,10 @@ class ResumeOcrPipeline:
                 sha256=sha256,
                 ocr_markdown_path=str(ocr_paths["markdown_path"]),
             )
+            _dump_temp_extracted_file(self.root, resume_id, "08_resume_profile_before_save", profile)
             profile_path = save_resume_profile(self.output_dir, profile)
             record = build_candidate_tower_record(profile)
+            _dump_temp_extracted_file(self.root, resume_id, "09_candidate_tower_record", record)
             self.logger.log(
                 "resume_parse_complete",
                 source_path=str(source_path),
@@ -149,6 +187,22 @@ class ResumeOcrPipeline:
             )
             return profile, record, "processed"
         except Exception as exc:
+            import traceback
+            traceback_text = traceback.format_exc()
+            print(f"[ERROR] exception_type={type(exc).__name__}", flush=True)
+            print(f"[ERROR] exception_message={exc}", flush=True)
+            print(traceback_text, flush=True)
+            _dump_temp_extracted_file(
+                self.root,
+                resume_id,
+                "99_exception",
+                {
+                    "exception_type": type(exc).__name__,
+                    "exception_message": str(exc),
+                    "traceback": traceback_text,
+                    "source_path": str(source_path),
+                },
+            )
             failed_path = save_failed_payload(self.failed_dir, resume_id, source_path.name, "error", repr(exc))
             self.logger.log("file_failed", source_path=str(source_path), resume_id=resume_id, error_message=str(exc), failed_path=str(failed_path))
             return None, None, "failed"

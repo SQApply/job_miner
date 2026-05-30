@@ -1,0 +1,184 @@
+{
+  "timestamp": "20260530T213631943420Z",
+  "first_quality_errors": [
+    "WORK EXPERIENCE exists, but experience[] has no role with company + title + date/current fields.",
+    "WORK EXPERIENCE exists, but current_title is null.",
+    "WORK EXPERIENCE exists, but current_company is null.",
+    "PROJECTS section exists, but projects[] is empty.",
+    "EDUCATION section exists, but education[] is empty or contains only null fields.",
+    "Resume states total years of experience, but total_experience_years is null.",
+    "domains[] is empty. Infer domains from summary, skills, projects, and work experience."
+  ],
+  "first_payload": {
+    "resume_id": "res_cca8ed2ef1d5ac1768f37db0",
+    "source_file_name": "resume_ocr_20260530T213513Z_abhinav_resume_test.pdf",
+    "sha256": "cca8ed2ef1d5ac1768f37db0bed9938ec73ca5263c45cae418ff21d07d7eda56",
+    "contact": {
+      "full_name": null,
+      "email": null,
+      "phone": "+91 8938000962",
+      "location": "Delhi NCR, India",
+      "linkedin_url": null,
+      "github_url": null,
+      "portfolio_url": null
+    },
+    "headline": null,
+    "summary": null,
+    "total_experience_years": null,
+    "current_title": null,
+    "current_company": null,
+    "primary_skills": [],
+    "secondary_skills": [],
+    "tools_and_platforms": [
+      "LangChain",
+      "FastAPI",
+      "OpenCV",
+      "BentoML",
+      "DVC",
+      "MLFlow",
+      "ZenML",
+      "Dockers",
+      "Kubernetes",
+      "Torch-serve",
+      "Express.js",
+      "Node.js",
+      "Tailwind CSS",
+      "Framer Motion"
+    ],
+    "programming_languages": [
+      "Python",
+      "PySpark",
+      "PyTorch",
+      "JavaScript (React.js, Next.js)",
+      "TypeScript"
+    ],
+    "domains": [],
+    "certifications": [],
+    "experience": [
+      {
+        "company": null,
+        "title": "Assistant Vice President (Data Science) at NextGen Invent",
+        "location": null,
+        "start_date": "2025-current",
+        "end_date": null,
+        "is_current": true,
+        "responsibilities": [],
+        "technologies": [],
+        "evidence": {
+          "source_section": "WORK EXPERIENCE",
+          "block_id": "sec_006_work_experience_role_001",
+          "evidence_text": "Assistant Vice President (Data Science) at NextGen Invent (2025-currently working)"
+        }
+      },
+      {
+        "company": null,
+        "title": "Senior Data Scientist at SBI-Card",
+        "location": null,
+        "start_date": "2023-2024",
+        "end_date": null,
+        "is_current": false,
+        "responsibilities": [],
+        "technologies": [],
+        "evidence": {
+          "source_section": "WORK EXPERIENCE",
+          "block_id": "sec_006_work_experience_role_002",
+          "evidence_text": "Senior Data Scientist at SBI-Card (2023-2024)."
+        }
+      },
+      {
+        "company": null,
+        "title": "Data scientist at Bank of Baroda",
+        "location": null,
+        "start_date": "2019-2023",
+        "end_date": null,
+        "is_current": false,
+        "responsibilities": [],
+        "technologies": [],
+        "evidence": {
+          "source_section": "WORK EXPERIENCE",
+          "block_id": "sec_006_work_experience_role_003",
+          "evidence_text": "Data scientist at Bank of Baroda (2019-2023)."
+        }
+      },
+      {
+        "company": null,
+        "title": "Data Analyst at Bank of Baroda",
+        "location": null,
+        "start_date": "2014-2019",
+        "end_date": null,
+        "is_current": false,
+        "responsibilities": [],
+        "technologies": [],
+        "evidence": {
+          "source_section": "WORK EXPERIENCE",
+          "block_id": "sec_006_work_experience_role_004",
+          "evidence_text": "Data Analyst at Bank of Baroda (2014-2019)."
+        }
+      },
+      {
+        "company": null,
+        "title": "Programmer Analyst at Tata Consultancy Services",
+        "location": null,
+        "start_date": "2010-2012",
+        "end_date": null,
+        "is_current": false,
+        "responsibilities": [],
+        "technologies": [],
+        "evidence": {
+          "source_section": "WORK EXPERIENCE",
+          "block_id": "sec_006_work_experience_role_005",
+          "evidence_text": "Programmer Analyst at Tata Consultancy Services (2010-2012)."
+        }
+      }
+    ],
+    "education": [
+      {
+        "institution": null,
+        "degree": null,
+        "field_of_study": null,
+        "start_date": null,
+        "end_date": null,
+        "score_or_grade": null,
+        "evidence": {
+          "source_section": "EDUCATION",
+          "block_id": "sec_005_education_role_001",
+          "evidence_text": "B.Tech in Electronics and Communication Engineering from Bundelkhand Institute of Engineering and Technology, Jhansi (2005-2009)."
+        }
+      }
+    ],
+    "projects": [
+      {
+        "name": null,
+        "description": null,
+        "technologies": [],
+        "url": null,
+        "evidence": {
+          "source_section": "PROJECTS UNDERTAKEN",
+          "block_id": "sec_005_projects_role_001",
+          "evidence_text": "Title: Gandharva Music – Online Music Learning Platform\nTech Stack: React.js, Node.js, Express.js, MongoDB, Tailwind CSS, Cloudflare, Zoom SDK, Vercel, Railway"
+        }
+      },
+      {
+        "name": null,
+        "description": null,
+        "technologies": [],
+        "url": null,
+        "evidence": {
+          "source_section": "PROJECTS UNDERTAKEN",
+          "block_id": "sec_005_projects_role_002",
+          "evidence_text": "Title: Co-WRITER\nTech Stack: Python, LangChain, Comet ML, Opik, MongoDB, Qdrant DB, Zen ML, Dockers, GitHub-Actions, AWS SageMaker"
+        }
+      }
+    ],
+    "languages": [],
+    "raw_ocr_markdown_path": "C:\\Users\\abhin\\Downloads\\job_miner\\data\\resumes\\processed\\resumes\\res_cca8ed2ef1d5ac1768f37db0_resume_ocr_20260530t213513z_abhinav_resume_test\\res_cca8ed2ef1d5ac1768f37db0_ocr.md",
+    "parse_warnings": [],
+    "extraction_quality": {}
+  },
+  "debug_paths": [
+    "data\\resumes\\llm_debug\\res_cca8ed2ef1d5ac1768f37db0\\20260530T213514826323Z_03_canonical_resume_ir.json",
+    "data\\resumes\\llm_debug\\res_cca8ed2ef1d5ac1768f37db0\\20260530T213514849701Z_01_first_prompt.json",
+    "data\\resumes\\llm_debug\\res_cca8ed2ef1d5ac1768f37db0\\20260530T213631935998Z_02_first_response.json",
+    "data\\resumes\\llm_debug\\res_cca8ed2ef1d5ac1768f37db0\\20260530T213631938814Z_03_first_payload.json"
+  ]
+}

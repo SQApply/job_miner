@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,6 +16,25 @@ def _clean_doc(doc: dict[str, Any] | None) -> dict[str, Any] | None:
     out = dict(doc)
     out.pop("_id", None)
     return out
+
+
+def _mongo_safe(value: Any) -> Any:
+    """Return a Mongo/BSON-safe copy of a value.
+
+    Postgres rows returned by psycopg may contain native uuid.UUID values.
+    PyMongo's default UuidRepresentation.UNSPECIFIED rejects native UUIDs,
+    so app/user identifiers must be persisted in Mongo as strings unless the
+    Mongo client is explicitly configured for UUID binary representation.
+    """
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _mongo_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_mongo_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_mongo_safe(item) for item in value]
+    return value
 
 
 def _utc_now() -> datetime:
@@ -173,14 +193,26 @@ def create_incomplete_candidate_profile_for_user(user: dict[str, Any]) -> dict[s
         "updated_at": now,
     }
 
+    resume_doc = _mongo_safe(resume_doc)
+    tower_doc = _mongo_safe(tower_doc)
+
+    # MongoDB does not allow the same field to be present in both $setOnInsert
+    # and $set for a single upsert. Keep creation timestamps in $setOnInsert and
+    # mutable "last seen / updated" timestamps in $set only.
+    resume_insert_doc = dict(resume_doc)
+    resume_insert_doc.pop("last_seen_at", None)
+
+    tower_insert_doc = dict(tower_doc)
+    tower_insert_doc.pop("updated_at", None)
+
     db[MongoCollections.RESUME_PROFILES_CURRENT].update_one(
         {"resume_id": resume_id},
-        {"$setOnInsert": resume_doc, "$set": {"last_seen_at": now}},
+        {"$setOnInsert": resume_insert_doc, "$set": {"last_seen_at": now}},
         upsert=True,
     )
     db[MongoCollections.CANDIDATE_TOWER_RECORDS].update_one(
         {"candidate_id": candidate_id},
-        {"$setOnInsert": tower_doc, "$set": {"updated_at": now}},
+        {"$setOnInsert": tower_insert_doc, "$set": {"updated_at": now}},
         upsert=True,
     )
     return tower_doc

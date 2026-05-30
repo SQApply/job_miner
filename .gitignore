@@ -68,3 +68,5 @@ yarn-error.log*
 .env
 .env.*
 !.env.example
+data/resumes/llm_debug/
+temp_extracted_files/

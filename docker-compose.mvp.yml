@@ -69,9 +69,13 @@ services:
       KC_DB_PASSWORD: ${KC_DB_PASSWORD:-job_miner_password}
       KC_HOSTNAME_STRICT: ${KC_HOSTNAME_STRICT:-false}
       KC_HTTP_ENABLED: ${KC_HTTP_ENABLED:-true}
+      KC_SPI_THEME_CACHE_THEMES: ${KC_SPI_THEME_CACHE_THEMES:-false}
+      KC_SPI_THEME_CACHE_TEMPLATES: ${KC_SPI_THEME_CACHE_TEMPLATES:-false}
+      KC_SPI_THEME_STATIC_MAX_AGE: ${KC_SPI_THEME_STATIC_MAX_AGE:--1}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-change-me}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-change-me}
     command: ["start-dev", "--import-realm"]
     volumes:
       - ./infra/keycloak/job-miner-realm.json:/opt/keycloak/data/import/job-miner-realm.json:ro
       - ./infra/keycloak/themes/job-miner:/opt/keycloak/themes/job-miner:ro
+      - ./infra/keycloak/bootstrap:/opt/keycloak/bootstrap:ro

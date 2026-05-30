@@ -48,6 +48,13 @@ function valueFrom(...values) {
   return null;
 }
 
+function firstNonEmptyArray(...values) {
+  for (const value of values) {
+    if (Array.isArray(value) && value.length > 0) return value;
+  }
+  return [];
+}
+
 function getJobTitle(item) {
   const raw = valueFrom(item?.title, item?.job?.title, item?.match?.title, item?.match?.job?.title, 'Untitled job');
   return cleanJobTitle(String(raw), getCompany(item));
@@ -141,8 +148,9 @@ function CandidateProfileCard({ profile, onRefresh }) {
   const email = valueFrom(tower.email, contact.email);
   const phone = valueFrom(tower.phone, contact.phone);
   const experience = valueFrom(tower.total_experience_years, resume.total_experience_years);
-  const skills = tower.skills || tower.primary_skills || resume.primary_skills || [];
-  const domains = tower.domains || resume.domains || [];
+  const skills = firstNonEmptyArray(tower.skills, tower.primary_skills, resume.primary_skills);
+  const domains = firstNonEmptyArray(tower.domains, resume.domains);
+  const profileStatus = valueFrom(tower.status, tower.profile_state, resume.status, resume.profile_state, 'ready');
 
   return <Card title="Candidate Profile" subtitle="Profile summary used for recommendations.">
     <div className="row top-actions"><Button onClick={onRefresh}>Refresh profile</Button></div>
@@ -151,7 +159,7 @@ function CandidateProfileCard({ profile, onRefresh }) {
         <h3>{fullName}</h3>
         <p>{title || 'Title not available'}{company ? ` · ${company}` : ''}</p>
       </div>
-      <span className="status-pill">{tower.embedding_status || 'profile loaded'}</span>
+      <span className="status-pill">{profileStatus}</span>
     </div>
     <div className="profile-grid">
       <Field label="Email" value={email} />
@@ -224,6 +232,76 @@ function ApplicationsCard({ apps, onRefresh }) {
       {apps.map((item) => <ApplicationCard key={item.id || `${item.job_id}-${item.application_status}`} item={item} />)}
     </div>}
   </Card>;
+}
+
+
+function ResumeUploadPage({ me, onUploaded }) {
+  const [file, setFile] = useState(null);
+  const [error, setError] = useState(null);
+  const [uploading, setUploading] = useState(false);
+
+  async function submitResume(event) {
+    event.preventDefault();
+    setError(null);
+    if (!file) {
+      setError('Resume upload is mandatory. Select a PDF, DOCX, or image resume file.');
+      return;
+    }
+    const form = new FormData();
+    form.append('resume', file);
+    setUploading(true);
+    try {
+      const result = await api('/me/resume', { method: 'POST', body: form }, getToken());
+      await onUploaded(result);
+    } catch (e) {
+      setError(e.message || 'Resume upload failed');
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  return <div className="onboarding-shell">
+    <Card title="Upload your resume" subtitle="Resume upload is required before recommendations can be generated.">
+      <div className="onboarding-hero">
+        <div>
+          <h3>Welcome{me?.user?.full_name ? `, ${me.user.full_name}` : ''}</h3>
+          <p>Your account is created. Upload your resume now and Job Miner will extract your profile automatically.</p>
+        </div>
+        <span className="status-pill warning">Resume required</span>
+      </div>
+
+      <form onSubmit={submitResume} className="upload-form">
+        <label className="upload-dropzone">
+          <input
+            type="file"
+            accept=".pdf,.docx,.png,.jpg,.jpeg,.webp,.tif,.tiff"
+            onChange={(event) => setFile(event.target.files?.[0] || null)}
+            disabled={uploading}
+          />
+          <div>
+            <strong>{file ? file.name : 'Choose resume file'}</strong>
+            <p>Supported formats: PDF, DOCX, PNG, JPG, WEBP, TIFF. Maximum size is controlled by JOB_MINER_RESUME_UPLOAD_MAX_MB.</p>
+          </div>
+        </label>
+
+        {error && <p className="error">{error}</p>}
+
+        <div className="row top-actions">
+          <Button type="submit" disabled={uploading || !file}>{uploading ? 'Processing resume...' : 'Upload and generate profile'}</Button>
+          <Button variant="secondary" onClick={() => setFile(null)} disabled={uploading || !file}>Clear</Button>
+        </div>
+      </form>
+
+      <div className="process-note">
+        <h4>What happens after upload?</h4>
+        <ol>
+          <li>Job Miner extracts readable resume text.</li>
+          <li>The parser generates your candidate profile, skills, experience, education, and domains.</li>
+          <li>You are redirected to the candidate portal with your profile filled.</li>
+        </ol>
+      </div>
+    </Card>
+  </div>;
 }
 
 function CandidatePortal({ me, refreshMe }) {
@@ -393,6 +471,12 @@ function App() {
 
   async function loadMe() { const res = await api('/me', {}, getToken()); setMe(res); return res; }
 
+  async function handleResumeUploaded() {
+    const updated = await loadMe();
+    setMe(updated);
+    setView('candidate');
+  }
+
   useEffect(() => {
     initKeycloak().then(() => loadMe()).then((res) => {
       setReady(true);
@@ -417,7 +501,11 @@ function App() {
         <Button variant="secondary" onClick={logout}>Logout</Button>
       </div>
     </header>
-    {view === 'admin' && canAdmin ? <AdminPortal /> : <CandidatePortal me={me} refreshMe={loadMe} />}
+    {view === 'admin' && canAdmin ? <AdminPortal /> : (
+      me?.profile_state === 'incomplete' || me?.next_action === 'complete_profile'
+        ? <ResumeUploadPage me={me} onUploaded={handleResumeUploaded} />
+        : <CandidatePortal me={me} refreshMe={loadMe} />
+    )}
   </div>;
 }
 

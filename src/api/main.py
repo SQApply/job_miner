@@ -9,7 +9,7 @@ from ..common.env import load_runtime_env
 
 load_runtime_env()
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
@@ -21,6 +21,7 @@ from ..matching.feedback import add_feedback
 from ..tasks.mvp_tasks import full_demo_pipeline_task, run_cli_task
 from .mongo_views import candidate_exists, create_incomplete_candidate_profile_for_user, find_candidates_by_verified_email, get_candidate_profile, get_job_by_id, get_recommended_job, list_candidate_recommendations, warehouse_counts
 from .mvp_models import CandidateLinkRequest, FeedbackRequest, JobActionRequest, PipelineRunRequest
+from .resume_upload import process_candidate_resume_upload
 from .security import get_current_user, keycloak_public_config, require_permission
 
 app = FastAPI(title="Job Miner API", version="1.0.0")
@@ -222,6 +223,24 @@ def _require_candidate_link(user: dict[str, Any]) -> dict[str, Any]:
     if not link:
         raise HTTPException(status_code=409, detail="Candidate profile is not ready for this user. Reload /me or contact support.")
     return link
+
+
+
+
+@app.post("/me/resume")
+def upload_my_resume(
+    resume: UploadFile = File(...),
+    user: dict[str, Any] = Depends(require_permission("candidate.view_self")),
+) -> dict[str, Any]:
+    current_link = _require_candidate_link(user)
+    result = process_candidate_resume_upload(upload=resume, user=user, current_link=current_link)
+    link = result["candidate_link"]
+    profile_state, next_action = _candidate_profile_state(link)
+    return {
+        **result,
+        "profile_state": profile_state,
+        "next_action": next_action,
+    }
 
 
 @app.get("/me/profile")
