@@ -1,0 +1,77 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: job_miner_mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-job_miner}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-job_miner}
+    volumes:
+      - ./data/mongo_storage:/data/db
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: job_miner_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./data/qdrant_storage:/qdrant/storage
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: job_miner_postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-job_miner_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-job_miner_password}
+      POSTGRES_DB: ${POSTGRES_DB:-job_miner_control}
+    volumes:
+      - ./data/postgres_storage:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U job_miner_app -d job_miner_control"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: job_miner_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ./data/redis_storage:/data
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0.6
+    container_name: job_miner_keycloak
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_DB: ${KC_DB:-postgres}
+      KC_DB_URL_HOST: ${KC_DB_URL_HOST:-postgres}
+      KC_DB_URL_DATABASE: ${KC_DB_URL_DATABASE:-keycloak}
+      KC_DB_USERNAME: ${KC_DB_USERNAME:-job_miner_app}
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD:-job_miner_password}
+      KC_HOSTNAME_STRICT: ${KC_HOSTNAME_STRICT:-false}
+      KC_HTTP_ENABLED: ${KC_HTTP_ENABLED:-true}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-change-me}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-change-me}
+    command: ["start-dev", "--import-realm"]
+    volumes:
+      - ./infra/keycloak/job-miner-realm.json:/opt/keycloak/data/import/job-miner-realm.json:ro
+      - ./infra/keycloak/themes/job-miner:/opt/keycloak/themes/job-miner:ro

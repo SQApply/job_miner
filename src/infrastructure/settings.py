@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from ..common.env import load_runtime_env
+
+load_runtime_env()
 
 def _int_env(name: str, default: int) -> int:
     raw = os.getenv(name)

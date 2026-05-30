@@ -20,6 +20,7 @@ from .documents import (
 )
 from .hashing import make_candidate_id, make_job_id, make_resume_id_from_sha, stable_hash
 from .serializers import as_str_list, to_plain_data
+from .skill_utils import build_canonical_candidate_skills, unique_skills
 
 
 def _split_mongo_update_payload(doc: Any) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -319,6 +320,26 @@ class WarehouseRepository:
         resume_id = str(payload.get("resume_id") or make_resume_id_from_sha(sha256))
         source_hash = source_content_hash or stable_hash(payload)
 
+        skills = unique_skills(as_str_list(payload.get("skills")))
+        if not skills:
+            skills = unique_skills(
+                [
+                    *as_str_list(payload.get("primary_skills")),
+                    *as_str_list(payload.get("secondary_skills")),
+                    *as_str_list(payload.get("programming_languages")),
+                    *as_str_list(payload.get("tools_and_platforms")),
+                    *as_str_list(payload.get("certifications")),
+                ]
+            )
+        if not skills and payload.get("raw_payload"):
+            raw_payload = payload.get("raw_payload")
+            if isinstance(raw_payload, dict):
+                skills = build_canonical_candidate_skills(raw_payload)
+
+        skills_text = str(payload.get("skills_text") or "")
+        if skills and not skills_text.strip():
+            skills_text = "Skills: " + ", ".join(skills)
+
         doc = CandidateTowerDocument(
             _id=candidate_id,
             candidate_id=candidate_id,
@@ -332,11 +353,12 @@ class WarehouseRepository:
             current_title=payload.get("current_title"),
             current_company=payload.get("current_company"),
             total_experience_years=payload.get("total_experience_years"),
-            primary_skills=as_str_list(payload.get("primary_skills")),
-            secondary_skills=as_str_list(payload.get("secondary_skills")),
+            skills=skills,
+            primary_skills=[],
+            secondary_skills=[],
             domains=as_str_list(payload.get("domains")),
             identity_text=str(payload.get("identity_text") or ""),
-            skills_text=str(payload.get("skills_text") or ""),
+            skills_text=skills_text,
             experience_text=str(payload.get("experience_text") or ""),
             education_text=str(payload.get("education_text") or ""),
             candidate_embedding_text=str(

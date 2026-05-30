@@ -141,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     match_parser.add_argument("--candidates-limit", type=int, default=None)
     match_parser.add_argument("--llm-model", default=os.getenv("JOB_MINER_LLM_RERANKER_MODEL", "qwen2.5:3b"))
     match_parser.add_argument("--llm-timeout-seconds", type=int, default=600)
-    match_parser.add_argument("--llm-chunk-size", type=int, default=10)
+    match_parser.add_argument("--llm-chunk-size", type=int, default=3)
     match_parser.add_argument("--llm-num-ctx", type=int, default=8192)
     match_parser.add_argument("--llm-num-predict", type=int, default=4096)
     match_parser.set_defaults(func=cmd_match)

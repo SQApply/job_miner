@@ -1,0 +1,214 @@
+{
+  "realm": "job-miner",
+  "enabled": true,
+  "displayName": "Job Miner",
+  "registrationAllowed": true,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": true,
+  "roles": {
+    "realm": [
+      {
+        "name": "platform_admin",
+        "description": "Full admin access"
+      },
+      {
+        "name": "tenant_admin",
+        "description": "Tenant admin access"
+      },
+      {
+        "name": "candidate",
+        "description": "Candidate portal user"
+      },
+      {
+        "name": "recruiter",
+        "description": "Recruiter access"
+      },
+      {
+        "name": "viewer",
+        "description": "Read-only access"
+      }
+    ]
+  },
+  "groups": [
+    {
+      "name": "tenants",
+      "subGroups": [
+        {
+          "name": "default",
+          "attributes": {
+            "tenant_code": [
+              "default"
+            ]
+          },
+          "subGroups": [
+            {
+              "name": "admins"
+            },
+            {
+              "name": "candidates"
+            },
+            {
+              "name": "recruiters"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "job-miner-web",
+      "name": "Job Miner Web",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": [
+        "http://localhost:5173/*"
+      ],
+      "webOrigins": [
+        "http://localhost:5173"
+      ],
+      "protocol": "openid-connect",
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:5173/*"
+      },
+      "protocolMappers": [
+        {
+          "name": "job-miner-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "job-miner-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "consentRequired": false,
+          "config": {
+            "full.path": "true",
+            "claim.name": "groups",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "job-miner-api",
+      "name": "Job Miner API",
+      "enabled": true,
+      "bearerOnly": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false
+    }
+  ],
+  "users": [
+    {
+      "username": "admin@jobminer.local",
+      "email": "admin@jobminer.local",
+      "firstName": "Admin",
+      "lastName": "User",
+      "enabled": true,
+      "emailVerified": true,
+      "realmRoles": [
+        "platform_admin"
+      ],
+      "groups": [
+        "/tenants/default/admins"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Admin@123",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "candidate@jobminer.local",
+      "email": "candidate@jobminer.local",
+      "firstName": "Candidate",
+      "lastName": "User",
+      "enabled": true,
+      "emailVerified": true,
+      "realmRoles": [
+        "candidate"
+      ],
+      "groups": [
+        "/tenants/default/candidates"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Candidate@123",
+          "temporary": false
+        }
+      ]
+    }
+  ],
+  "verifyEmail": true,
+  "rememberMe": true,
+  "loginTheme": "job-miner",
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "maxFailureWaitSeconds": 900,
+  "minimumQuickLoginWaitSeconds": 60,
+  "waitIncrementSeconds": 60,
+  "quickLoginCheckMilliSeconds": 1000,
+  "maxDeltaTimeSeconds": 43200,
+  "failureFactor": 5,
+  "defaultRoles": [
+    "candidate"
+  ],
+  "defaultGroups": [
+    "/tenants/default/candidates"
+  ],
+  "identityProviders": [
+    {
+      "alias": "google",
+      "displayName": "Google",
+      "providerId": "google",
+      "enabled": true,
+      "updateProfileFirstLoginMode": "on",
+      "trustEmail": true,
+      "storeToken": false,
+      "addReadTokenRoleOnCreate": false,
+      "authenticateByDefault": false,
+      "linkOnly": false,
+      "firstBrokerLoginFlowAlias": "first broker login",
+      "config": {
+        "clientId": "${GOOGLE_CLIENT_ID}",
+        "clientSecret": "${GOOGLE_CLIENT_SECRET}",
+        "defaultScope": "openid profile email",
+        "syncMode": "FORCE",
+        "useJwksUrl": "true"
+      }
+    }
+  ],
+  "identityProviderMappers": [
+    {
+      "name": "google-email-verified",
+      "identityProviderAlias": "google",
+      "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+      "config": {
+        "claim": "email_verified",
+        "user.attribute": "emailVerified",
+        "syncMode": "FORCE"
+      }
+    }
+  ]
+}

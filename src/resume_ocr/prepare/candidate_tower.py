@@ -4,6 +4,7 @@ import hashlib
 
 from ..schemas import CandidateTowerRecord, ResumeProfile
 from ..utils import compact_text
+from ...warehouse.skill_utils import build_canonical_candidate_skills
 
 
 def _join(items: list[str]) -> str:
@@ -31,11 +32,10 @@ def build_candidate_tower_record(profile: ResumeProfile) -> CandidateTowerRecord
         f"Total experience: {profile.total_experience_years} years" if profile.total_experience_years is not None else "",
     ]))
 
+    profile_payload = profile.model_dump(mode="python")
+    skills = build_canonical_candidate_skills(profile_payload)
     skills_text = compact_text("\n".join([
-        "Primary skills: " + _join(profile.primary_skills),
-        "Secondary skills: " + _join(profile.secondary_skills),
-        "Programming languages: " + _join(profile.programming_languages),
-        "Tools and platforms: " + _join(profile.tools_and_platforms),
+        "Skills: " + _join(skills),
         "Domains: " + _join(profile.domains),
         "Certifications: " + _join(profile.certifications),
     ]))
@@ -83,8 +83,9 @@ def build_candidate_tower_record(profile: ResumeProfile) -> CandidateTowerRecord
         current_title=profile.current_title,
         current_company=profile.current_company,
         total_experience_years=profile.total_experience_years,
-        primary_skills=profile.primary_skills,
-        secondary_skills=profile.secondary_skills,
+        skills=skills,
+        primary_skills=[],
+        secondary_skills=[],
         domains=profile.domains,
         identity_text=identity_text,
         skills_text=skills_text,

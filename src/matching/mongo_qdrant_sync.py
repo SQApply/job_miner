@@ -152,8 +152,7 @@ def _candidate_payload(row: dict[str, Any], *, embedding_model: str) -> dict[str
         "total_experience_years": row.get("total_experience_years"),
         "source_content_hash": row.get("source_content_hash"),
         "embedding_model": embedding_model,
-        "primary_skills": row.get("primary_skills") or [],
-        "secondary_skills": row.get("secondary_skills") or [],
+        "skills": row.get("skills") or [],
         "domains": row.get("domains") or [],
     }
 

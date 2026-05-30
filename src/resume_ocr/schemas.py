@@ -148,8 +148,9 @@ class CandidateTowerRecord(BaseModel):
     current_title: str | None = None
     current_company: str | None = None
     total_experience_years: float | None = None
-    primary_skills: list[str] = Field(default_factory=list)
-    secondary_skills: list[str] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)
+    primary_skills: list[str] = Field(default_factory=list)  # legacy only
+    secondary_skills: list[str] = Field(default_factory=list)  # legacy only
     domains: list[str] = Field(default_factory=list)
     identity_text: str
     skills_text: str

@@ -5,6 +5,7 @@ from typing import Any
 from .documents import CandidateTowerDocument, JobTowerDocument
 from .hashing import make_candidate_id, stable_hash
 from .serializers import as_str_list
+from .skill_utils import build_canonical_candidate_skills
 
 
 def _join(items: list[str]) -> str:
@@ -76,17 +77,13 @@ def build_candidate_tower_from_resume_profile(profile: dict[str, Any]) -> Candid
         f"Total experience: {profile.get('total_experience_years')} years" if profile.get("total_experience_years") is not None else None,
     ])
     #skills_text_for_embedding
-    primary = as_str_list(profile.get("primary_skills"))
-    secondary = as_str_list(profile.get("secondary_skills"))
-    tools = as_str_list(profile.get("tools_and_platforms"))
-    langs = as_str_list(profile.get("programming_languages"))
+    # Use one canonical skills list. Do not store broad parser labels such as
+    # "Programming Languages" or "Deployment Platform" as skills.
+    skills = build_canonical_candidate_skills(profile)
     domains = as_str_list(profile.get("domains"))
     certs = as_str_list(profile.get("certifications"))
     skills_text = _compact([
-        "Primary skills: " + _join(primary) if primary else None,
-        "Secondary skills: " + _join(secondary) if secondary else None,
-        "Programming languages: " + _join(langs) if langs else None,
-        "Tools and platforms: " + _join(tools) if tools else None,
+        "Skills: " + _join(skills) if skills else None,
         "Domains: " + _join(domains) if domains else None,
         "Certifications: " + _join(certs) if certs else None,
     ])
@@ -116,8 +113,9 @@ def build_candidate_tower_from_resume_profile(profile: dict[str, Any]) -> Candid
         current_title=profile.get("current_title"),
         current_company=profile.get("current_company"),
         total_experience_years=profile.get("total_experience_years"),
-        primary_skills=primary,
-        secondary_skills=secondary,
+        skills=skills,
+        primary_skills=[],
+        secondary_skills=[],
         domains=domains,
         identity_text=identity_text,
         skills_text=skills_text,

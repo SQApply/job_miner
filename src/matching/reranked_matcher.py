@@ -241,6 +241,7 @@ def match_candidates_with_llm_rerank(
 
     all_final_matches: list[dict[str, Any]] = []
     grouped_output: list[dict[str, Any]] = []
+    unscored_llm_job_count = 0
 
     for candidate_index, candidate in enumerate(candidates):
         candidate_id = _candidate_id(candidate, candidate_index)
@@ -327,6 +328,8 @@ def match_candidates_with_llm_rerank(
 
         optimized_candidates: list[dict[str, Any]] = []
 
+        candidate_unscored_count = 0
+
         for job_payload in baseline_candidates:
             job_id = str(job_payload.get("job_id") or "")
             baseline_score = job_payload.get("baseline_score")
@@ -338,22 +341,13 @@ def match_candidates_with_llm_rerank(
 
             llm_result = llm_by_job_id.get(job_id)
 
-            if llm_result:
-                llm_match_score = llm_result.llm_match_score
-                decision = llm_result.decision
-                matched_skills = llm_result.matched_skills
-                missing_skills = llm_result.missing_skills
-                risk_flags = llm_result.risk_flags
-                reason = llm_result.reason
-                reranker_status = "llm_scored"
-            else:
-                llm_match_score = _fallback_llm_score_from_baseline(baseline_score_float)
-                decision = "fallback_from_baseline"
-                matched_skills = []
-                missing_skills = []
-                risk_flags = ["llm_did_not_return_this_job"]
-                reason = "LLM did not return a score for this job; fallback score derived from baseline score for ranking continuity."
-                reranker_status = "fallback"
+            if not llm_result:
+                # Candidate-facing optimized recommendations must be real LLM-scored records.
+                # We no longer synthesize fallback LLM scores because that makes the product look
+                # as if the LLM evaluated a job when it did not. Missing jobs are tracked in the
+                # summary/logs and excluded from the optimized top-N output.
+                candidate_unscored_count += 1
+                continue
 
             optimized_candidates.append(
                 {
@@ -361,15 +355,23 @@ def match_candidates_with_llm_rerank(
                     "baseline_score_0_1": baseline_score_float,
                     "vector_score_0_1": job_payload.get("vector_score"),
                     "baseline_rank": job_payload.get("baseline_rank"),
-                    "llm_match_score_0_100": llm_match_score,
-                    "final_score_0_100": llm_match_score,
-                    "llm_decision": decision,
-                    "llm_reason": reason,
-                    "llm_matched_skills": matched_skills,
-                    "llm_missing_skills": missing_skills,
-                    "llm_risk_flags": risk_flags,
-                    "reranker_status": reranker_status,
+                    "llm_match_score_0_100": llm_result.llm_match_score,
+                    "final_score_0_100": llm_result.llm_match_score,
+                    "llm_decision": llm_result.decision,
+                    "llm_reason": llm_result.reason,
+                    "llm_matched_skills": llm_result.matched_skills,
+                    "llm_missing_skills": llm_result.missing_skills,
+                    "llm_risk_flags": llm_result.risk_flags,
+                    "reranker_status": "llm_scored",
                 }
+            )
+
+        unscored_llm_job_count += candidate_unscored_count
+        if candidate_unscored_count:
+            logger.warning(
+                "Dropped unscored LLM jobs from optimized output candidate_id=%s count=%s",
+                candidate_id,
+                candidate_unscored_count,
             )
 
         optimized_candidates.sort(
@@ -427,7 +429,8 @@ def match_candidates_with_llm_rerank(
                 "resume_id": candidate.get("resume_id"),
                 "candidate_name": _candidate_name(candidate),
                 "retrieved_count": len(qdrant_results),
-                "reranked_count": len(optimized_candidates),
+                "llm_scored_count": len(optimized_candidates),
+                "unscored_llm_job_count": candidate_unscored_count,
                 "final_top_n": final_top_n,
                 "matches": final_matches,
             }
@@ -464,8 +467,10 @@ def match_candidates_with_llm_rerank(
         "baseline_collection": "candidate_job_matches",
         "optimized_collection": OPTIMIZED_MATCH_COLLECTION,
         "candidate_count": len(candidates),
-        "matched_candidate_count": len(grouped_output),
+        "matched_candidate_count": sum(1 for item in grouped_output if item.get("matches")),
         "total_match_count": len(all_final_matches),
+        "llm_scored_candidate_job_count": len(all_final_matches),
+        "unscored_llm_job_count": unscored_llm_job_count,
         "qdrant_top_k": top_k,
         "final_top_n": final_top_n,
         "embedding_model": embedder.model,

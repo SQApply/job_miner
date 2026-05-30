@@ -1,0 +1,270 @@
+body {
+  background: #f5f7fb;
+  color: #1f2937;
+  font-family: Inter, Arial, sans-serif;
+}
+
+.login-pf body,
+.login-pf-page {
+  background: #f5f7fb;
+}
+
+#kc-header,
+#kc-header-wrapper {
+  color: #2563eb;
+  font-size: 28px;
+  font-weight: 800;
+  padding: 22px 0 8px;
+  text-transform: none;
+}
+
+.jm-page-title {
+  display: block;
+  color: #111827;
+  font-size: 26px;
+  font-weight: 800;
+  text-align: left;
+}
+
+.jm-shell {
+  display: grid;
+  grid-template-columns: 330px minmax(540px, 820px);
+  gap: 42px;
+  align-items: start;
+  justify-content: center;
+  width: min(1180px, calc(100vw - 48px));
+  margin: 26px auto;
+}
+
+.jm-benefits,
+.jm-card {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 18px;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.06);
+}
+
+.jm-benefits {
+  padding: 34px 34px 28px;
+  min-height: 330px;
+}
+
+.jm-illustration {
+  width: 118px;
+  height: 118px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  color: #16a34a;
+  font-size: 42px;
+  background: #eef4ff;
+  margin: 0 auto 22px;
+}
+
+.jm-benefits h2 {
+  text-align: center;
+  color: #111827;
+  font-size: 20px;
+  margin: 0 0 22px;
+}
+
+.jm-benefits ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.jm-benefits li {
+  position: relative;
+  padding-left: 28px;
+  margin: 16px 0;
+  line-height: 1.35;
+  color: #344054;
+}
+
+.jm-benefits li::before {
+  content: "✓";
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: #22c55e;
+  color: white;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.jm-card {
+  min-height: 440px;
+  padding: 46px 64px;
+}
+
+.jm-register-card {
+  min-height: 560px;
+}
+
+.jm-card h1 {
+  margin: 0;
+  color: #111827;
+  font-size: 26px;
+  font-weight: 900;
+}
+
+.jm-subtitle {
+  margin: 8px 0 28px;
+  color: #667085;
+  font-size: 15px;
+}
+
+.jm-form {
+  display: grid;
+  gap: 10px;
+}
+
+.jm-form label {
+  color: #111827;
+  font-size: 14px;
+  font-weight: 800;
+  margin-top: 8px;
+}
+
+.jm-form input[type="text"],
+.jm-form input[type="email"],
+.jm-form input[type="password"] {
+  border: 1px solid #d9deea;
+  border-radius: 13px;
+  box-sizing: border-box;
+  font-size: 15px;
+  min-height: 48px;
+  padding: 12px 16px;
+  width: 100%;
+}
+
+.jm-form input:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 4px rgba(37, 99, 235, .12);
+  outline: none;
+}
+
+.jm-form-row {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  margin: 8px 0 14px;
+}
+
+.jm-form-row a,
+.jm-register-link a {
+  color: #2563eb;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.jm-checkbox {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  margin: 0 !important;
+}
+
+.jm-primary {
+  background: #2563eb;
+  border: 0;
+  border-radius: 999px;
+  color: #ffffff;
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: 900;
+  min-height: 48px;
+  padding: 12px 24px;
+  width: 100%;
+}
+
+.jm-primary:hover {
+  background: #1d4ed8;
+}
+
+.jm-social-wrap {
+  margin: -28px auto 0;
+  max-width: 310px;
+  text-align: center;
+}
+
+.jm-divider {
+  color: #98a2b3;
+  margin: 18px 0 10px;
+}
+
+.jm-google {
+  align-items: center;
+  background: white;
+  border: 1px solid #c7d2fe;
+  border-radius: 999px;
+  color: #2563eb;
+  display: inline-flex;
+  font-weight: 900;
+  gap: 12px;
+  justify-content: center;
+  min-height: 42px;
+  padding: 0 22px;
+  text-decoration: none;
+}
+
+.jm-google-mark {
+  color: #4285f4;
+  font-weight: 900;
+}
+
+.jm-alert {
+  border-radius: 12px;
+  font-weight: 700;
+  margin: 14px 0;
+  padding: 12px;
+}
+
+.jm-alert-error {
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.jm-field-error {
+  color: #b91c1c;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.jm-register-link {
+  color: #111827;
+  font-size: 15px;
+  position: fixed;
+  right: 10vw;
+  top: 28px;
+}
+
+.jm-terms {
+  color: #667085;
+  font-size: 13px;
+  line-height: 1.45;
+  margin: 10px 0;
+}
+
+@media (max-width: 920px) {
+  .jm-shell {
+    grid-template-columns: 1fr;
+    width: min(640px, calc(100vw - 28px));
+  }
+
+  .jm-card {
+    padding: 32px 24px;
+  }
+
+  .jm-register-link {
+    position: static;
+    margin: 12px auto;
+    text-align: center;
+  }
+}

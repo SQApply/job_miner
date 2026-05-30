@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 def _strip_code_fences(text: str) -> str:
@@ -69,7 +72,8 @@ def _compact(value: Any, *, max_chars: int = 1500) -> str:
 
 
 def _chunked(items: list[dict[str, Any]], chunk_size: int) -> list[list[dict[str, Any]]]:
-    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+    safe_chunk_size = max(1, int(chunk_size or 1))
+    return [items[i : i + safe_chunk_size] for i in range(0, len(items), safe_chunk_size)]
 
 
 @dataclass(slots=True)
@@ -91,9 +95,93 @@ class LLMJobReranker:
     temperature: float = 0.0
     num_ctx: int = 8192
     num_predict: int = 4096
-    chunk_size: int = 10
+    chunk_size: int = 3
+    retry_missing_jobs: bool = True
+    max_missing_retries: int = 2
 
     def rerank(
+        self,
+        *,
+        candidate: dict[str, Any],
+        jobs: list[dict[str, Any]],
+    ) -> list[LLMRerankResult]:
+        """Score candidate-job fit with an LLM.
+
+        This method is strict about job coverage:
+        - It accepts only job_ids that were present in the input batch.
+        - It retries any job_ids missing from the LLM JSON response.
+        - It does not create synthetic/fallback LLM scores. The orchestration layer can
+          decide whether to drop unscored jobs or show diagnostics.
+        """
+        if not jobs:
+            return []
+
+        results_by_job_id: dict[str, LLMRerankResult] = {}
+        jobs_by_id = {str(job.get("job_id") or "").strip(): job for job in jobs if str(job.get("job_id") or "").strip()}
+
+        for chunk in _chunked(list(jobs_by_id.values()), self.chunk_size):
+            chunk_results = self._rerank_chunk(candidate=candidate, jobs=chunk)
+            valid_ids = {str(job.get("job_id") or "").strip() for job in chunk}
+            for item in chunk_results:
+                if item.job_id in valid_ids:
+                    results_by_job_id[item.job_id] = item
+
+            if not self.retry_missing_jobs:
+                continue
+
+            missing_ids = [job_id for job_id in valid_ids if job_id not in results_by_job_id]
+            if missing_ids:
+                logger.warning(
+                    "LLM skipped job_ids in chunk. Retrying missing jobs count=%s ids=%s",
+                    len(missing_ids),
+                    missing_ids[:10],
+                )
+                self._retry_missing(candidate=candidate, jobs_by_id=jobs_by_id, missing_ids=missing_ids, results_by_job_id=results_by_job_id)
+
+        missing_final = [job_id for job_id in jobs_by_id if job_id not in results_by_job_id]
+        if missing_final:
+            logger.warning(
+                "LLM still did not score some jobs after retries. Dropping from optimized output count=%s ids=%s",
+                len(missing_final),
+                missing_final[:20],
+            )
+
+        return sorted(
+            results_by_job_id.values(),
+            key=lambda item: item.llm_match_score,
+            reverse=True,
+        )
+
+    def _retry_missing(
+        self,
+        *,
+        candidate: dict[str, Any],
+        jobs_by_id: dict[str, dict[str, Any]],
+        missing_ids: list[str],
+        results_by_job_id: dict[str, LLMRerankResult],
+    ) -> None:
+        remaining = list(missing_ids)
+        for attempt in range(1, max(1, self.max_missing_retries) + 1):
+            if not remaining:
+                return
+            logger.info("Retrying missing LLM job scores attempt=%s remaining=%s", attempt, len(remaining))
+            next_remaining: list[str] = []
+            # Retry one job at a time. This is slower but much more reliable for local small LLMs.
+            for job_id in remaining:
+                if job_id in results_by_job_id:
+                    continue
+                job = jobs_by_id.get(job_id)
+                if not job:
+                    continue
+                retry_results = self._rerank_chunk(candidate=candidate, jobs=[job])
+                match = next((item for item in retry_results if item.job_id == job_id), None)
+                if match:
+                    results_by_job_id[job_id] = match
+                else:
+                    next_remaining.append(job_id)
+            remaining = next_remaining
+
+    def _rerank_chunk(
         self,
         *,
         candidate: dict[str, Any],
@@ -102,54 +190,56 @@ class LLMJobReranker:
         if not jobs:
             return []
 
-        all_results: list[LLMRerankResult] = []
+        expected_ids = {str(job.get("job_id") or "").strip() for job in jobs if str(job.get("job_id") or "").strip()}
+        prompt = self._build_prompt(candidate=candidate, jobs=jobs)
+        response_text = self._call_ollama(prompt)
+        payload = _extract_json(response_text)
 
-        for chunk in _chunked(jobs, self.chunk_size):
-            prompt = self._build_prompt(candidate=candidate, jobs=chunk)
-            response_text = self._call_ollama(prompt)
-            payload = _extract_json(response_text)
+        if not isinstance(payload, dict):
+            logger.warning("LLM response was not valid JSON object. expected_job_ids=%s", sorted(expected_ids))
+            return []
 
-            if not isinstance(payload, dict):
+        results = payload.get("results")
+        if not isinstance(results, list):
+            logger.warning("LLM JSON did not contain results list. expected_job_ids=%s", sorted(expected_ids))
+            return []
+
+        parsed: list[LLMRerankResult] = []
+        seen: set[str] = set()
+
+        for item in results:
+            if not isinstance(item, dict):
                 continue
 
-            results = payload.get("results")
-
-            if not isinstance(results, list):
+            job_id = str(item.get("job_id") or "").strip()
+            if not job_id or job_id not in expected_ids or job_id in seen:
                 continue
+            seen.add(job_id)
 
-            for item in results:
-                if not isinstance(item, dict):
-                    continue
+            try:
+                score = int(float(item.get("llm_match_score", 0)))
+            except Exception:
+                score = 0
 
-                job_id = str(item.get("job_id") or "").strip()
+            score = max(0, min(100, score))
 
-                if not job_id:
-                    continue
-
-                try:
-                    score = int(float(item.get("llm_match_score", 0)))
-                except Exception:
-                    score = 0
-
-                score = max(0, min(100, score))
-
-                all_results.append(
-                    LLMRerankResult(
-                        job_id=job_id,
-                        llm_match_score=score,
-                        decision=str(item.get("decision") or "unknown"),
-                        matched_skills=_as_list(item.get("matched_skills")),
-                        missing_skills=_as_list(item.get("missing_skills")),
-                        risk_flags=_as_list(item.get("risk_flags")),
-                        reason=str(item.get("reason") or "").strip(),
-                    )
+            parsed.append(
+                LLMRerankResult(
+                    job_id=job_id,
+                    llm_match_score=score,
+                    decision=str(item.get("decision") or "unknown"),
+                    matched_skills=_as_list(item.get("matched_skills")),
+                    missing_skills=_as_list(item.get("missing_skills")),
+                    risk_flags=_as_list(item.get("risk_flags")),
+                    reason=str(item.get("reason") or "").strip(),
                 )
+            )
 
-        return sorted(
-            all_results,
-            key=lambda item: item.llm_match_score,
-            reverse=True,
-        )
+        missing_ids = sorted(expected_ids - {item.job_id for item in parsed})
+        if missing_ids:
+            logger.warning("LLM chunk missing job_ids=%s", missing_ids)
+
+        return parsed
 
     def _candidate_brief(self, candidate: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -160,8 +250,7 @@ class LLMJobReranker:
             "current_title": candidate.get("current_title"),
             "current_company": candidate.get("current_company"),
             "total_experience_years": candidate.get("total_experience_years"),
-            "primary_skills": _as_list(candidate.get("primary_skills")),
-            "secondary_skills": _as_list(candidate.get("secondary_skills")),
+            "skills": _as_list(candidate.get("skills")),
             "domains": _as_list(candidate.get("domains")),
             "location": candidate.get("location"),
             "identity_text": _compact(candidate.get("identity_text"), max_chars=1200),
@@ -186,7 +275,7 @@ class LLMJobReranker:
             "preferred_skills": _as_list(job.get("preferred_skills")),
             "summary": _compact(job.get("summary"), max_chars=1200),
             "responsibilities": _compact(job.get("responsibilities"), max_chars=1600),
-            "raw_payload": _compact(job.get("raw_payload"), max_chars=1500),
+            "raw_payload": _compact(job.get("raw_payload"), max_chars=1000),
         }
 
     def _build_prompt(
@@ -197,19 +286,26 @@ class LLMJobReranker:
     ) -> str:
         candidate_brief = self._candidate_brief(candidate)
         job_briefs = [self._job_brief(job) for job in jobs]
+        job_ids = [brief.get("job_id") for brief in job_briefs]
 
         return f"""
 You are an expert technical recruiter and job-matching reranker.
 
 Task:
-Rerank the provided jobs for the candidate.
+Score the provided jobs for the candidate.
+
+Critical output rule:
+- Return exactly one result object for every job_id in this list: {json.dumps(job_ids, ensure_ascii=False)}.
+- Do not omit any job_id.
+- Do not create new job_ids.
+- If a job is a poor fit, still return it with a low score and explanation.
+- Return only valid JSON.
 
 Important:
 - These jobs were already retrieved by vector search.
 - Your job is to judge final candidate-job fit.
 - Use only the information provided.
 - Do not invent candidate experience or job requirements.
-- Return only valid JSON.
 
 Score rubric:
 90-100 = excellent match; candidate strongly fits role, skills, and experience.

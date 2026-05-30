@@ -156,6 +156,9 @@ class CandidateTowerDocument(MongoDocument):
     current_title: str | None = None
     current_company: str | None = None
     total_experience_years: float | None = None
+    # Canonical skills used by embeddings, matching, and LLM reranking.
+    # primary_skills/secondary_skills are kept as legacy fields for backward compatibility only.
+    skills: list[str] = Field(default_factory=list)
     primary_skills: list[str] = Field(default_factory=list)
     secondary_skills: list[str] = Field(default_factory=list)
     domains: list[str] = Field(default_factory=list)

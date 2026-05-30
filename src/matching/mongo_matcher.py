@@ -36,7 +36,7 @@ def terms_from_text(text: str) -> set[str]:
 
 def skills(record: dict[str, Any]) -> set[str]:
     out = set()
-    for k in ("primary_skills", "secondary_skills", "domains", "required_skills", "preferred_skills"):
+    for k in ("skills", "primary_skills", "secondary_skills", "domains", "required_skills", "preferred_skills"):
         out.update(norm(x) for x in as_list(record.get(k)))
     out.update(terms_from_text(json.dumps(record, ensure_ascii=False, default=str)))
     return {x for x in out if x}

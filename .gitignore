@@ -1,5 +1,6 @@
 # Secrets
 .env
+!.env.example
 .env.*
 *.pem
 *.key
@@ -35,6 +36,7 @@ data/
 .crawl4ai/
 smoke_test/*.json
 .env
+!.env.example
 *.bak
 __pycache__/
 *.pyc
@@ -45,3 +47,24 @@ data/processed/
 data/resumes/processed/
 data/resumes/input/
 logs/
+
+
+# Node dependencies
+node_modules/
+**/node_modules/
+
+# Build outputs
+dist/
+build/
+.vite/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment files
+.env
+.env.*
+!.env.example

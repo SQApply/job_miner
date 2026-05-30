@@ -199,8 +199,7 @@ def export_training_pairs(
             "candidate_features": {
                 "full_name": candidate.get("full_name"),
                 "current_title": candidate.get("current_title"),
-                "primary_skills": candidate.get("primary_skills") or [],
-                "secondary_skills": candidate.get("secondary_skills") or [],
+                "skills": candidate.get("skills") or [],
                 "domains": candidate.get("domains") or [],
             },
             "job_features": {
