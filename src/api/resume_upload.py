@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from datetime import datetime, timezone
 
 from fastapi import HTTPException, UploadFile, status
 
@@ -14,11 +16,200 @@ from ..resume_ocr.logger import build_session_logger
 from ..resume_ocr.pipeline import ResumeOcrPipeline, _new_run_session_id
 from ..resume_ocr.settings import load_system_config
 from ..resume_ocr.utils import SUPPORTED_EXTENSIONS
+from ..tasks.recommendation_tasks import generate_recommendations_after_resume_upload_task
 from ..warehouse.repositories import WarehouseRepository
+from ..common.constants import MongoCollections
 
 
 DEFAULT_MAX_UPLOAD_MB = 15
 CHUNK_SIZE_BYTES = 1024 * 1024
+
+RESUME_PROCESSING_STALE_SECONDS = 60 * 60
+PROCESSING_STATES = {"queued", "processing", "profile_extracting"}
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _resume_processing_stale_seconds() -> int:
+    raw = os.getenv("JOB_MINER_RESUME_PROCESSING_STALE_SECONDS", str(RESUME_PROCESSING_STALE_SECONDS))
+    try:
+        return max(int(raw), 60)
+    except ValueError:
+        return RESUME_PROCESSING_STALE_SECONDS
+
+
+def _is_stale_timestamp(value: Any) -> bool:
+    if not value:
+        return True
+
+    if isinstance(value, datetime):
+        started_at = value
+    else:
+        try:
+            started_at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return True
+
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+
+    elapsed = (_utc_now() - started_at).total_seconds()
+    return elapsed > _resume_processing_stale_seconds()
+
+
+def _assert_no_active_resume_processing(db: Any, candidate_id: str | None) -> None:
+    if not candidate_id:
+        return
+
+    tower = db[MongoCollections.CANDIDATE_TOWER_RECORDS].find_one(
+        {"candidate_id": candidate_id},
+        {
+            "_id": 0,
+            "profile_state": 1,
+            "resume_upload_status": 1,
+            "resume_processing_started_at": 1,
+            "resume_upload_started_at": 1,
+            "active_resume_upload_id": 1,
+        },
+    )
+
+    if not tower:
+        return
+
+    status_values = {
+        str(tower.get("resume_upload_status") or "").lower(),
+        str(tower.get("profile_state") or "").lower(),
+    }
+
+    is_processing = bool(status_values.intersection(PROCESSING_STATES))
+    started_at = tower.get("resume_processing_started_at") or tower.get("resume_upload_started_at")
+
+    if is_processing and not _is_stale_timestamp(started_at):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Your resume is already being processed. Refreshing or uploading again is not required. "
+                "Please wait for the current processing run to finish."
+            ),
+        )
+
+
+def _mark_resume_processing_started(
+    *,
+    db: Any,
+    candidate_id: str | None,
+    resume_id: str | None,
+    upload_id: str,
+    original_name: str,
+    user: dict[str, Any],
+    local_path: Path,
+) -> None:
+    if not candidate_id:
+        return
+
+    now = _utc_now()
+
+    payload = {
+        "profile_state": "processing",
+        "resume_upload_status": "processing",
+        "resume_upload_status_message": "Your resume is being processed. Please do not upload it again.",
+        "resume_processing_started_at": now,
+        "resume_upload_started_at": now,
+        "resume_upload_updated_at": now,
+        "active_resume_upload_id": upload_id,
+        "active_resume_file_name": original_name,
+        "active_resume_local_path": str(local_path),
+        "uploaded_by_app_user_id": str(user.get("id")),
+        "uploaded_by_email": _normalize_email(user.get("email")),
+        "onboarding_required": True,
+    }
+
+    db[MongoCollections.CANDIDATE_TOWER_RECORDS].update_one(
+        {"candidate_id": candidate_id},
+        {"$set": payload},
+    )
+
+    if resume_id:
+        db[MongoCollections.RESUME_PROFILES_CURRENT].update_one(
+            {"resume_id": resume_id},
+            {"$set": payload},
+        )
+
+
+def _mark_resume_processing_failed(
+    *,
+    db: Any,
+    candidate_id: str | None,
+    resume_id: str | None,
+    upload_id: str,
+    error_message: str,
+) -> None:
+    if not candidate_id:
+        return
+
+    now = _utc_now()
+
+    payload = {
+        "profile_state": "incomplete",
+        "resume_upload_status": "failed",
+        "resume_upload_status_message": "Resume processing failed. Please check the file and upload again.",
+        "resume_upload_error": error_message[:4000],
+        "resume_upload_failed_at": now,
+        "resume_upload_updated_at": now,
+        "active_resume_upload_id": upload_id,
+        "onboarding_required": True,
+    }
+
+    db[MongoCollections.CANDIDATE_TOWER_RECORDS].update_one(
+        {"candidate_id": candidate_id},
+        {"$set": payload},
+    )
+
+    if resume_id:
+        db[MongoCollections.RESUME_PROFILES_CURRENT].update_one(
+            {"resume_id": resume_id},
+            {"$set": payload},
+        )
+
+
+def _mark_previous_shell_superseded(
+    *,
+    db: Any,
+    previous_candidate_id: str | None,
+    previous_resume_id: str | None,
+    new_candidate_id: str,
+    new_resume_id: str,
+    upload_id: str,
+) -> None:
+    if not previous_candidate_id or previous_candidate_id == new_candidate_id:
+        return
+
+    now = _utc_now()
+
+    payload = {
+        "profile_state": "superseded",
+        "resume_upload_status": "completed",
+        "resume_upload_status_message": "Resume processing completed and a full candidate profile was created.",
+        "resume_upload_completed_at": now,
+        "resume_upload_updated_at": now,
+        "active_resume_upload_id": upload_id,
+        "superseded_by_candidate_id": new_candidate_id,
+        "superseded_by_resume_id": new_resume_id,
+        "onboarding_required": False,
+    }
+
+    db[MongoCollections.CANDIDATE_TOWER_RECORDS].update_one(
+        {"candidate_id": previous_candidate_id},
+        {"$set": payload},
+    )
+
+    if previous_resume_id:
+        db[MongoCollections.RESUME_PROFILES_CURRENT].update_one(
+            {"resume_id": previous_resume_id},
+            {"$set": payload},
+        )
 
 
 def _project_root() -> Path:
@@ -85,6 +276,100 @@ def _model_to_payload(value: Any) -> dict[str, Any]:
     raise TypeError(f"Unsupported resume pipeline payload type: {type(value)!r}")
 
 
+def _env_enabled(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _queue_recommendation_generation(
+    *,
+    db: Any,
+    candidate_id: str,
+    resume_id: str,
+    login_email: str,
+    run_session_id: str,
+) -> dict[str, Any]:
+    """Queue recommendation generation without blocking resume upload.
+
+    If Redis/Celery is unavailable, the upload still succeeds and the candidate
+    record is marked with a queue failure that can be retried operationally.
+    """
+    now = datetime.now(timezone.utc)
+
+    if not _env_enabled("JOB_MINER_ENABLE_AUTO_RECOMMENDATION_QUEUE", True):
+        db.candidate_tower_records.update_many(
+            {"candidate_id": candidate_id},
+            {
+                "$set": {
+                    "recommendation_status": "disabled",
+                    "recommendation_status_message": "Automatic recommendation generation is disabled.",
+                    "recommendation_updated_at": now,
+                }
+            },
+        )
+        return {
+            "status": "disabled",
+            "candidate_id": candidate_id,
+            "message": "Automatic recommendation generation is disabled.",
+        }
+
+    queue_name = os.getenv("JOB_MINER_RECOMMENDATION_QUEUE", "recommendation_queue")
+
+    try:
+        async_result = generate_recommendations_after_resume_upload_task.apply_async(
+            kwargs={
+                "candidate_id": candidate_id,
+                "resume_id": resume_id,
+                "email": login_email,
+                "run_session_id": run_session_id,
+            },
+            queue=queue_name,
+        )
+    except Exception as exc:
+        db.candidate_tower_records.update_many(
+            {"candidate_id": candidate_id},
+            {
+                "$set": {
+                    "recommendation_status": "queue_failed",
+                    "recommendation_status_message": "Profile is ready, but recommendation generation could not be queued.",
+                    "recommendation_error": repr(exc),
+                    "recommendation_updated_at": now,
+                }
+            },
+        )
+        return {
+            "status": "queue_failed",
+            "candidate_id": candidate_id,
+            "message": "Recommendation generation could not be queued.",
+            "error": repr(exc),
+        }
+
+    db.candidate_tower_records.update_many(
+        {"candidate_id": candidate_id},
+        {
+            "$set": {
+                "recommendation_status": "queued",
+                "recommendation_status_message": "Recommendations are being generated in the background.",
+                "recommendation_task_id": async_result.id,
+                "recommendation_queue": queue_name,
+                "recommendation_queued_at": now,
+                "recommendation_updated_at": now,
+                "recommendation_error": None,
+            }
+        },
+    )
+
+    return {
+        "status": "queued",
+        "candidate_id": candidate_id,
+        "task_id": async_result.id,
+        "queue": queue_name,
+        "message": "Recommendations are being generated in the background.",
+    }
+
+
 def process_candidate_resume_upload(
     *,
     upload: UploadFile,
@@ -111,11 +396,52 @@ def process_candidate_resume_upload(
         allowed = ", ".join(sorted(SUPPORTED_EXTENSIONS))
         raise HTTPException(status_code=400, detail=f"Unsupported resume file type '{suffix}'. Allowed types: {allowed}.")
 
+    # root = _project_root()
+    # upload_id = _new_run_session_id()
+    # upload_dir = root / "data" / "resumes" / "candidate_uploads" / str(user["id"])
+    # local_path = upload_dir / f"{upload_id}_{original_name}"
+    # file_size_bytes = _write_upload_to_disk(upload, local_path)
     root = _project_root()
     upload_id = _new_run_session_id()
     upload_dir = root / "data" / "resumes" / "candidate_uploads" / str(user["id"])
     local_path = upload_dir / f"{upload_id}_{original_name}"
-    file_size_bytes = _write_upload_to_disk(upload, local_path)
+
+    previous_candidate_id = (
+        str(current_link.get("candidate_id"))
+        if current_link and current_link.get("candidate_id")
+        else None
+    )
+    previous_resume_id = (
+        str(current_link.get("resume_id"))
+        if current_link and current_link.get("resume_id")
+        else None
+    )
+
+    db = get_mongo_database()
+
+    _assert_no_active_resume_processing(db, previous_candidate_id)
+
+    _mark_resume_processing_started(
+        db=db,
+        candidate_id=previous_candidate_id,
+        resume_id=previous_resume_id,
+        upload_id=upload_id,
+        original_name=original_name,
+        user=user,
+        local_path=local_path,
+    )
+
+    try:
+        file_size_bytes = _write_upload_to_disk(upload, local_path)
+    except HTTPException as exc:
+        _mark_resume_processing_failed(
+            db=db,
+            candidate_id=previous_candidate_id,
+            resume_id=previous_resume_id,
+            upload_id=upload_id,
+            error_message=str(exc.detail),
+        )
+        raise
 
     config = load_system_config(root)
     run_session_id = _new_run_session_id()
@@ -128,22 +454,64 @@ def process_candidate_resume_upload(
         file_size_bytes=file_size_bytes,
     )
 
+    # pipeline = ResumeOcrPipeline(root, config, logger)
+    # profile, record, status_text = pipeline.process_file(local_path)
+    # if status_text != "processed" or profile is None or record is None:
+    #     raise HTTPException(
+    #         status_code=422,
+    #         detail="Resume could not be processed. Check that the file is readable and that the OCR/LLM services are running.",
+    #     )
     pipeline = ResumeOcrPipeline(root, config, logger)
-    profile, record, status_text = pipeline.process_file(local_path)
-    if status_text != "processed" or profile is None or record is None:
-        raise HTTPException(
-            status_code=422,
-            detail="Resume could not be processed. Check that the file is readable and that the OCR/LLM services are running.",
+
+    try:
+        profile, record, status_text = pipeline.process_file(local_path)
+
+        if status_text != "processed" or profile is None or record is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Resume could not be processed. Check that the file is readable and that the OCR/LLM services are running.",
+            )
+
+    except HTTPException as exc:
+        _mark_resume_processing_failed(
+            db=db,
+            candidate_id=previous_candidate_id,
+            resume_id=previous_resume_id,
+            upload_id=upload_id,
+            error_message=str(exc.detail),
         )
+        raise
+
+    except Exception as exc:
+        _mark_resume_processing_failed(
+            db=db,
+            candidate_id=previous_candidate_id,
+            resume_id=previous_resume_id,
+            upload_id=upload_id,
+            error_message=repr(exc),
+        )
+        raise
 
     profile_payload = _model_to_payload(profile)
     contact = profile_payload.setdefault("contact", {})
     parsed_email = _normalize_email(contact.get("email"))
     if parsed_email and parsed_email != login_email:
+        _mark_resume_processing_failed(
+        db=db,
+        candidate_id=previous_candidate_id,
+        resume_id=previous_resume_id,
+        upload_id=upload_id,
+        error_message="The email extracted from the resume does not match the verified login email.",
+    )
+
         raise HTTPException(
             status_code=409,
             detail="The email extracted from the resume does not match your verified login email. Upload a resume with the same email or contact support.",
         )
+        # raise HTTPException(
+        #     status_code=409,
+        #     detail="The email extracted from the resume does not match your verified login email. Upload a resume with the same email or contact support.",
+        # )
 
     # Keep ownership deterministic. If the resume has no email, the verified
     # login email becomes the canonical candidate email.
@@ -154,6 +522,10 @@ def process_candidate_resume_upload(
     profile_payload["profile_state"] = "ready"
     profile_payload["onboarding_required"] = False
     profile_payload["resume_uploaded"] = True
+    profile_payload["resume_upload_status"] = "completed"
+    profile_payload["resume_upload_status_message"] = "Resume processing completed."
+    profile_payload["resume_upload_completed_at"] = _utc_now()
+    profile_payload["active_resume_upload_id"] = upload_id
     profile_payload.setdefault("raw_payload", {})
     if isinstance(profile_payload["raw_payload"], dict):
         profile_payload["raw_payload"].update(
@@ -172,15 +544,30 @@ def process_candidate_resume_upload(
     record_payload["profile_state"] = "ready"
     record_payload["onboarding_required"] = False
     record_payload["resume_uploaded"] = True
+    record_payload["resume_upload_status"] = "completed"
+    record_payload["resume_upload_status_message"] = "Resume processing completed."
+    record_payload["resume_upload_completed_at"] = _utc_now()
+    record_payload["active_resume_upload_id"] = upload_id
     record_payload["uploaded_by_app_user_id"] = str(user.get("id"))
     record_payload["uploaded_by_email"] = login_email
     record_payload["recommendation_status"] = "pending"
     record_payload["recommendation_status_message"] = "Profile parsed. Recommendation generation is pending."
 
-    db = get_mongo_database()
+    # db = get_mongo_database()
     warehouse = WarehouseRepository(db)
+    # resume_id, _, _ = warehouse.upsert_resume_profile(profile_payload, run_session_id=run_session_id)
+    # candidate_id = warehouse.upsert_candidate_tower(record_payload)
     resume_id, _, _ = warehouse.upsert_resume_profile(profile_payload, run_session_id=run_session_id)
     candidate_id = warehouse.upsert_candidate_tower(record_payload)
+
+    _mark_previous_shell_superseded(
+        db=db,
+        previous_candidate_id=previous_candidate_id,
+        previous_resume_id=previous_resume_id,
+        new_candidate_id=candidate_id,
+        new_resume_id=resume_id,
+        upload_id=upload_id,
+    )
 
     # Persist the original uploaded resume for audit/debugging. The parsed OCR
     # outputs are already written by the resume OCR pipeline under data/processed.
@@ -214,12 +601,29 @@ def process_candidate_resume_upload(
         source_path=str(local_path),
     )
 
+    recommendation_generation = _queue_recommendation_generation(
+        db=db,
+        candidate_id=candidate_id,
+        resume_id=resume_id,
+        login_email=login_email,
+        run_session_id=run_session_id,
+    )
+
+    logger.log(
+        "candidate_recommendation_generation_queued",
+        app_user_id=str(user.get("id")),
+        candidate_id=candidate_id,
+        resume_id=resume_id,
+        recommendation_generation=recommendation_generation,
+    )
+
     return {
         "uploaded": True,
         "candidate_id": candidate_id,
         "resume_id": resume_id,
         "candidate_link": link,
         "run_session_id": run_session_id,
+        "recommendation_generation": recommendation_generation,
         "profile": {
             "resume_profile": profile_payload,
             "candidate_tower": record_payload,

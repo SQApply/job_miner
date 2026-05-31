@@ -303,6 +303,68 @@ function ResumeUploadPage({ me, onUploaded }) {
     </Card>
   </div>;
 }
+function ResumeProcessingPage({ me, refreshMe }) {
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [error, setError] = useState(null);
+
+  async function refreshStatus() {
+    try {
+      setError(null);
+      await refreshMe();
+    } catch (e) {
+      setError(e.message || 'Could not refresh processing status');
+    }
+  }
+
+  useEffect(() => {
+    refreshStatus();
+
+    const timer = window.setInterval(() => {
+      setElapsedSeconds((value) => value + 1);
+    }, 1000);
+
+    const poller = window.setInterval(refreshStatus, 15000);
+
+    return () => {
+      window.clearInterval(timer);
+      window.clearInterval(poller);
+    };
+  }, []);
+
+  const minutes = Math.floor(elapsedSeconds / 60);
+  const seconds = String(elapsedSeconds % 60).padStart(2, '0');
+  const showComeBackLater = elapsedSeconds >= 300;
+
+  return <div className="onboarding-shell">
+    <Card title="Processing your resume" subtitle="Your upload is already in progress. Please do not upload the same resume again.">
+      <div className="onboarding-hero processing-hero">
+        <div>
+          <h3>Resume processing is in progress</h3>
+          <p>Job Miner is extracting your profile, skills, experience, education, and domains.</p>
+          <p className="muted">Elapsed time: <b>{minutes}:{seconds}</b></p>
+        </div>
+        <span className="status-pill warning">Processing</span>
+      </div>
+
+      <div className="progress-panel">
+        <div className="progress-spinner" aria-hidden="true" />
+        <div>
+          <h4>What is happening now?</h4>
+          <p>Profile creation usually takes 1–3 minutes. Job recommendations are generated after your profile is ready.</p>
+          {showComeBackLater && <p className="muted">This is taking longer than usual. You can keep this page open or come back later. Your current upload will continue in the background.</p>}
+        </div>
+      </div>
+
+      <div className="row top-actions">
+        <Button onClick={refreshStatus}>Refresh status</Button>
+      </div>
+
+      {error && <p className="error">{error}</p>}
+    </Card>
+  </div>;
+}
+
+
 
 function CandidatePortal({ me, refreshMe }) {
   const [profile, setProfile] = useState(null);
@@ -502,9 +564,11 @@ function App() {
       </div>
     </header>
     {view === 'admin' && canAdmin ? <AdminPortal /> : (
-      me?.profile_state === 'incomplete' || me?.next_action === 'complete_profile'
-        ? <ResumeUploadPage me={me} onUploaded={handleResumeUploaded} />
-        : <CandidatePortal me={me} refreshMe={loadMe} />
+      me?.profile_state === 'processing' || me?.next_action === 'wait_for_resume_processing'
+        ? <ResumeProcessingPage me={me} refreshMe={loadMe} />
+        : (me?.profile_state === 'incomplete' || me?.next_action === 'complete_profile' || me?.next_action === 'retry_resume_upload'
+          ? <ResumeUploadPage me={me} onUploaded={handleResumeUploaded} />
+          : <CandidatePortal me={me} refreshMe={loadMe} />)
     )}
   </div>;
 }

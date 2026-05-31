@@ -471,3 +471,44 @@ th, td {
   color: #374151;
   line-height: 1.6;
 }
+
+.processing-hero {
+  align-items: center;
+}
+
+.progress-panel {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  background: #f9fafb;
+  padding: 16px;
+  margin: 14px 0;
+}
+
+.progress-panel h4 {
+  margin: 0 0 8px 0;
+}
+
+.progress-panel p {
+  margin: 0 0 8px 0;
+  line-height: 1.45;
+}
+
+.progress-spinner {
+  width: 26px;
+  height: 26px;
+  border: 3px solid #dbeafe;
+  border-top-color: #2563eb;
+  border-radius: 999px;
+  animation: spin 1s linear infinite;
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
