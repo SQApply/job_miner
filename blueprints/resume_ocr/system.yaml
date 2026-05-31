@@ -18,9 +18,9 @@ llm:
   provider: "qwen2.5:7b"
   base_url: "http://127.0.0.1:11434"
   temperature: 0.0
-  max_tokens: 4096
-  num_ctx: 4096
-  request_timeout_seconds: 900
+  max_tokens: 8192
+  num_ctx: 8192
+  request_timeout_seconds: 1200
 
 parser:
   enabled: true

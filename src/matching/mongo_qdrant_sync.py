@@ -430,20 +430,23 @@ def index_candidate_towers(
     recreate: bool = False,
     only_pending: bool = False,
     limit: int | None = None,
+    candidate_id: str | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
 
     logger.info(
-        "Starting candidate tower indexing collection=%s recreate=%s only_pending=%s limit=%s",
+        "Starting candidate tower indexing collection=%s recreate=%s only_pending=%s limit=%s candidate_id=%s",
         collection_name,
         recreate,
         only_pending,
         limit,
+        candidate_id,
     )
 
     rows_from_mongo = repo.candidate_towers(
         only_pending=only_pending,
         limit=limit,
+        candidate_id=candidate_id,
     )
 
     logger.info(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -220,18 +221,22 @@ def create_incomplete_candidate_profile_for_user(user: dict[str, Any]) -> dict[s
 
 def list_candidate_recommendations(candidate_id: str, source: str = "llm", limit: int = 50) -> list[dict[str, Any]]:
     db = get_mongo_database()
+    requested_source = source
+
     if source == "baseline":
         collection = MongoCollections.CANDIDATE_JOB_MATCHES
         sort_key = "rank"
+        query: dict[str, Any] = {"candidate_id": candidate_id}
     else:
         collection = MongoCollections.CANDIDATE_JOB_MATCHES_LLM_RERANKED
         sort_key = "final_rank"
-    query: dict[str, Any] = {"candidate_id": candidate_id}
-    if source != "baseline":
-        # Candidate-facing LLM recommendations should include only records that were
-        # actually scored by the LLM. Old fallback records are hidden even if they are
-        # still present from previous runs.
-        query["evidence.reranker_status"] = "llm_scored"
+        query = {
+            "candidate_id": candidate_id,
+            # Candidate-facing LLM recommendations should include only records that were
+            # actually scored by the LLM. Old fallback records are hidden even if they are
+            # still present from previous runs.
+            "evidence.reranker_status": "llm_scored",
+        }
 
     rows = list(
         db[collection]
@@ -239,6 +244,17 @@ def list_candidate_recommendations(candidate_id: str, source: str = "llm", limit
         .sort([("match_run_id", -1), (sort_key, 1)])
         .limit(limit)
     )
+
+    if requested_source != "baseline" and not rows and os.getenv("JOB_MINER_RECOMMENDATIONS_FALLBACK_TO_BASELINE", "true").strip().lower() in {"1", "true", "yes", "on"}:
+        collection = MongoCollections.CANDIDATE_JOB_MATCHES
+        sort_key = "rank"
+        rows = list(
+            db[collection]
+            .find({"candidate_id": candidate_id})
+            .sort([("match_run_id", -1), (sort_key, 1)])
+            .limit(limit)
+        )
+
     out: list[dict[str, Any]] = []
     for row in rows:
         row = _clean_doc(row) or {}

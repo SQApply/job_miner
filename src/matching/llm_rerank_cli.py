@@ -84,6 +84,7 @@ def cmd_match(args: argparse.Namespace) -> None:
         final_top_n=args.final_top_n,
         output_dir=Path(args.output_dir),
         candidates_limit=args.candidates_limit,
+        candidate_id=args.candidate_id,
     )
 
     _print(summary)
@@ -139,6 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     match_parser.add_argument("--final-top-n", type=int, default=10)
     match_parser.add_argument("--output-dir", default="data/processed/matching_llm")
     match_parser.add_argument("--candidates-limit", type=int, default=None)
+    match_parser.add_argument("--candidate-id", default=None)
     match_parser.add_argument("--llm-model", default=os.getenv("JOB_MINER_LLM_RERANKER_MODEL", "qwen2.5:3b"))
     match_parser.add_argument("--llm-timeout-seconds", type=int, default=600)
     match_parser.add_argument("--llm-chunk-size", type=int, default=3)

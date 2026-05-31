@@ -555,8 +555,15 @@ class WarehouseRepository:
         *,
         only_pending: bool = False,
         limit: int | None = None,
+        candidate_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        query = {"embedding_status": {"$ne": "indexed"}} if only_pending else {}
+        query: dict[str, Any] = {}
+
+        if only_pending:
+            query["embedding_status"] = {"$ne": "indexed"}
+
+        if candidate_id:
+            query["candidate_id"] = candidate_id
 
         cursor = self.db[CandidateTowerDocument.collection_name].find(query).sort(
             "updated_at",

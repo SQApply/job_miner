@@ -60,8 +60,19 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
         for row in rows: f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
 
-def match_candidates_from_mongo(*, repo: WarehouseRepository, store: QdrantVectorStore, embedder: OllamaEmbedder, jobs_collection: str, top_n: int, output_dir: Path | None = None, limit: int | None = None) -> dict[str, Any]:
-    candidates = repo.candidate_towers(limit=limit); run_id = "matching_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+def match_candidates_from_mongo(
+    *,
+    repo: WarehouseRepository,
+    store: QdrantVectorStore,
+    embedder: OllamaEmbedder,
+    jobs_collection: str,
+    top_n: int,
+    output_dir: Path | None = None,
+    limit: int | None = None,
+    candidate_id: str | None = None,
+) -> dict[str, Any]:
+    candidates = repo.candidate_towers(limit=limit, candidate_id=candidate_id)
+    run_id = "matching_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     grouped = []; flat = []; docs = []
     for cand in candidates:
         text = str(cand.get("candidate_embedding_text") or "")
@@ -78,7 +89,7 @@ def match_candidates_from_mongo(*, repo: WarehouseRepository, store: QdrantVecto
         grouped.append({"candidate_id": cand.get("candidate_id"), "resume_id": cand.get("resume_id"), "candidate_name": cand.get("full_name"), "top_n": top_n, "matches": matches})
     repo.upsert_matches(docs)
     vals = [x["score"] for x in flat]
-    summary = {"match_run_id": run_id, "candidate_count": len(candidates), "matched_candidate_count": len(grouped), "total_match_count": len(flat), "top_n": top_n, "embedding_model": embedder.model, "jobs_collection": jobs_collection, "average_score": round(sum(vals) / len(vals), 6) if vals else 0.0, "max_score": round(max(vals), 6) if vals else 0.0, "top_matched_titles": Counter(x.get("title") or "UNKNOWN" for x in flat).most_common(10)}
+    summary = {"match_run_id": run_id, "candidate_id": candidate_id, "candidate_count": len(candidates), "matched_candidate_count": len(grouped), "total_match_count": len(flat), "top_n": top_n, "embedding_model": embedder.model, "jobs_collection": jobs_collection, "average_score": round(sum(vals) / len(vals), 6) if vals else 0.0, "max_score": round(max(vals), 6) if vals else 0.0, "top_matched_titles": Counter(x.get("title") or "UNKNOWN" for x in flat).most_common(10)}
     if output_dir:
         write_json(output_dir / "candidate_job_matches_latest.json", grouped); write_jsonl(output_dir / "candidate_job_matches_latest.jsonl", flat); write_json(output_dir / "candidate_job_matches_latest_summary.json", summary)
     return summary

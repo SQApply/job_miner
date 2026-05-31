@@ -1205,6 +1205,19 @@ Quality requirements:
 32. If education_blocks exist, education[] must be populated.
 33. If project_blocks exist, projects[] must be populated.
 
+Output size limits:
+34. Keep summary concise, maximum 700 characters.
+35. primary_skills: maximum 35 items.
+36. secondary_skills: maximum 25 items.
+37. tools_and_platforms: maximum 35 items.
+38. programming_languages: maximum 15 items.
+39. domains: maximum 10 items.
+40. experience[].responsibilities: maximum 6 strongest bullets per role.
+41. projects: maximum 8 strongest projects.
+42. projects[].description: maximum 250 characters.
+43. Remove duplicates across skill lists where possible.
+44. Do not include long prose when a short factual value is enough.
+
 Fixed values:
 resume_id = {resume_id}
 source_file_name = {file_name}

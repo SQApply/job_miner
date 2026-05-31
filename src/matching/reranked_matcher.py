@@ -222,6 +222,7 @@ def match_candidates_with_llm_rerank(
     final_top_n: int = 10,
     output_dir: Path = Path("data/processed/matching_llm"),
     candidates_limit: int | None = None,
+    candidate_id: str | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     logger.info(
@@ -232,11 +233,16 @@ def match_candidates_with_llm_rerank(
     )
     match_run_id = _utc_run_id("llm_rerank")
 
-    candidates = repo.candidate_towers(limit=candidates_limit)
+    if candidate_id:
+        candidates = list(repo.db["candidate_tower_records"].find({"candidate_id": candidate_id}).limit(1))
+    else:
+        candidates = repo.candidate_towers(limit=candidates_limit)
+
     logger.info(
-        "Fetched candidate tower records count=%s candidates_limit=%s",
+        "Fetched candidate tower records count=%s candidates_limit=%s candidate_id=%s",
         len(candidates),
         candidates_limit,
+        candidate_id,
     )
 
     all_final_matches: list[dict[str, Any]] = []

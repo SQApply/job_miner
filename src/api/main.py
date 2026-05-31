@@ -9,7 +9,7 @@ from ..common.env import load_runtime_env
 
 load_runtime_env()
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
@@ -21,6 +21,7 @@ from ..matching.feedback import add_feedback
 from ..tasks.mvp_tasks import full_demo_pipeline_task, run_cli_task
 from .mongo_views import candidate_exists, create_incomplete_candidate_profile_for_user, find_candidates_by_verified_email, get_candidate_profile, get_job_by_id, get_recommended_job, list_candidate_recommendations, warehouse_counts
 from .mvp_models import CandidateLinkRequest, FeedbackRequest, JobActionRequest, PipelineRunRequest
+from .recommendation_generation import generate_candidate_recommendations_after_upload
 from .resume_upload import process_candidate_resume_upload
 from .security import get_current_user, keycloak_public_config, require_permission
 
@@ -229,6 +230,7 @@ def _require_candidate_link(user: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/me/resume")
 def upload_my_resume(
+    background_tasks: BackgroundTasks,
     resume: UploadFile = File(...),
     user: dict[str, Any] = Depends(require_permission("candidate.view_self")),
 ) -> dict[str, Any]:
@@ -236,10 +238,23 @@ def upload_my_resume(
     result = process_candidate_resume_upload(upload=resume, user=user, current_link=current_link)
     link = result["candidate_link"]
     profile_state, next_action = _candidate_profile_state(link)
+
+    candidate_id = str(result["candidate_id"])
+    background_tasks.add_task(
+        generate_candidate_recommendations_after_upload,
+        candidate_id,
+        source="candidate_resume_upload",
+    )
+
     return {
         **result,
         "profile_state": profile_state,
         "next_action": next_action,
+        "recommendation_generation": {
+            "status": "queued",
+            "candidate_id": candidate_id,
+            "message": "Recommendation generation has started in the background.",
+        },
     }
 
 
@@ -256,6 +271,39 @@ def my_profile(user: dict[str, Any] = Depends(require_permission("candidate.view
 def my_recommendations(source: str = "llm", limit: int = 50, user: dict[str, Any] = Depends(require_permission("recommendations.view_self"))) -> dict[str, Any]:
     link = _require_candidate_link(user)
     return {"candidate_id": link["candidate_id"], "source": source, "recommendations": list_candidate_recommendations(link["candidate_id"], source=source, limit=limit)}
+
+
+@app.get("/me/recommendations/status")
+def my_recommendation_status(user: dict[str, Any] = Depends(require_permission("recommendations.view_self"))) -> dict[str, Any]:
+    link = _require_candidate_link(user)
+    db = get_mongo_database()
+    candidate_id = link["candidate_id"]
+    tower = db[MongoCollections.CANDIDATE_TOWER_RECORDS].find_one(
+        {"candidate_id": candidate_id},
+        {
+            "_id": 0,
+            "candidate_id": 1,
+            "recommendation_status": 1,
+            "recommendation_status_message": 1,
+            "recommendation_started_at": 1,
+            "recommendation_finished_at": 1,
+            "recommendation_failed_at": 1,
+            "recommendation_error": 1,
+            "recommendation_summary": 1,
+            "embedding_status": 1,
+            "embedding_model": 1,
+            "last_indexed_at": 1,
+        },
+    ) or {"candidate_id": candidate_id}
+
+    return {
+        "candidate_id": candidate_id,
+        "status": tower.get("recommendation_status") or "not_started",
+        "message": tower.get("recommendation_status_message") or "Recommendation generation has not started.",
+        "candidate_tower": tower,
+        "baseline_count": db[MongoCollections.CANDIDATE_JOB_MATCHES].count_documents({"candidate_id": candidate_id}),
+        "llm_count": db[MongoCollections.CANDIDATE_JOB_MATCHES_LLM_RERANKED].count_documents({"candidate_id": candidate_id}),
+    }
 
 
 @app.get("/me/recommendations/{job_id}")

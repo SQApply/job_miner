@@ -75,7 +75,10 @@ function Remove-PathIfExists {
 }
 
 function Invoke-Docker {
-    param([string[]]$DockerArgs)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$DockerArgs
+    )
 
     $output = & docker @DockerArgs 2>&1
     $exitCode = $LASTEXITCODE
@@ -83,6 +86,33 @@ function Invoke-Docker {
     if ($exitCode -ne 0) {
         $message = ($output | Out-String).Trim()
         throw "Docker command failed: docker $($DockerArgs -join ' ')`n$message"
+    }
+
+    return $output
+}
+
+function Invoke-DockerWithInputFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$DockerArgs,
+
+        [Parameter(Mandatory = $true)]
+        [string]$InputFile,
+
+        [Parameter(Mandatory = $false)]
+        [string]$FailureMessage = "Docker command with input file failed."
+    )
+
+    if (-not (Test-Path -LiteralPath $InputFile)) {
+        throw "Input file not found: $InputFile"
+    }
+
+    $output = Get-Content -Raw -LiteralPath $InputFile | & docker @DockerArgs 2>&1
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -ne 0) {
+        $message = ($output | Out-String).Trim()
+        throw "$FailureMessage`nDocker command failed: docker $($DockerArgs -join ' ')`n$message"
     }
 
     return $output
@@ -100,17 +130,22 @@ Write-Host "============================================================"
 Write-Step "Checking Docker containers"
 Invoke-Docker @("ps", "--format", "{{.Names}}") | Out-Null
 
-$runningContainers = Invoke-Docker @("ps", "--format", "{{.Names}}")
+$runningContainers = @(Invoke-Docker @("ps", "--format", "{{.Names}}"))
+
 if ($runningContainers -notcontains $PostgresContainer) {
     throw "Postgres container '$PostgresContainer' is not running."
 }
+
 if ($runningContainers -notcontains $MongoContainer) {
     throw "Mongo container '$MongoContainer' is not running."
 }
+
 Write-Ok "Docker containers are running"
 
 Write-Step "Finding app user in Postgres"
+
 $emailSql = $Email.Replace("'", "''")
+
 $appUserIdRaw = Invoke-Docker @(
     "exec", "-i", $PostgresContainer,
     "psql", "-U", $PostgresUser, "-d", $PostgresDb,
@@ -128,7 +163,9 @@ else {
 }
 
 Write-Step "Deleting Mongo candidate/resume/recommendation records"
+
 $emailJson = $Email | ConvertTo-Json -Compress
+
 $mongoJs = @"
 const email = $emailJson;
 
@@ -200,15 +237,18 @@ $tempJs = Join-Path $env:TEMP ("job_miner_cleanup_" + [Guid]::NewGuid().ToString
 Set-Content -LiteralPath $tempJs -Value $mongoJs -Encoding UTF8
 
 try {
-    $mongoOutput = Invoke-Docker @(
-        "exec", "-i", $MongoContainer,
-        "mongosh",
-        "-u", $MongoUser,
-        "-p", $MongoPassword,
-        "--authenticationDatabase", "admin",
-        $MongoDb,
-        "--quiet"
-    ) < $tempJs
+    $mongoOutput = Invoke-DockerWithInputFile `
+        -InputFile $tempJs `
+        -DockerArgs @(
+            "exec", "-i", $MongoContainer,
+            "mongosh",
+            "-u", $MongoUser,
+            "-p", $MongoPassword,
+            "--authenticationDatabase", "admin",
+            $MongoDb,
+            "--quiet"
+        ) `
+        -FailureMessage "Failed to delete Mongo candidate/resume/recommendation records."
 
     $mongoOutput | ForEach-Object { Write-Host $_ }
 }
@@ -217,6 +257,7 @@ finally {
 }
 
 Write-Step "Deleting Postgres candidate links, saved jobs, and applications"
+
 Invoke-Docker @(
     "exec", "-i", $PostgresContainer,
     "psql", "-U", $PostgresUser, "-d", $PostgresDb,
@@ -262,6 +303,7 @@ if ($CleanLogs) {
 }
 
 Write-Step "Verifying Postgres cleanup"
+
 Invoke-Docker @(
     "exec", "-i", $PostgresContainer,
     "psql", "-U", $PostgresUser, "-d", $PostgresDb,
@@ -269,8 +311,10 @@ Invoke-Docker @(
 ) | ForEach-Object { Write-Host $_ }
 
 Write-Step "Verifying Mongo cleanup"
+
 $verifyJs = @"
 const email = $emailJson;
+
 print("candidate_tower_records=" + db.candidate_tower_records.countDocuments({
   `$or: [
     { email: email },
@@ -278,6 +322,7 @@ print("candidate_tower_records=" + db.candidate_tower_records.countDocuments({
     { "raw_payload.email": email }
   ]
 }));
+
 print("resume_profiles_current=" + db.resume_profiles_current.countDocuments({
   "contact.email": email
 }));
@@ -287,15 +332,18 @@ $tempVerifyJs = Join-Path $env:TEMP ("job_miner_verify_" + [Guid]::NewGuid().ToS
 Set-Content -LiteralPath $tempVerifyJs -Value $verifyJs -Encoding UTF8
 
 try {
-    $verifyOutput = Invoke-Docker @(
-        "exec", "-i", $MongoContainer,
-        "mongosh",
-        "-u", $MongoUser,
-        "-p", $MongoPassword,
-        "--authenticationDatabase", "admin",
-        $MongoDb,
-        "--quiet"
-    ) < $tempVerifyJs
+    $verifyOutput = Invoke-DockerWithInputFile `
+        -InputFile $tempVerifyJs `
+        -DockerArgs @(
+            "exec", "-i", $MongoContainer,
+            "mongosh",
+            "-u", $MongoUser,
+            "-p", $MongoPassword,
+            "--authenticationDatabase", "admin",
+            $MongoDb,
+            "--quiet"
+        ) `
+        -FailureMessage "Failed to verify Mongo cleanup."
 
     $verifyOutput | ForEach-Object { Write-Host $_ }
 }

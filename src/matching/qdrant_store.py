@@ -50,6 +50,27 @@ class QdrantVectorStore:
         except Exception:
             return False
 
+    def healthcheck(self) -> dict[str, Any]:
+        """Return a small health payload for CLI/API diagnostics."""
+        try:
+            collections = self.client.get_collections()
+            names = [
+                item.name
+                for item in getattr(collections, "collections", [])
+            ]
+            return {
+                "ok": True,
+                "url": self.url,
+                "collections": names,
+            }
+        except Exception as exc:
+            logger.exception("Qdrant healthcheck failed url=%s", self.url)
+            return {
+                "ok": False,
+                "url": self.url,
+                "error": str(exc),
+            }
+
     def ensure_collection(
         self,
         collection_name: str,
