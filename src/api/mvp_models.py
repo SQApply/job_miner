@@ -26,3 +26,26 @@ class PipelineRunRequest(BaseModel):
     final_top_n: int = 10
     run_llm: bool = True
     recreate_qdrant: bool = True
+
+
+class CandidateProfileUpdateRequest(BaseModel):
+    full_name: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    location: str | None = None
+    current_title: str | None = None
+    current_company: str | None = None
+    total_experience_years: float | None = None
+    skills: list[str] | str | None = None
+    domains: list[str] | str | None = None
+    target_roles: list[str] | str | None = None
+    preferred_locations: list[str] | str | None = None
+    remote_preference: str | None = None
+    employment_type: str | None = None
+    seniority_level: str | None = None
+    linkedin_url: str | None = None
+    github_url: str | None = None
+    portfolio_url: str | None = None
+    notice_period: str | None = None
+    expected_compensation: str | None = None
+    summary: str | None = None

@@ -41,7 +41,12 @@
             </div>
 
             <input type="hidden" id="id-hidden-input" name="credentialId" <#if auth.selectedCredential?has_content>value="${auth.selectedCredential}"</#if>/>
-            <button tabindex="4" class="jm-primary" name="login" id="kc-login" type="submit">Sign in</button>
+            <div class="jm-action-row">
+              <button tabindex="4" class="jm-primary jm-action-btn" name="login" id="kc-login" type="submit">Sign in</button>
+              <#if realm.registrationAllowed && !registrationDisabled??>
+                <a class="jm-secondary jm-action-btn" href="${url.registrationUrl}">Sign up</a>
+              </#if>
+            </div>
           </form>
         </div>
       </section>
@@ -58,8 +63,5 @@
       </div>
     </#if>
   <#elseif section = "info">
-    <#if realm.registrationAllowed && !registrationDisabled??>
-      <div class="jm-register-link">New here? <a href="${url.registrationUrl}">${msg("doRegister")}</a></div>
-    </#if>
   </#if>
 </@layout.registrationLayout>

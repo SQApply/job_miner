@@ -136,24 +136,28 @@ function formatDate(value) {
   try { return new Date(value).toLocaleString(); } catch { return String(value); }
 }
 
-function CandidateProfileCard({ profile, onRefresh }) {
+function CandidateProfileCard({ profile, onRefresh, onEdit }) {
   const tower = profile?.candidate_tower || {};
   const resume = profile?.resume_profile || {};
   const contact = resume?.contact || {};
+  const effective = tower.effective_profile || {};
 
-  const fullName = valueFrom(tower.full_name, contact.full_name, resume.full_name, 'Candidate');
-  const title = valueFrom(tower.current_title, resume.current_title, resume.headline);
-  const company = valueFrom(tower.current_company, resume.current_company);
-  const location = valueFrom(tower.location, contact.location, resume.location);
-  const email = valueFrom(tower.email, contact.email);
-  const phone = valueFrom(tower.phone, contact.phone);
-  const experience = valueFrom(tower.total_experience_years, resume.total_experience_years);
-  const skills = firstNonEmptyArray(tower.skills, tower.primary_skills, resume.primary_skills);
-  const domains = firstNonEmptyArray(tower.domains, resume.domains);
+  const fullName = valueFrom(effective.full_name, tower.full_name, contact.full_name, resume.full_name, 'Candidate');
+  const title = valueFrom(effective.current_title, tower.current_title, resume.current_title, resume.headline);
+  const company = valueFrom(effective.current_company, tower.current_company, resume.current_company);
+  const location = valueFrom(effective.location, tower.location, contact.location, resume.location);
+  const email = valueFrom(effective.email, tower.email, contact.email);
+  const phone = valueFrom(effective.phone, tower.phone, contact.phone);
+  const experience = valueFrom(effective.total_experience_years, tower.total_experience_years, resume.total_experience_years);
+  const skills = firstNonEmptyArray(effective.skills, tower.skills, tower.primary_skills, resume.primary_skills);
+  const domains = firstNonEmptyArray(effective.domains, tower.domains, resume.domains);
   const profileStatus = valueFrom(tower.status, tower.profile_state, resume.status, resume.profile_state, 'ready');
 
   return <Card title="Candidate Profile" subtitle="Profile summary used for recommendations.">
-    <div className="row top-actions"><Button onClick={onRefresh}>Refresh profile</Button></div>
+    <div className="row top-actions">
+      <Button onClick={onRefresh}>Refresh profile</Button>
+      <Button variant="secondary" onClick={onEdit}>Edit Profile</Button>
+    </div>
     <div className="profile-hero">
       <div>
         <h3>{fullName}</h3>
@@ -165,10 +169,109 @@ function CandidateProfileCard({ profile, onRefresh }) {
       <Field label="Email" value={email} />
       <Field label="Phone" value={phone} />
       <Field label="Location" value={location} />
-      <Field label="Experience" value={experience ? `${experience} years` : null} />
+      <Field label="Experience" value={experience !== null && experience !== undefined ? `${experience} years` : null} />
     </div>
     <div className="detail-section"><h4>Skills</h4><Chips items={skills} /></div>
     <div className="detail-section"><h4>Domains</h4><Chips items={domains} /></div>
+  </Card>;
+}
+
+function csvFromArray(values) {
+  return Array.isArray(values) ? values.join(', ') : (values || '');
+}
+
+function ProfileEditForm({ profile, onCancel, onSaved }) {
+  const tower = profile?.candidate_tower || {};
+  const resume = profile?.resume_profile || {};
+  const contact = resume?.contact || {};
+  const effective = tower.effective_profile || {};
+  const [form, setForm] = useState(() => ({
+    full_name: valueFrom(effective.full_name, tower.full_name, contact.full_name, resume.full_name, ''),
+    email: valueFrom(effective.email, tower.email, contact.email, ''),
+    phone: valueFrom(effective.phone, tower.phone, contact.phone, ''),
+    location: valueFrom(effective.location, tower.location, contact.location, resume.location, ''),
+    current_title: valueFrom(effective.current_title, tower.current_title, resume.current_title, ''),
+    current_company: valueFrom(effective.current_company, tower.current_company, resume.current_company, ''),
+    total_experience_years: valueFrom(effective.total_experience_years, tower.total_experience_years, resume.total_experience_years, ''),
+    skills: csvFromArray(firstNonEmptyArray(effective.skills, tower.skills, resume.primary_skills)),
+    domains: csvFromArray(firstNonEmptyArray(effective.domains, tower.domains, resume.domains)),
+    target_roles: csvFromArray(firstNonEmptyArray(effective.target_roles, tower.target_roles)),
+    preferred_locations: csvFromArray(firstNonEmptyArray(effective.preferred_locations, tower.preferred_locations)),
+    remote_preference: valueFrom(effective.remote_preference, tower.remote_preference, 'no_preference'),
+    linkedin_url: valueFrom(effective.linkedin_url, tower.linkedin_url, ''),
+    github_url: valueFrom(effective.github_url, tower.github_url, ''),
+    portfolio_url: valueFrom(effective.portfolio_url, tower.portfolio_url, ''),
+  }));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+
+  function update(field, value) {
+    setForm((current) => ({ ...current, [field]: value }));
+  }
+
+  function csvToList(value) {
+    return String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
+  }
+
+  async function submit(event) {
+    event.preventDefault();
+    setError(null);
+    setSaving(true);
+    try {
+      const payload = {
+        full_name: form.full_name,
+        email: form.email,
+        phone: form.phone,
+        location: form.location,
+        current_title: form.current_title,
+        current_company: form.current_company,
+        total_experience_years: form.total_experience_years === '' ? null : Number(form.total_experience_years),
+        skills: csvToList(form.skills),
+        domains: csvToList(form.domains),
+        target_roles: csvToList(form.target_roles),
+        preferred_locations: csvToList(form.preferred_locations),
+        remote_preference: form.remote_preference || 'no_preference',
+        linkedin_url: form.linkedin_url,
+        github_url: form.github_url,
+        portfolio_url: form.portfolio_url,
+      };
+      const result = await api('/me/profile', { method: 'PATCH', body: JSON.stringify(payload) }, getToken());
+      await onSaved(result);
+    } catch (e) {
+      setError(e.message || 'Could not save profile');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <Card title="Edit Candidate Profile" subtitle="Name and email are locked. Update missing profile fields, skills, domains, and matching preferences.">
+    <form className="profile-edit-form" onSubmit={submit}>
+      <div className="profile-grid edit-grid">
+        <label><span>Full name</span><input value={form.full_name} readOnly /></label>
+        <label><span>Email</span><input value={form.email} readOnly /></label>
+        <label><span>Phone</span><input value={form.phone} onChange={(e) => update('phone', e.target.value)} /></label>
+        <label><span>Location</span><input value={form.location} onChange={(e) => update('location', e.target.value)} placeholder="Delhi NCR, India" /></label>
+        <label><span>Current title</span><input value={form.current_title} onChange={(e) => update('current_title', e.target.value)} /></label>
+        <label><span>Current company</span><input value={form.current_company} onChange={(e) => update('current_company', e.target.value)} /></label>
+        <label><span>Total experience years</span><input type="number" step="0.1" min="0" max="60" value={form.total_experience_years} onChange={(e) => update('total_experience_years', e.target.value)} /></label>
+        <label><span>Remote preference</span><select value={form.remote_preference} onChange={(e) => update('remote_preference', e.target.value)}><option value="no_preference">No preference</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="onsite">Onsite</option></select></label>
+      </div>
+      <label className="full-width-field"><span>Skills <small>comma separated</small></span><textarea rows="4" value={form.skills} onChange={(e) => update('skills', e.target.value)} /></label>
+      <label className="full-width-field"><span>Domains <small>comma separated</small></span><textarea rows="3" value={form.domains} onChange={(e) => update('domains', e.target.value)} /></label>
+      <label className="full-width-field"><span>Target roles <small>comma separated</small></span><input value={form.target_roles} onChange={(e) => update('target_roles', e.target.value)} placeholder="AI Engineer, LLM Engineer, Data Scientist" /></label>
+      <label className="full-width-field"><span>Preferred locations <small>comma separated</small></span><input value={form.preferred_locations} onChange={(e) => update('preferred_locations', e.target.value)} placeholder="Remote, India, Dubai" /></label>
+      <div className="profile-grid edit-grid">
+        <label><span>LinkedIn URL</span><input value={form.linkedin_url} onChange={(e) => update('linkedin_url', e.target.value)} /></label>
+        <label><span>GitHub URL</span><input value={form.github_url} onChange={(e) => update('github_url', e.target.value)} /></label>
+        <label><span>Portfolio URL</span><input value={form.portfolio_url} onChange={(e) => update('portfolio_url', e.target.value)} /></label>
+      </div>
+      <p className="muted">Changing skills, domains, location, experience, title, target roles, preferred locations, or remote preference will refresh recommendations. Contact details are saved without regenerating recommendations.</p>
+      {error && <p className="error">{error}</p>}
+      <div className="row top-actions">
+        <Button type="submit" disabled={saving}>{saving ? 'Saving...' : 'Save profile'}</Button>
+        <Button variant="secondary" onClick={onCancel} disabled={saving}>Cancel</Button>
+      </div>
+    </form>
   </Card>;
 }
 
@@ -190,6 +293,88 @@ function RecommendationCard({ item, onAction, onFeedback }) {
     </div>
   </article>;
 }
+
+function AllJobsPage({ onBack, onAction }) {
+  const [jobs, setJobs] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
+  const [limit] = useState(50);
+  const [query, setQuery] = useState('');
+  const [searchText, setSearchText] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  async function loadJobs(nextOffset = offset, nextQuery = query) {
+    setError(null);
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({
+        limit: String(limit),
+        offset: String(nextOffset),
+      });
+      if (nextQuery) params.set('q', nextQuery);
+      const res = await api(`/me/jobs/all?${params.toString()}`, {}, getToken());
+      setJobs(res.jobs || []);
+      setTotal(res.total || 0);
+      setOffset(res.offset || 0);
+      setQuery(res.q || '');
+    } catch (e) {
+      setError(e.message || 'Could not load jobs');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function submitSearch(event) {
+    event.preventDefault();
+    loadJobs(0, searchText.trim());
+  }
+
+  async function handleAction(item, action) {
+    await onAction(item, action);
+  }
+
+  useEffect(() => { loadJobs(0, ''); }, []);
+
+  const currentStart = total ? offset + 1 : 0;
+  const currentEnd = Math.min(offset + limit, total);
+  const canPrevious = offset > 0;
+  const canNext = offset + limit < total;
+
+  return <div className="all-jobs-page">
+    <Card title="All Jobs" subtitle="Browse the complete job catalog sorted alphabetically by title.">
+      <div className="all-jobs-toolbar">
+        <Button variant="secondary" onClick={onBack}>Back to candidate portal</Button>
+        <form className="all-jobs-search" onSubmit={submitSearch}>
+          <input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="Search title, company, location, or skills" />
+          <Button type="submit">Search</Button>
+          {query && <Button variant="secondary" onClick={() => { setSearchText(''); loadJobs(0, ''); }}>Clear</Button>}
+        </form>
+      </div>
+
+      <p className="muted">Showing <b>{currentStart}-{currentEnd}</b> of <b>{total}</b>{query ? <> for <b>{query}</b></> : null}</p>
+
+      {error && <p className="error">{error}</p>}
+      {loading ? <EmptyState message="Loading jobs..." /> : !jobs.length ? <EmptyState message="No jobs found." /> : <div className="job-list all-jobs-list">
+        {jobs.map((job) => <article className="job-card" key={job.job_id}>
+          <div className="job-title">{getJobTitle(job)}</div>
+          <div className="job-company-location">{getCompany(job)} · {getLocation(job)}</div>
+          {job.summary && <p className="reason">{String(job.summary).slice(0, 260)}</p>}
+          <div className="action-bar">
+            <Button onClick={() => handleAction(job, 'save')}>Save</Button>
+            <Button onClick={() => handleAction(job, 'apply-click')} disabled={!getApplyUrl(job)}>Apply</Button>
+          </div>
+        </article>)}
+      </div>}
+
+      <div className="pagination-bar">
+        <Button variant="secondary" disabled={!canPrevious || loading} onClick={() => loadJobs(Math.max(offset - limit, 0), query)}>Previous</Button>
+        <Button variant="secondary" disabled={!canNext || loading} onClick={() => loadJobs(offset + limit, query)}>Next</Button>
+      </div>
+    </Card>
+  </div>;
+}
+
 
 function SavedJobCard({ item }) {
   const applyUrl = getApplyUrl(item);
@@ -239,6 +424,11 @@ function ResumeUploadPage({ me, onUploaded }) {
   const [file, setFile] = useState(null);
   const [error, setError] = useState(null);
   const [uploading, setUploading] = useState(false);
+  const processing = me?.candidate_processing || {};
+  const resumeUploadStatus = String(processing.resume_upload_status || '').toLowerCase();
+  const asyncResumeError = (me?.next_action === 'retry_resume_upload' || resumeUploadStatus === 'failed')
+    ? (processing.resume_upload_error || processing.resume_upload_status_message || 'Resume processing failed. Please upload the corrected resume and try again.')
+    : null;
 
   async function submitResume(event) {
     event.preventDefault();
@@ -269,6 +459,11 @@ function ResumeUploadPage({ me, onUploaded }) {
         </div>
         <span className="status-pill warning">Resume required</span>
       </div>
+
+      {asyncResumeError && <div className="error-block">
+        <strong>Previous resume upload failed.</strong>
+        <p>{asyncResumeError}</p>
+      </div>}
 
       <form onSubmit={submitResume} className="upload-form">
         <label className="upload-dropzone">
@@ -366,7 +561,7 @@ function ResumeProcessingPage({ me, refreshMe }) {
 
 
 
-function CandidatePortal({ me, refreshMe }) {
+function CandidatePortal({ me, refreshMe, candidateView, setCandidateView }) {
   const [profile, setProfile] = useState(null);
   const [recs, setRecs] = useState([]);
   const [source, setSource] = useState('llm');
@@ -374,6 +569,8 @@ function CandidatePortal({ me, refreshMe }) {
   const [apps, setApps] = useState([]);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [recommendationStatus, setRecommendationStatus] = useState(null);
+  const [notice, setNotice] = useState(null);
 
   async function loadProfile() {
     setError(null);
@@ -390,6 +587,28 @@ function CandidatePortal({ me, refreshMe }) {
       setRecs(nextSource === 'llm' ? items.filter((item) => !isFallbackRecommendation(item)) : items);
     } catch (e) { setError(e.message); }
     finally { setLoading(false); }
+  }
+
+  async function loadRecommendationStatus() {
+    try {
+      const res = await api('/me/recommendations/status', {}, getToken());
+      setRecommendationStatus(res);
+      return res;
+    } catch {
+      return null;
+    }
+  }
+
+  async function handleProfileSaved(result) {
+    await loadProfile();
+    await refreshMe();
+    setCandidateView('dashboard');
+    if (result?.recommendations_refresh_required) {
+      setNotice('Profile saved. Recommendations are refreshing in the background.');
+      await loadRecommendationStatus();
+    } else {
+      setNotice('Profile saved. Recommendations were not regenerated because matching inputs did not change.');
+    }
   }
 
   async function loadSavedAndApps() {
@@ -417,9 +636,23 @@ function CandidatePortal({ me, refreshMe }) {
   useEffect(() => {
     if (!me.candidate_link) return;
     loadProfile();
+    loadRecommendationStatus();
     if (me.profile_state === 'ready') loadRecs(source);
     loadSavedAndApps();
   }, [me?.candidate_link?.candidate_id, me?.profile_state]);
+
+  useEffect(() => {
+    const status = String(recommendationStatus?.status || '').toLowerCase();
+    if (!['pending', 'queued', 'running', 'processing'].includes(status)) return undefined;
+    const timer = window.setInterval(async () => {
+      const next = await loadRecommendationStatus();
+      const nextStatus = String(next?.status || '').toLowerCase();
+      if (['llm_ready', 'baseline_ready', 'completed', 'no_matches', 'no_jobs'].includes(nextStatus)) {
+        await loadRecs(source);
+      }
+    }, 10000);
+    return () => window.clearInterval(timer);
+  }, [recommendationStatus?.status, source]);
 
   if (me.profile_state === 'conflict') {
     return <Card title="Profile resolution needed" subtitle="We found more than one candidate profile for your verified email.">
@@ -439,14 +672,27 @@ function CandidatePortal({ me, refreshMe }) {
 
   const isIncomplete = me.profile_state === 'incomplete';
 
+  if (candidateView === 'all-jobs') {
+    return <AllJobsPage onBack={() => setCandidateView('dashboard')} onAction={jobAction} />;
+  }
+
+  if (candidateView === 'profile') {
+    return <ProfileEditForm profile={profile} onCancel={() => setCandidateView('dashboard')} onSaved={handleProfileSaved} />;
+  }
+
+  const recStatus = String(recommendationStatus?.status || '').toLowerCase();
+  const recommendationsRefreshing = ['pending', 'queued', 'running', 'processing'].includes(recStatus);
+
   return <div className="candidate-layout">
     <div className="left-column">
-      <CandidateProfileCard profile={profile} onRefresh={loadProfile} />
+      <CandidateProfileCard profile={profile} onRefresh={loadProfile} onEdit={() => setCandidateView('profile')} />
       <SavedJobsCard saved={saved} onRefresh={loadSavedAndApps} />
       <ApplicationsCard apps={apps} onRefresh={loadSavedAndApps} />
     </div>
     <div className="right-column">
       <Card title="Recommended Jobs" subtitle={isIncomplete ? "Complete your profile and upload a resume to generate recommendations." : "Review jobs and act directly from this list."}>
+        {notice && <p className="info-banner">{notice}</p>}
+        {recommendationsRefreshing && <p className="info-banner">{recommendationStatus?.message || 'Recommendations are refreshing in the background.'}</p>}
         {isIncomplete ? <EmptyState message="Your candidate profile was created from login only. Upload or process your resume, add mobile number, work status, skills, and preferred locations to activate recommendations." /> : <>
           <div className="row top-actions">
             <Button onClick={() => { setSource('llm'); loadRecs('llm'); }}>Recommended</Button>
@@ -457,6 +703,9 @@ function CandidatePortal({ me, refreshMe }) {
         {loading ? <EmptyState message="Loading recommendations..." /> : !recs.length ? <EmptyState message="No LLM-scored recommendations found. Use Baseline or ask admin to rerun LLM reranking with a smaller chunk size." /> : <div className="job-list">
           {recs.map((r) => <RecommendationCard key={`${r.match_run_id}-${r.job_id}`} item={r} onAction={jobAction} onFeedback={sendFeedback} />)}
         </div>}
+        <div className="view-all-jobs-row">
+          <Button variant="secondary" onClick={() => setCandidateView('all-jobs')}>View all jobs</Button>
+        </div>
         </>}
       </Card>
       {error && <p className="error">{error}</p>}
@@ -529,14 +778,26 @@ function App() {
   const [ready, setReady] = useState(false);
   const [me, setMe] = useState(null);
   const [view, setView] = useState('candidate');
+  const [candidateView, setCandidateView] = useState('dashboard');
   const [error, setError] = useState(null);
 
   async function loadMe() { const res = await api('/me', {}, getToken()); setMe(res); return res; }
+
+  function openCandidateProfile() {
+    setView('candidate');
+    setCandidateView('profile');
+  }
+
+  function openAdminPortal() {
+    setView('admin');
+    setCandidateView('dashboard');
+  }
 
   async function handleResumeUploaded() {
     const updated = await loadMe();
     setMe(updated);
     setView('candidate');
+    setCandidateView('dashboard');
   }
 
   useEffect(() => {
@@ -558,8 +819,8 @@ function App() {
       <h1>Job Miner</h1>
       <div className="row">
         <span className="muted">{me?.user?.email || me?.user?.preferred_username}</span>
-        <Button onClick={() => setView('candidate')}>Candidate Portal</Button>
-        {canAdmin && <Button onClick={() => setView('admin')}>Admin Portal</Button>}
+        <Button onClick={openCandidateProfile}>Candidate Portal</Button>
+        {canAdmin && <Button onClick={openAdminPortal}>Admin Portal</Button>}
         <Button variant="secondary" onClick={logout}>Logout</Button>
       </div>
     </header>
@@ -568,7 +829,7 @@ function App() {
         ? <ResumeProcessingPage me={me} refreshMe={loadMe} />
         : (me?.profile_state === 'incomplete' || me?.next_action === 'complete_profile' || me?.next_action === 'retry_resume_upload'
           ? <ResumeUploadPage me={me} onUploaded={handleResumeUploaded} />
-          : <CandidatePortal me={me} refreshMe={loadMe} />)
+          : <CandidatePortal me={me} refreshMe={loadMe} candidateView={candidateView} setCandidateView={setCandidateView} />)
     )}
   </div>;
 }

@@ -134,7 +134,8 @@ body {
 
 .jm-form input[type="text"],
 .jm-form input[type="email"],
-.jm-form input[type="password"] {
+.jm-form input[type="password"],
+.jm-form input[type="file"] {
   border: 1px solid #d9deea;
   border-radius: 13px;
   box-sizing: border-box;
@@ -182,6 +183,38 @@ body {
   min-height: 48px;
   padding: 12px 24px;
   width: 100%;
+}
+
+.jm-action-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  align-items: center;
+}
+
+.jm-action-btn {
+  align-items: center;
+  box-sizing: border-box;
+  display: inline-flex;
+  justify-content: center;
+  min-height: 48px;
+  text-align: center;
+  text-decoration: none;
+}
+
+.jm-secondary {
+  background: #ffffff;
+  border: 1px solid #2563eb;
+  border-radius: 999px;
+  color: #2563eb;
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: 900;
+  padding: 12px 24px;
+}
+
+.jm-secondary:hover {
+  background: #eff6ff;
 }
 
 .jm-primary:hover {
@@ -237,6 +270,38 @@ body {
   font-weight: 800;
 }
 
+.jm-field-hint {
+  color: #667085;
+  display: block;
+  font-size: 12px;
+  line-height: 1.45;
+  margin-top: -4px;
+}
+
+.jm-info-box {
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 14px;
+  color: #1e3a8a;
+  display: grid;
+  gap: 6px;
+  line-height: 1.45;
+  margin: 14px 0 4px;
+  padding: 14px 16px;
+}
+
+.jm-info-box strong {
+  color: #1d4ed8;
+}
+
+.jm-confirmation {
+  align-items: flex-start;
+  color: #344054;
+  font-size: 13px !important;
+  line-height: 1.4;
+  margin-top: 8px !important;
+}
+
 .jm-register-link {
   color: #111827;
   font-size: 15px;
@@ -260,6 +325,10 @@ body {
 
   .jm-card {
     padding: 32px 24px;
+  }
+
+  .jm-action-row {
+    grid-template-columns: 1fr;
   }
 
   .jm-register-link {

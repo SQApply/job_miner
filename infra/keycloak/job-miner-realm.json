@@ -4,6 +4,7 @@
   "displayName": "Job Miner",
   "registrationAllowed": true,
   "loginWithEmailAllowed": true,
+  "registrationEmailAsUsername": true,
   "duplicateEmailsAllowed": false,
   "resetPasswordAllowed": true,
   "roles": {
@@ -160,7 +161,9 @@
       ]
     }
   ],
-  "verifyEmail": true,
+  "verifyEmail": false,
+  "passwordPolicy": "length(8) and upperCase(1) and specialChars(1)",
+  "smtpServer": {},
   "rememberMe": true,
   "loginTheme": "job-miner",
   "bruteForceProtected": true,

@@ -11,6 +11,22 @@ WEB_CLIENT_ID="${JOB_MINER_KEYCLOAK_CLIENT_ID:-job-miner-web}"
 API_CLIENT_ID="${JOB_MINER_KEYCLOAK_AUDIENCE:-job-miner-api}"
 AUDIENCE_MAPPER_NAME="${JOB_MINER_KEYCLOAK_AUDIENCE_MAPPER_NAME:-job-miner-api-audience}"
 DEFAULT_ROLE="${JOB_MINER_DEFAULT_USER_ROLE:-candidate}"
+VERIFY_EMAIL="${JOB_MINER_KEYCLOAK_VERIFY_EMAIL:-false}"
+SMTP_HOST="${JOB_MINER_KEYCLOAK_SMTP_HOST:-}"
+SMTP_PORT="${JOB_MINER_KEYCLOAK_SMTP_PORT:-587}"
+SMTP_FROM="${JOB_MINER_KEYCLOAK_SMTP_FROM:-}"
+SMTP_FROM_DISPLAY_NAME="${JOB_MINER_KEYCLOAK_SMTP_FROM_DISPLAY_NAME:-Job Miner}"
+SMTP_REPLY_TO="${JOB_MINER_KEYCLOAK_SMTP_REPLY_TO:-}"
+SMTP_AUTH="${JOB_MINER_KEYCLOAK_SMTP_AUTH:-true}"
+SMTP_USER="${JOB_MINER_KEYCLOAK_SMTP_USER:-}"
+SMTP_PASSWORD="${JOB_MINER_KEYCLOAK_SMTP_PASSWORD:-}"
+SMTP_STARTTLS="${JOB_MINER_KEYCLOAK_SMTP_STARTTLS:-true}"
+SMTP_SSL="${JOB_MINER_KEYCLOAK_SMTP_SSL:-false}"
+
+case "$(printf '%s' "$VERIFY_EMAIL" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes) VERIFY_EMAIL="true" ;;
+  *) VERIFY_EMAIL="false" ;;
+esac
 
 kc() {
   /opt/keycloak/bin/kcadm.sh "$@"
@@ -63,17 +79,46 @@ kc config credentials \
   --user "$ADMIN_USER" \
   --password "$ADMIN_PASSWORD"
 
+if [ "$VERIFY_EMAIL" = "true" ] && [ -z "$SMTP_HOST" ]; then
+  echo "[WARN] JOB_MINER_KEYCLOAK_VERIFY_EMAIL=true but SMTP is not configured."
+  echo "[WARN] Disabling verifyEmail for local/dev so signup is not blocked. Configure SMTP before enabling this in production."
+  VERIFY_EMAIL="false"
+fi
+
+if [ "$VERIFY_EMAIL" = "false" ]; then
+  echo "[WARN] Keycloak email verification is DISABLED. This is acceptable only for local/dev testing."
+fi
+
 echo "[INFO] Applying Job Miner realm login and security settings"
 kc update "realms/$REALM" \
   -s enabled=true \
   -s loginTheme=job-miner \
   -s registrationAllowed=true \
   -s loginWithEmailAllowed=true \
+  -s registrationEmailAsUsername=true \
   -s duplicateEmailsAllowed=false \
   -s resetPasswordAllowed=true \
-  -s verifyEmail=true \
+  -s verifyEmail="$VERIFY_EMAIL" \
+  -s passwordPolicy="length(8) and upperCase(1) and specialChars(1)" \
   -s rememberMe=true \
   -s bruteForceProtected=true
+
+if [ -n "$SMTP_HOST" ]; then
+  echo "[INFO] Applying Keycloak SMTP settings from environment."
+  kc update "realms/$REALM" \
+    -s "smtpServer.host=$SMTP_HOST" \
+    -s "smtpServer.port=$SMTP_PORT" \
+    -s "smtpServer.from=$SMTP_FROM" \
+    -s "smtpServer.fromDisplayName=$SMTP_FROM_DISPLAY_NAME" \
+    -s "smtpServer.replyTo=$SMTP_REPLY_TO" \
+    -s "smtpServer.auth=$SMTP_AUTH" \
+    -s "smtpServer.user=$SMTP_USER" \
+    -s "smtpServer.password=$SMTP_PASSWORD" \
+    -s "smtpServer.starttls=$SMTP_STARTTLS" \
+    -s "smtpServer.ssl=$SMTP_SSL"
+else
+  echo "[INFO] SMTP is not configured. Email verification remains disabled for local/dev."
+fi
 
 if ! kc get "roles/$DEFAULT_ROLE" -r "$REALM" >/dev/null 2>&1; then
   echo "[INFO] Creating missing realm role: $DEFAULT_ROLE"

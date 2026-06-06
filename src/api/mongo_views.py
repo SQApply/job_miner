@@ -267,6 +267,144 @@ def list_candidate_recommendations(candidate_id: str, source: str = "llm", limit
     return out
 
 
+def _job_catalog_projection() -> dict[str, int]:
+    return {
+        "_id": 0,
+        "job_id": 1,
+        "title": 1,
+        "job_title": 1,
+        "company": 1,
+        "company_name": 1,
+        "employer": 1,
+        "location": 1,
+        "location_text": 1,
+        "job_url": 1,
+        "apply_url": 1,
+        "source_url": 1,
+        "url": 1,
+        "description": 1,
+        "summary": 1,
+        "required_skills": 1,
+        "preferred_skills": 1,
+        "skills": 1,
+        "employment_type": 1,
+        "posted_at": 1,
+        "created_at": 1,
+        "updated_at": 1,
+        "catalog_visible": 1,
+        "validation_status": 1,
+    }
+    
+def _candidate_visible_job_filter() -> dict[str, Any]:
+    """Return Mongo filter for jobs that are safe to show in candidate-facing views.
+
+    Raw scraped jobs can be incomplete. Candidate-facing APIs should not show
+    placeholder records such as "Untitled job".
+    """
+    return {
+        "$and": [
+            {"catalog_visible": {"$ne": False}},
+            {"validation_status": {"$nin": ["invalid", "invalid_missing_title", "invalid_missing_company", "invalid_missing_url"]}},
+            {
+                "$or": [
+                    {"title": {"$type": "string", "$regex": r"\S"}},
+                    {"job_title": {"$type": "string", "$regex": r"\S"}},
+                ]
+            },
+            {
+                "$or": [
+                    {"company": {"$type": "string", "$regex": r"\S"}},
+                    {"company_name": {"$type": "string", "$regex": r"\S"}},
+                    {"employer": {"$type": "string", "$regex": r"\S"}},
+                ]
+            },
+            {
+                "$or": [
+                    {"job_url": {"$type": "string", "$regex": r"\S"}},
+                    {"apply_url": {"$type": "string", "$regex": r"\S"}},
+                    {"source_url": {"$type": "string", "$regex": r"\S"}},
+                    {"url": {"$type": "string", "$regex": r"\S"}},
+                ]
+            },
+            {
+                "$nor": [
+                    {"title": {"$regex": r"^\s*untitled\s+job\s*$", "$options": "i"}},
+                    {"job_title": {"$regex": r"^\s*untitled\s+job\s*$", "$options": "i"}},
+                    {"title": {"$regex": r"^\s*(n/a|na|none|null|unknown)\s*$", "$options": "i"}},
+                    {"job_title": {"$regex": r"^\s*(n/a|na|none|null|unknown)\s*$", "$options": "i"}},
+                ]
+            },
+        ]
+    }
+
+def _job_catalog_search_query(search_text: str | None) -> dict[str, Any]:
+    value = str(search_text or "").strip()
+    if not value:
+        return {}
+
+    regex = re.compile(re.escape(value), re.IGNORECASE)
+    return {
+        "$or": [
+            {"title": regex},
+            {"job_title": regex},
+            {"company": regex},
+            {"company_name": regex},
+            {"employer": regex},
+            {"location": regex},
+            {"location_text": regex},
+            {"description": regex},
+            {"summary": regex},
+            {"required_skills": regex},
+            {"preferred_skills": regex},
+            {"skills": regex},
+        ]
+    }
+
+def list_all_jobs_catalog(*, limit: int = 50, offset: int = 0, q: str | None = None) -> dict[str, Any]:
+    """Return the candidate-facing full jobs catalog.
+
+    The catalog is paginated and sorted alphabetically so the frontend does not
+    load thousands of job records into the browser at once. This is intentionally
+    read-only; save/apply actions continue to use the existing job action APIs.
+    """
+    db = get_mongo_database()
+    safe_limit = min(max(int(limit or 50), 1), 100)
+    safe_offset = max(int(offset or 0), 0)
+    # query = _job_catalog_search_query(q)
+    base_filter = _candidate_visible_job_filter()
+    search_filter = _job_catalog_search_query(q)
+    query = {"$and": [base_filter, search_filter]} if search_filter else base_filter
+
+    total = db[MongoCollections.JOBS_CURRENT].count_documents(query)
+    rows = list(
+        db[MongoCollections.JOBS_CURRENT]
+        .find(query, _job_catalog_projection())
+        .sort([("title", 1), ("company", 1), ("job_id", 1)])
+        .skip(safe_offset)
+        .limit(safe_limit)
+    )
+
+    jobs: list[dict[str, Any]] = []
+    for row in rows:
+        job = _clean_doc(row) or {}
+        job["source_collection"] = MongoCollections.JOBS_CURRENT
+        job["apply_url"] = job.get("apply_url") or job.get("job_url") or job.get("source_url") or job.get("url")
+        jobs.append(job)
+
+    next_offset = safe_offset + safe_limit if safe_offset + safe_limit < total else None
+    previous_offset = max(safe_offset - safe_limit, 0) if safe_offset > 0 else None
+
+    return {
+        "jobs": jobs,
+        "total": total,
+        "limit": safe_limit,
+        "offset": safe_offset,
+        "next_offset": next_offset,
+        "previous_offset": previous_offset,
+        "q": str(q or "").strip(),
+    }
+
+
 def get_job_by_id(job_id: str) -> dict[str, Any] | None:
     if not job_id:
         return None

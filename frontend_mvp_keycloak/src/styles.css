@@ -512,3 +512,111 @@ th, td {
     transform: rotate(360deg);
   }
 }
+
+.view-all-jobs-row {
+  display: flex;
+  justify-content: center;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid #e5e7eb;
+}
+
+.all-jobs-page {
+  max-width: 980px;
+  margin: 0 auto;
+}
+
+.all-jobs-toolbar {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.all-jobs-search {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.all-jobs-search input {
+  flex: 1 1 360px;
+  min-width: 240px;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font: inherit;
+}
+
+.all-jobs-list .job-card {
+  border-left: 3px solid #dbeafe;
+}
+
+.pagination-bar {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid #e5e7eb;
+}
+
+.error-block {
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  color: #991b1b;
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin: 14px 0;
+}
+
+.error-block p {
+  margin: 6px 0 0;
+}
+
+/* Candidate profile edit form */
+.profile-edit-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-weight: 700;
+  color: #111827;
+}
+
+.profile-edit-form label span small {
+  color: #6b7280;
+  font-weight: 400;
+}
+
+.profile-edit-form input[readonly] {
+  background: #f3f4f6;
+  color: #374151;
+  cursor: not-allowed;
+}
+
+.profile-edit-form textarea,
+.profile-edit-form input,
+.profile-edit-form select {
+  width: 100%%;
+  box-sizing: border-box;
+}
+
+.edit-grid {
+  margin-bottom: 12px;
+}
+
+.full-width-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 12px 0;
+}
+
+.info-banner {
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  color: #1e3a8a;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-weight: 700;
+}

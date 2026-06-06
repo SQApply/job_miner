@@ -621,13 +621,20 @@ class ControlRepository:
         return dict(row)
 
     def create_task_row(self, *, task_uuid: str, task_name: str, queue_name: str, pipeline_run_id: str | None, user: dict[str, Any] | None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        user_id = user.get("id") if user else None
         row = self.session.execute(
             text(
                 """
                 INSERT INTO job_miner_control.celery_tasks (
-                    organization_id, task_uuid, task_name, queue_name, pipeline_run_id, requested_by_app_user_id, payload
-                ) VALUES (:org_id, :task_uuid, :task_name, :queue_name, :pipeline_run_id, :user_id, CAST(:payload AS jsonb))
-                ON CONFLICT (task_uuid) DO UPDATE SET modified_on = NOW()
+                    organization_id, task_uuid, task_name, queue_name, pipeline_run_id,
+                    requested_by_app_user_id, payload, created_by, modified_by
+                ) VALUES (
+                    :org_id, :task_uuid, :task_name, :queue_name, :pipeline_run_id,
+                    :user_id, CAST(:payload AS jsonb), :user_id, :user_id
+                )
+                ON CONFLICT (task_uuid) DO UPDATE
+                SET modified_on = NOW(),
+                    modified_by = EXCLUDED.modified_by
                 RETURNING *
                 """
             ),
@@ -637,7 +644,7 @@ class ControlRepository:
                 "task_name": task_name,
                 "queue_name": queue_name,
                 "pipeline_run_id": pipeline_run_id,
-                "user_id": user.get("id") if user else None,
+                "user_id": user_id,
                 "payload": _json(payload or {}),
             },
         ).mappings().one()
@@ -689,6 +696,53 @@ class ControlRepository:
                 "message": message,
                 "progress_percent": progress_percent,
                 "payload": _json(payload or {}),
+            },
+        )
+
+    def record_processing_failure(
+        self,
+        *,
+        failure_id: str,
+        task_uuid: str | None,
+        entity_type: str | None,
+        entity_id: str | None,
+        error: BaseException,
+        failed_payload: dict[str, Any] | None = None,
+    ) -> None:
+        celery_task_id = None
+        organization_id = self.get_default_org_id()
+        if task_uuid:
+            row = self.session.execute(
+                text("SELECT id, organization_id FROM job_miner_control.celery_tasks WHERE task_uuid = :task_uuid"),
+                {"task_uuid": task_uuid},
+            ).mappings().first()
+            if row:
+                celery_task_id = str(row["id"])
+                organization_id = str(row["organization_id"]) if row.get("organization_id") else organization_id
+
+        self.session.execute(
+            text(
+                """
+                INSERT INTO job_miner_control.processing_failures (
+                    organization_id, celery_task_id, failure_id, entity_type, entity_id,
+                    error_type, error_message, traceback, failed_payload
+                ) VALUES (
+                    :organization_id, :celery_task_id, :failure_id, :entity_type, :entity_id,
+                    :error_type, :error_message, :traceback, CAST(:failed_payload AS jsonb)
+                )
+                ON CONFLICT (failure_id) DO NOTHING
+                """
+            ),
+            {
+                "organization_id": organization_id,
+                "celery_task_id": celery_task_id,
+                "failure_id": failure_id,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+                "traceback": traceback_module.format_exc(),
+                "failed_payload": _json(failed_payload or {}),
             },
         )
 

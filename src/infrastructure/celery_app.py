@@ -14,6 +14,7 @@ BROKER_URL = os.getenv("JOB_MINER_CELERY_BROKER_URL", REDIS_URL)
 RESULT_BACKEND = os.getenv("JOB_MINER_CELERY_RESULT_BACKEND", REDIS_URL)
 
 RECOMMENDATION_QUEUE = os.getenv("JOB_MINER_RECOMMENDATION_QUEUE", "recommendation_queue")
+RESUME_PROCESSING_QUEUE = os.getenv("JOB_MINER_RESUME_PROCESSING_QUEUE", "resume_processing_queue")
 
 celery_app = Celery(
     "job_miner",
@@ -22,6 +23,7 @@ celery_app = Celery(
     include=[
         "src.tasks.mvp_tasks",
         "src.tasks.recommendation_tasks",
+        "src.tasks.resume_tasks",
     ],
 )
 
@@ -43,6 +45,9 @@ celery_app.conf.update(
         "src.tasks.mvp_tasks.run_cli_task": {"queue": "maintenance_queue"},
         "src.tasks.recommendation_tasks.generate_recommendations_after_resume_upload_task": {
             "queue": RECOMMENDATION_QUEUE
+        },
+        "src.tasks.resume_tasks.process_candidate_resume_upload_task": {
+            "queue": RESUME_PROCESSING_QUEUE
         },
     },
 )

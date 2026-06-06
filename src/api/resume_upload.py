@@ -5,7 +5,6 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from datetime import datetime, timezone
 
 from fastapi import HTTPException, UploadFile, status
 
@@ -17,6 +16,8 @@ from ..resume_ocr.pipeline import ResumeOcrPipeline, _new_run_session_id
 from ..resume_ocr.settings import load_system_config
 from ..resume_ocr.utils import SUPPORTED_EXTENSIONS
 from ..tasks.recommendation_tasks import generate_recommendations_after_resume_upload_task
+from ..tasks.tracking import create_task_tracking_row, mark_task_failed
+from ..observability.correlation import new_uuid
 from ..warehouse.repositories import WarehouseRepository
 from ..common.constants import MongoCollections
 
@@ -105,6 +106,9 @@ def _mark_resume_processing_started(
     original_name: str,
     user: dict[str, Any],
     local_path: Path,
+    status_value: str = "processing",
+    status_message: str = "Your resume is being processed. Please do not upload it again.",
+    extra: dict[str, Any] | None = None,
 ) -> None:
     if not candidate_id:
         return
@@ -113,8 +117,8 @@ def _mark_resume_processing_started(
 
     payload = {
         "profile_state": "processing",
-        "resume_upload_status": "processing",
-        "resume_upload_status_message": "Your resume is being processed. Please do not upload it again.",
+        "resume_upload_status": status_value,
+        "resume_upload_status_message": status_message,
         "resume_processing_started_at": now,
         "resume_upload_started_at": now,
         "resume_upload_updated_at": now,
@@ -125,6 +129,10 @@ def _mark_resume_processing_started(
         "uploaded_by_email": _normalize_email(user.get("email")),
         "onboarding_required": True,
     }
+    if status_value == "queued":
+        payload["resume_upload_queued_at"] = now
+    if extra:
+        payload.update(extra)
 
     db[MongoCollections.CANDIDATE_TOWER_RECORDS].update_one(
         {"candidate_id": candidate_id},
@@ -283,6 +291,62 @@ def _env_enabled(name: str, default: bool = True) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _resume_upload_mode() -> str:
+    raw = os.getenv("JOB_MINER_RESUME_UPLOAD_MODE", "sync").strip().lower()
+    return "async" if raw in {"async", "queued", "background", "celery"} else "sync"
+
+
+def _resume_processing_queue_name() -> str:
+    return os.getenv("JOB_MINER_RESUME_PROCESSING_QUEUE", "resume_processing_queue")
+
+
+def _resume_upload_user_context(user: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(user.get("id")) if user.get("id") is not None else None,
+        "organization_id": str(user.get("organization_id")) if user.get("organization_id") is not None else None,
+        "email": user.get("email"),
+        "email_verified": bool(user.get("email_verified")),
+        "full_name": user.get("full_name"),
+        "keycloak_user_id": user.get("keycloak_user_id"),
+        "login_keycloak_user_id": user.get("login_keycloak_user_id"),
+        "preferred_username": user.get("preferred_username"),
+    }
+
+
+def _resume_upload_link_context(current_link: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not current_link:
+        return None
+    return {
+        "candidate_id": str(current_link.get("candidate_id")) if current_link.get("candidate_id") else None,
+        "resume_id": str(current_link.get("resume_id")) if current_link.get("resume_id") else None,
+    }
+
+
+def _mark_resume_processing_extracting(
+    *,
+    db: Any,
+    candidate_id: str | None,
+    resume_id: str | None,
+    upload_id: str,
+) -> None:
+    if not candidate_id:
+        return
+
+    now = _utc_now()
+    payload = {
+        "profile_state": "processing",
+        "resume_upload_status": "profile_extracting",
+        "resume_upload_status_message": "Your resume is being parsed and converted into a candidate profile.",
+        "resume_processing_started_at": now,
+        "resume_upload_updated_at": now,
+        "active_resume_upload_id": upload_id,
+        "onboarding_required": True,
+    }
+    db[MongoCollections.CANDIDATE_TOWER_RECORDS].update_one({"candidate_id": candidate_id}, {"$set": payload})
+    if resume_id:
+        db[MongoCollections.RESUME_PROFILES_CURRENT].update_one({"resume_id": resume_id}, {"$set": payload})
+
+
 def _queue_recommendation_generation(
     *,
     db: Any,
@@ -290,6 +354,8 @@ def _queue_recommendation_generation(
     resume_id: str,
     login_email: str,
     run_session_id: str,
+    request_id: str | None,
+    user: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Queue recommendation generation without blocking resume upload.
 
@@ -316,6 +382,22 @@ def _queue_recommendation_generation(
         }
 
     queue_name = os.getenv("JOB_MINER_RECOMMENDATION_QUEUE", "recommendation_queue")
+    task_uuid = new_uuid()
+    task_payload = {
+        "request_id": request_id,
+        "candidate_id": candidate_id,
+        "resume_id": resume_id,
+        "email": login_email,
+        "run_session_id": run_session_id,
+        "source": "candidate_resume_upload_celery",
+    }
+    create_task_tracking_row(
+        task_uuid=task_uuid,
+        task_name="src.tasks.recommendation_tasks.generate_recommendations_after_resume_upload_task",
+        queue_name=queue_name,
+        user=user,
+        payload=task_payload,
+    )
 
     try:
         async_result = generate_recommendations_after_resume_upload_task.apply_async(
@@ -324,10 +406,20 @@ def _queue_recommendation_generation(
                 "resume_id": resume_id,
                 "email": login_email,
                 "run_session_id": run_session_id,
+                "request_id": request_id,
             },
             queue=queue_name,
+            task_id=task_uuid,
         )
     except Exception as exc:
+        mark_task_failed(
+            task_uuid=task_uuid,
+            error=exc,
+            entity_type="recommendation_generation",
+            entity_id=candidate_id,
+            failed_payload=task_payload,
+            message="Recommendation task could not be queued.",
+        )
         db.candidate_tower_records.update_many(
             {"candidate_id": candidate_id},
             {
@@ -352,7 +444,7 @@ def _queue_recommendation_generation(
             "$set": {
                 "recommendation_status": "queued",
                 "recommendation_status_message": "Recommendations are being generated in the background.",
-                "recommendation_task_id": async_result.id,
+                "recommendation_task_id": task_uuid,
                 "recommendation_queue": queue_name,
                 "recommendation_queued_at": now,
                 "recommendation_updated_at": now,
@@ -364,7 +456,7 @@ def _queue_recommendation_generation(
     return {
         "status": "queued",
         "candidate_id": candidate_id,
-        "task_id": async_result.id,
+        "task_id": task_uuid,
         "queue": queue_name,
         "message": "Recommendations are being generated in the background.",
     }
@@ -375,13 +467,13 @@ def process_candidate_resume_upload(
     upload: UploadFile,
     user: dict[str, Any],
     current_link: dict[str, Any] | None,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
-    """Persist, parse, warehouse, and link a candidate resume upload.
+    """Validate and persist a candidate resume upload.
 
-    The endpoint is intentionally strict: a candidate cannot skip resume upload
-    when their profile is incomplete, and a parsed resume email cannot conflict
-    with the verified login email. This prevents a user from linking another
-    candidate's profile to their account by uploading a different person's CV.
+    Default `sync` mode keeps the original behavior for local development and existing tests.
+    Production can set `JOB_MINER_RESUME_UPLOAD_MODE=async` to return 202 from FastAPI
+    after storing the file and queueing the heavy OCR/profile extraction in Celery.
     """
     if not user.get("id"):
         raise HTTPException(status_code=403, detail="Authenticated app user is missing.")
@@ -390,17 +482,14 @@ def process_candidate_resume_upload(
     if not login_email or not user.get("email_verified"):
         raise HTTPException(status_code=403, detail="A verified email is required before uploading a resume.")
 
+    request_id = request_id or new_uuid()
+
     original_name = _safe_filename(upload.filename)
     suffix = Path(original_name).suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
         allowed = ", ".join(sorted(SUPPORTED_EXTENSIONS))
         raise HTTPException(status_code=400, detail=f"Unsupported resume file type '{suffix}'. Allowed types: {allowed}.")
 
-    # root = _project_root()
-    # upload_id = _new_run_session_id()
-    # upload_dir = root / "data" / "resumes" / "candidate_uploads" / str(user["id"])
-    # local_path = upload_dir / f"{upload_id}_{original_name}"
-    # file_size_bytes = _write_upload_to_disk(upload, local_path)
     root = _project_root()
     upload_id = _new_run_session_id()
     upload_dir = root / "data" / "resumes" / "candidate_uploads" / str(user["id"])
@@ -418,9 +507,15 @@ def process_candidate_resume_upload(
     )
 
     db = get_mongo_database()
-
     _assert_no_active_resume_processing(db, previous_candidate_id)
 
+    async_mode = _resume_upload_mode() == "async"
+    started_status = "queued" if async_mode else "processing"
+    started_message = (
+        "Your resume upload was accepted and queued for background processing."
+        if async_mode
+        else "Your resume is being processed. Please do not upload it again."
+    )
     _mark_resume_processing_started(
         db=db,
         candidate_id=previous_candidate_id,
@@ -429,6 +524,9 @@ def process_candidate_resume_upload(
         original_name=original_name,
         user=user,
         local_path=local_path,
+        status_value=started_status,
+        status_message=started_message,
+        extra={"resume_upload_request_id": request_id},
     )
 
     try:
@@ -443,6 +541,161 @@ def process_candidate_resume_upload(
         )
         raise
 
+    if async_mode:
+        queue_name = _resume_processing_queue_name()
+        task_uuid = new_uuid()
+        task_payload = {
+            "request_id": request_id,
+            "local_path": str(local_path),
+            "original_name": original_name,
+            "file_size_bytes": file_size_bytes,
+            "upload_id": upload_id,
+            "candidate_id": previous_candidate_id,
+            "resume_id": previous_resume_id,
+        }
+        create_task_tracking_row(
+            task_uuid=task_uuid,
+            task_name="src.tasks.resume_tasks.process_candidate_resume_upload_task",
+            queue_name=queue_name,
+            user=user,
+            payload=task_payload,
+        )
+
+        try:
+            from ..tasks.resume_tasks import process_candidate_resume_upload_task
+
+            async_result = process_candidate_resume_upload_task.apply_async(
+                kwargs={
+                    "local_path": str(local_path),
+                    "original_name": original_name,
+                    "file_size_bytes": file_size_bytes,
+                    "upload_id": upload_id,
+                    "user": _resume_upload_user_context(user),
+                    "current_link": _resume_upload_link_context(current_link),
+                    "request_id": request_id,
+                },
+                queue=queue_name,
+                task_id=task_uuid,
+            )
+        except Exception as exc:
+            mark_task_failed(
+                task_uuid=task_uuid,
+                error=exc,
+                entity_type="resume_upload",
+                entity_id=previous_candidate_id or upload_id,
+                failed_payload=task_payload,
+                message="Resume processing task could not be queued.",
+            )
+            _mark_resume_processing_failed(
+                db=db,
+                candidate_id=previous_candidate_id,
+                resume_id=previous_resume_id,
+                upload_id=upload_id,
+                error_message=f"Resume processing could not be queued: {exc!r}",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Resume upload was saved, but background processing could not be queued. Please try again.",
+            ) from exc
+
+        now = _utc_now()
+        queue_payload = {
+            "resume_processing_task_id": task_uuid,
+            "resume_upload_request_id": request_id,
+            "resume_processing_queue": queue_name,
+            "resume_processing_queued_at": now,
+            "resume_upload_updated_at": now,
+        }
+        if previous_candidate_id:
+            db[MongoCollections.CANDIDATE_TOWER_RECORDS].update_one(
+                {"candidate_id": previous_candidate_id},
+                {"$set": queue_payload},
+            )
+        if previous_resume_id:
+            db[MongoCollections.RESUME_PROFILES_CURRENT].update_one(
+                {"resume_id": previous_resume_id},
+                {"$set": queue_payload},
+            )
+
+        return {
+            "uploaded": True,
+            "queued": True,
+            "candidate_id": previous_candidate_id,
+            "resume_id": previous_resume_id,
+            "candidate_link": current_link,
+            "upload_id": upload_id,
+            "original_file_name": original_name,
+            "uploaded_file_size_bytes": file_size_bytes,
+            "local_path": str(local_path),
+            "resume_processing": {
+                "status": "queued",
+                "task_id": task_uuid,
+                "queue": queue_name,
+                "message": "Resume processing is running in the background.",
+            },
+            "recommendation_generation": {
+                "status": "waiting_for_resume_processing",
+                "message": "Recommendations will be queued after the resume profile is parsed.",
+            },
+        }
+
+    return _process_candidate_resume_file_from_path(
+        local_path=local_path,
+        original_name=original_name,
+        file_size_bytes=file_size_bytes,
+        upload_id=upload_id,
+        user=_resume_upload_user_context(user),
+        current_link=_resume_upload_link_context(current_link),
+        request_id=request_id,
+    )
+
+
+def _process_candidate_resume_file_from_path(
+    *,
+    local_path: str | Path,
+    original_name: str,
+    file_size_bytes: int,
+    upload_id: str,
+    user: dict[str, Any],
+    current_link: dict[str, Any] | None,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    """Run the heavy OCR/profile extraction step for a previously stored upload.
+
+    This function is shared by the original synchronous upload path and the new
+    Celery-backed 202 path. Keeping the heavy logic in one place prevents the sync
+    and async paths from drifting apart.
+    """
+    if not user.get("id"):
+        raise HTTPException(status_code=403, detail="Authenticated app user is missing.")
+
+    login_email = _normalize_email(user.get("email"))
+    if not login_email or not user.get("email_verified"):
+        raise HTTPException(status_code=403, detail="A verified email is required before uploading a resume.")
+
+    request_id = request_id or new_uuid()
+
+    local_path = Path(local_path)
+    previous_candidate_id = (
+        str(current_link.get("candidate_id"))
+        if current_link and current_link.get("candidate_id")
+        else None
+    )
+    previous_resume_id = (
+        str(current_link.get("resume_id"))
+        if current_link and current_link.get("resume_id")
+        else None
+    )
+
+    db = get_mongo_database()
+    _mark_resume_processing_extracting(
+        db=db,
+        candidate_id=previous_candidate_id,
+        resume_id=previous_resume_id,
+        upload_id=upload_id,
+    )
+
+    root = _project_root()
     config = load_system_config(root)
     run_session_id = _new_run_session_id()
     logger = build_session_logger(root, config.output.log_dir, run_session_id)
@@ -452,15 +705,9 @@ def process_candidate_resume_upload(
         email=login_email,
         source_path=str(local_path),
         file_size_bytes=file_size_bytes,
+        async_mode=_resume_upload_mode() == "async",
     )
 
-    # pipeline = ResumeOcrPipeline(root, config, logger)
-    # profile, record, status_text = pipeline.process_file(local_path)
-    # if status_text != "processed" or profile is None or record is None:
-    #     raise HTTPException(
-    #         status_code=422,
-    #         detail="Resume could not be processed. Check that the file is readable and that the OCR/LLM services are running.",
-    #     )
     pipeline = ResumeOcrPipeline(root, config, logger)
 
     try:
@@ -497,21 +744,16 @@ def process_candidate_resume_upload(
     parsed_email = _normalize_email(contact.get("email"))
     if parsed_email and parsed_email != login_email:
         _mark_resume_processing_failed(
-        db=db,
-        candidate_id=previous_candidate_id,
-        resume_id=previous_resume_id,
-        upload_id=upload_id,
-        error_message="The email extracted from the resume does not match the verified login email.",
-    )
-
+            db=db,
+            candidate_id=previous_candidate_id,
+            resume_id=previous_resume_id,
+            upload_id=upload_id,
+            error_message="The email extracted from the resume does not match the verified login email.",
+        )
         raise HTTPException(
             status_code=409,
             detail="The email extracted from the resume does not match your verified login email. Upload a resume with the same email or contact support.",
         )
-        # raise HTTPException(
-        #     status_code=409,
-        #     detail="The email extracted from the resume does not match your verified login email. Upload a resume with the same email or contact support.",
-        # )
 
     # Keep ownership deterministic. If the resume has no email, the verified
     # login email becomes the canonical candidate email.
@@ -525,6 +767,7 @@ def process_candidate_resume_upload(
     profile_payload["resume_upload_status"] = "completed"
     profile_payload["resume_upload_status_message"] = "Resume processing completed."
     profile_payload["resume_upload_completed_at"] = _utc_now()
+    profile_payload["resume_upload_updated_at"] = _utc_now()
     profile_payload["active_resume_upload_id"] = upload_id
     profile_payload.setdefault("raw_payload", {})
     if isinstance(profile_payload["raw_payload"], dict):
@@ -547,16 +790,14 @@ def process_candidate_resume_upload(
     record_payload["resume_upload_status"] = "completed"
     record_payload["resume_upload_status_message"] = "Resume processing completed."
     record_payload["resume_upload_completed_at"] = _utc_now()
+    record_payload["resume_upload_updated_at"] = _utc_now()
     record_payload["active_resume_upload_id"] = upload_id
     record_payload["uploaded_by_app_user_id"] = str(user.get("id"))
     record_payload["uploaded_by_email"] = login_email
     record_payload["recommendation_status"] = "pending"
     record_payload["recommendation_status_message"] = "Profile parsed. Recommendation generation is pending."
 
-    # db = get_mongo_database()
     warehouse = WarehouseRepository(db)
-    # resume_id, _, _ = warehouse.upsert_resume_profile(profile_payload, run_session_id=run_session_id)
-    # candidate_id = warehouse.upsert_candidate_tower(record_payload)
     resume_id, _, _ = warehouse.upsert_resume_profile(profile_payload, run_session_id=run_session_id)
     candidate_id = warehouse.upsert_candidate_tower(record_payload)
 
@@ -569,15 +810,15 @@ def process_candidate_resume_upload(
         upload_id=upload_id,
     )
 
-    # Persist the original uploaded resume for audit/debugging. The parsed OCR
-    # outputs are already written by the resume OCR pipeline under data/processed.
     metadata = {
         "link_source": "candidate_resume_upload",
         "uploaded_file_name": original_name,
         "uploaded_file_size_bytes": file_size_bytes,
         "run_session_id": run_session_id,
-        "previous_candidate_id": current_link.get("candidate_id") if current_link else None,
-        "previous_resume_id": current_link.get("resume_id") if current_link else None,
+        "previous_candidate_id": previous_candidate_id,
+        "previous_resume_id": previous_resume_id,
+        "async_resume_upload": _resume_upload_mode() == "async",
+        "request_id": request_id,
     }
 
     with postgres_session() as session:
@@ -607,6 +848,8 @@ def process_candidate_resume_upload(
         resume_id=resume_id,
         login_email=login_email,
         run_session_id=run_session_id,
+        request_id=request_id,
+        user=user,
     )
 
     logger.log(
@@ -619,6 +862,7 @@ def process_candidate_resume_upload(
 
     return {
         "uploaded": True,
+        "queued": False,
         "candidate_id": candidate_id,
         "resume_id": resume_id,
         "candidate_link": link,

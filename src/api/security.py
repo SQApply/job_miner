@@ -49,6 +49,9 @@ class KeycloakSettings:
         self.audience = os.getenv(EnvironmentVariables.KEYCLOAK_AUDIENCE, "job-miner-api")
         self.client_id = os.getenv(EnvironmentVariables.KEYCLOAK_CLIENT_ID, "job-miner-web")
         self.leeway_seconds = int(os.getenv("JOB_MINER_KEYCLOAK_JWT_LEEWAY_SECONDS", "30"))
+        self.bypass_email_verification_for_local_dev = (
+            os.getenv("JOB_MINER_BYPASS_EMAIL_VERIFICATION_FOR_LOCAL_DEV", "false").lower() in {"1", "true", "yes"}
+        )
 
 
 @lru_cache(maxsize=1)
@@ -144,6 +147,12 @@ def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(
         )
 
     claims = decode_keycloak_token(credentials.credentials)
+    if settings.bypass_email_verification_for_local_dev:
+        # Local/dev only. This allows testing signup before SMTP is configured.
+        # Production must keep this disabled and rely on Keycloak email verification.
+        claims = dict(claims)
+        claims["email_verified"] = True
+
     with postgres_session() as session:
         repo = ControlRepository(session)
         try:

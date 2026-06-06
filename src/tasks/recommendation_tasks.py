@@ -9,6 +9,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 from ..api.recommendation_generation import generate_candidate_recommendations_after_upload
 from ..infrastructure.celery_app import celery_app
 from ..infrastructure.mongo import get_mongo_database
+from .tracking import mark_task_completed, mark_task_failed, mark_task_running
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ def generate_recommendations_after_resume_upload_task(
     email: str | None = None,
     run_session_id: str | None = None,
     source: str = "candidate_resume_upload_celery",
+    request_id: str | None = None,
 ) -> dict[str, Any]:
     """Celery entrypoint for post-resume-upload recommendations.
 
@@ -73,13 +75,24 @@ def generate_recommendations_after_resume_upload_task(
     src.api.recommendation_generation.generate_candidate_recommendations_after_upload.
     This task only moves execution out of FastAPI and into the Redis/Celery worker.
     """
-    task_id = getattr(self.request, "id", None)
+    task_id = str(getattr(self.request, "id", "") or "")
     logger.info(
-        "Celery recommendation task started candidate_id=%s resume_id=%s email=%s task_id=%s",
+        "recommendation_task_started request_id=%s task_id=%s candidate_id=%s resume_id=%s email=%s",
+        request_id,
+        task_id,
         candidate_id,
         resume_id,
         email,
-        task_id,
+    )
+    mark_task_running(
+        task_uuid=task_id,
+        message="Recommendation generation task started.",
+        payload={
+            "request_id": request_id,
+            "candidate_id": candidate_id,
+            "resume_id": resume_id,
+            "run_session_id": run_session_id,
+        },
     )
 
     _set_recommendation_status(
@@ -88,6 +101,7 @@ def generate_recommendations_after_resume_upload_task(
         message="Generating job recommendations in the background.",
         extra={
             "recommendation_task_id": task_id,
+            "recommendation_request_id": request_id,
             "recommendation_run_session_id": run_session_id,
             "recommendation_started_at": _utc_now(),
             "recommendation_error": None,
@@ -120,8 +134,16 @@ def generate_recommendations_after_resume_upload_task(
             },
         )
 
+        mark_task_completed(
+            task_uuid=task_id,
+            result={"status": final_status, **summary},
+            message="Recommendation generation task completed.",
+            event_payload={"request_id": request_id, "candidate_id": candidate_id, "resume_id": resume_id, "status": final_status},
+        )
         logger.info(
-            "Celery recommendation task completed candidate_id=%s status=%s summary=%s",
+            "recommendation_task_completed request_id=%s task_id=%s candidate_id=%s status=%s summary=%s",
+            request_id,
+            task_id,
             candidate_id,
             final_status,
             summary,
@@ -138,10 +160,18 @@ def generate_recommendations_after_resume_upload_task(
                 "recommendation_error": "soft_time_limit_exceeded",
             },
         )
+        mark_task_failed(
+            task_uuid=task_id,
+            error=SoftTimeLimitExceeded(),
+            entity_type="recommendation_generation",
+            entity_id=candidate_id,
+            failed_payload={"request_id": request_id, "candidate_id": candidate_id, "resume_id": resume_id},
+            message="Recommendation generation task timed out.",
+        )
         raise
 
     except Exception as exc:
-        logger.exception("Celery recommendation task failed candidate_id=%s task_id=%s", candidate_id, task_id)
+        logger.exception("recommendation_task_failed request_id=%s task_id=%s candidate_id=%s", request_id, task_id, candidate_id)
         _set_recommendation_status(
             candidate_id=candidate_id,
             status="failed",
@@ -150,5 +180,13 @@ def generate_recommendations_after_resume_upload_task(
                 "recommendation_failed_at": _utc_now(),
                 "recommendation_error": repr(exc),
             },
+        )
+        mark_task_failed(
+            task_uuid=task_id,
+            error=exc,
+            entity_type="recommendation_generation",
+            entity_id=candidate_id,
+            failed_payload={"request_id": request_id, "candidate_id": candidate_id, "resume_id": resume_id},
+            message="Recommendation generation task failed.",
         )
         raise
