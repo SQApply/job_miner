@@ -411,13 +411,14 @@ def my_profile(user: dict[str, Any] = Depends(require_permission("candidate.view
 
 
 @app.patch("/me/profile")
-def update_my_profile(payload: CandidateProfileUpdateRequest, response: Response, user: dict[str, Any] = Depends(require_permission("candidate.view_self"))) -> dict[str, Any]:
+def update_my_profile(payload: CandidateProfileUpdateRequest, response: Response, request: Request, user: dict[str, Any] = Depends(require_permission("candidate.view_self"))) -> dict[str, Any]:
     link = _require_candidate_link(user)
     result = update_candidate_profile(
         candidate_id=link["candidate_id"],
         app_user_id=str(user["id"]),
         user_email=user.get("email"),
         payload=payload.model_dump(exclude_unset=True),
+        request_id=getattr(request.state, "request_id", None),
     )
     with postgres_session() as session:
         repo = ControlRepository(session)

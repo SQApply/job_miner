@@ -95,7 +95,7 @@ class ResumeOcrPipeline:
         self.ocr_backend = build_ocr_backend(config.ocr, root)
         self.extractor = ResumeExtractor(
             config.llm,
-            max_markdown_chars=config.parser.max_markdown_chars_for_extraction,
+            parser_settings=config.parser,
         )
 
     def _ocr_or_native(self, source_path: Path, *, resume_id: str, sha256: str) -> OcrDocument:

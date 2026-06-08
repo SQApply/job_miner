@@ -9,6 +9,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 from ..api.recommendation_generation import generate_candidate_recommendations_after_upload
 from ..infrastructure.celery_app import celery_app
 from ..infrastructure.mongo import get_mongo_database
+from .concurrency import acquire_candidate_recommendation_lock
 from .tracking import mark_task_completed, mark_task_failed, mark_task_running
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,30 @@ def generate_recommendations_after_resume_upload_task(
         },
     )
 
+    lock = acquire_candidate_recommendation_lock(candidate_id, task_id)
+    if not lock.acquired:
+        message = "Recommendation generation skipped because another refresh is already running for this candidate."
+        _set_recommendation_status(
+            candidate_id=candidate_id,
+            status="skipped_duplicate",
+            message=message,
+            extra={
+                "recommendation_task_id": task_id,
+                "recommendation_request_id": request_id,
+                "recommendation_error": None,
+                "recommendation_completed_at": _utc_now(),
+            },
+        )
+        result = {"status": "skipped_duplicate", "candidate_id": candidate_id, "message": message}
+        mark_task_completed(
+            task_uuid=task_id,
+            result=result,
+            message=message,
+            event_payload={"request_id": request_id, "candidate_id": candidate_id, "resume_id": resume_id, "status": "skipped_duplicate"},
+        )
+        logger.info("recommendation_task_skipped_duplicate request_id=%s task_id=%s candidate_id=%s", request_id, task_id, candidate_id)
+        return result
+
     try:
         summary = generate_candidate_recommendations_after_upload(candidate_id, source=source)
         final_status = str(summary.get("status") or "completed")
@@ -190,3 +215,6 @@ def generate_recommendations_after_resume_upload_task(
             message="Recommendation generation task failed.",
         )
         raise
+
+    finally:
+        lock.release()

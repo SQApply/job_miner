@@ -52,6 +52,25 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+
+def _job_snapshot(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": job.get("job_id"),
+        "title": job.get("title") or job.get("job_title"),
+        "company": job.get("company") or job.get("company_name") or job.get("employer"),
+        "location_text": job.get("location_text") or job.get("location"),
+        "job_url": job.get("job_url"),
+        "apply_url": job.get("apply_url") or job.get("job_url") or job.get("source_url") or job.get("url"),
+        "source_url": job.get("source_url"),
+        "url": job.get("url"),
+        "description": job.get("description"),
+        "summary": job.get("summary"),
+        "required_skills": job.get("required_skills") or [],
+        "preferred_skills": job.get("preferred_skills") or [],
+        "skills": job.get("skills") or [],
+        "employment_type": job.get("employment_type"),
+    }
+
 def _candidate_id(candidate: dict[str, Any], index: int) -> str:
     return str(
         candidate.get("candidate_id")
@@ -394,6 +413,7 @@ def match_candidates_with_llm_rerank(
             job_payload = item["job_payload"]
             now = datetime.now(timezone.utc).isoformat()
 
+            snapshot = _job_snapshot(job_payload)
             record = {
                 "match_run_id": match_run_id,
                 "strategy": "qdrant_topk_llm_rerank",
@@ -401,12 +421,13 @@ def match_candidates_with_llm_rerank(
                 "resume_id": candidate.get("resume_id"),
                 "candidate_name": _candidate_name(candidate),
                 "final_rank": final_rank,
-                "job_id": job_payload.get("job_id"),
-                "title": job_payload.get("title"),
-                "company": job_payload.get("company"),
-                "location_text": job_payload.get("location_text"),
-                "job_url": job_payload.get("job_url"),
-                "apply_url": job_payload.get("apply_url"),
+                "job_id": snapshot.get("job_id"),
+                "title": snapshot.get("title"),
+                "company": snapshot.get("company"),
+                "location_text": snapshot.get("location_text"),
+                "job_url": snapshot.get("job_url"),
+                "apply_url": snapshot.get("apply_url"),
+                "job_snapshot": snapshot,
                 "baseline_rank": item["baseline_rank"],
                 "baseline_score_0_1": item["baseline_score_0_1"],
                 "vector_score_0_1": item["vector_score_0_1"],

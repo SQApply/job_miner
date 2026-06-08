@@ -12,7 +12,9 @@ from fastapi import HTTPException, status
 
 from ..common.constants import MongoCollections
 from ..infrastructure.mongo import get_mongo_database
+from ..observability.correlation import new_uuid
 from ..tasks.recommendation_tasks import generate_recommendations_after_resume_upload_task
+from ..tasks.tracking import create_task_tracking_row, mark_task_failed
 
 PROFILE_EDIT_EVENTS_COLLECTION = "candidate_profile_edit_events"
 
@@ -293,13 +295,59 @@ def diff_fields(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
     return changed
 
 
-def _queue_profile_edit_recommendations(*, db: Any, candidate_id: str, resume_id: str | None, email: str | None, matching_input_hash: str) -> dict[str, Any]:
+def _queue_profile_edit_recommendations(
+    *,
+    db: Any,
+    candidate_id: str,
+    resume_id: str | None,
+    email: str | None,
+    matching_input_hash: str,
+    request_id: str | None,
+    app_user_id: str | None,
+) -> dict[str, Any]:
     if os.getenv("JOB_MINER_ENABLE_AUTO_RECOMMENDATION_QUEUE", "true").strip().lower() not in {"1", "true", "yes", "on"}:
         return {"status": "disabled", "message": "Automatic recommendation generation is disabled."}
 
     queue_name = os.getenv("JOB_MINER_RECOMMENDATION_QUEUE", "recommendation_queue")
     run_session_id = f"candidate_profile_edit_{utc_now().strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
     now = utc_now()
+
+    skip_duplicate = os.getenv("JOB_MINER_PROFILE_EDIT_SKIP_DUPLICATE_RECOMMENDATIONS", "true").strip().lower() in {"1", "true", "yes", "on"}
+    if skip_duplicate:
+        current = db[MongoCollections.CANDIDATE_TOWER_RECORDS].find_one(
+            {"candidate_id": candidate_id},
+            {"recommendation_status": 1, "recommendation_task_id": 1, "recommendation_queue": 1, "recommendation_requested_for_hash": 1},
+        ) or {}
+        if (
+            current.get("recommendation_status") in {"queued", "running"}
+            and current.get("recommendation_requested_for_hash") == matching_input_hash
+        ):
+            return {
+                "status": "already_queued",
+                "task_id": current.get("recommendation_task_id"),
+                "queue": current.get("recommendation_queue") or queue_name,
+                "message": "Recommendation refresh is already queued or running for this profile version.",
+            }
+
+    task_id = new_uuid()
+    task_payload = {
+        "request_id": request_id,
+        "candidate_id": candidate_id,
+        "resume_id": resume_id,
+        "email": email,
+        "run_session_id": run_session_id,
+        "source": "candidate_profile_edit",
+        "matching_input_hash": matching_input_hash,
+        "app_user_id": app_user_id,
+    }
+
+    create_task_tracking_row(
+        task_uuid=task_id,
+        task_name="src.tasks.recommendation_tasks.generate_recommendations_after_resume_upload_task",
+        queue_name=queue_name,
+        user={"id": app_user_id} if app_user_id else None,
+        payload=task_payload,
+    )
 
     try:
         async_result = generate_recommendations_after_resume_upload_task.apply_async(
@@ -309,20 +357,33 @@ def _queue_profile_edit_recommendations(*, db: Any, candidate_id: str, resume_id
                 "email": email,
                 "run_session_id": run_session_id,
                 "source": "candidate_profile_edit",
+                "request_id": request_id,
             },
             queue=queue_name,
+            task_id=task_id,
         )
     except Exception as exc:
+        mark_task_failed(
+            task_uuid=task_id,
+            error=exc,
+            entity_type="recommendation_generation",
+            entity_id=candidate_id,
+            failed_payload=task_payload,
+            message="Recommendation refresh could not be queued after profile edit.",
+        )
         db[MongoCollections.CANDIDATE_TOWER_RECORDS].update_one(
             {"candidate_id": candidate_id},
             {"$set": {
                 "recommendation_status": "queue_failed",
                 "recommendation_status_message": "Profile was updated, but recommendation refresh could not be queued.",
                 "recommendation_error": repr(exc),
+                "recommendation_task_id": task_id,
+                "recommendation_queue": queue_name,
+                "recommendation_request_id": request_id,
                 "recommendation_updated_at": now,
             }},
         )
-        return {"status": "queue_failed", "message": "Recommendation refresh could not be queued.", "error": repr(exc)}
+        return {"status": "queue_failed", "message": "Recommendation refresh could not be queued.", "error": repr(exc), "task_id": task_id}
 
     db[MongoCollections.CANDIDATE_TOWER_RECORDS].update_one(
         {"candidate_id": candidate_id},
@@ -331,16 +392,17 @@ def _queue_profile_edit_recommendations(*, db: Any, candidate_id: str, resume_id
             "recommendation_status_message": "Profile updated. Recommendations are refreshing in the background.",
             "recommendation_task_id": async_result.id,
             "recommendation_queue": queue_name,
+            "recommendation_request_id": request_id,
             "recommendation_queued_at": now,
             "recommendation_updated_at": now,
             "recommendation_error": None,
             "recommendation_requested_for_hash": matching_input_hash,
         }},
     )
-    return {"status": "queued", "task_id": async_result.id, "queue": queue_name, "run_session_id": run_session_id}
+    return {"status": "queued", "task_id": async_result.id, "queue": queue_name, "run_session_id": run_session_id, "request_id": request_id}
 
 
-def update_candidate_profile(*, candidate_id: str, app_user_id: str, user_email: str | None, payload: dict[str, Any]) -> dict[str, Any]:
+def update_candidate_profile(*, candidate_id: str, app_user_id: str, user_email: str | None, payload: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
     db = get_mongo_database()
     tower = db[MongoCollections.CANDIDATE_TOWER_RECORDS].find_one({"candidate_id": candidate_id})
     if not tower:
@@ -453,6 +515,8 @@ def update_candidate_profile(*, candidate_id: str, app_user_id: str, user_email:
             resume_id=tower.get("resume_id"),
             email=tower.get("email"),
             matching_input_hash=after_hash,
+            request_id=request_id,
+            app_user_id=app_user_id,
         )
 
     return {

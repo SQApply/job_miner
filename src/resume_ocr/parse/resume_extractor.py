@@ -12,7 +12,7 @@ import requests
 from pydantic import ValidationError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
-from ..schemas import EducationItem, ExperienceItem, LlmSettings, ProjectItem, ResumeProfile
+from ..schemas import EducationItem, ExperienceItem, LlmSettings, ParserSettings, ProjectItem, ResumeProfile
 
 
 SECTION_HEADERS = {
@@ -357,9 +357,18 @@ def _build_work_role_blocks(section: dict[str, Any], *, max_blocks: int = 20, ma
         has_dates = bool(line.get("date_ranges")) or bool(DATE_RANGE_PATTERN.search(text))
 
         if starts_role and current is not None and current.get("lines"):
-            # A new title/date line starts a new role block. This is what fixes
-            # one-block IR for bullet-style work history.
-            flush_current()
+            # A new title/date line usually starts a new role block. However,
+            # many resumes split one role header over adjacent lines, e.g.:
+            #   Aldi, Batavia, IL Sep 2023 - Present
+            #   Data Scientist - AI/ML
+            # or:
+            #   Data Scientist - AI/ML
+            #   Aldi, Batavia, IL Sep 2023 - Present
+            # Do not split those header-only continuations before bullets begin.
+            header_only_current = not current.get("bullets") and len(current.get("lines", [])) <= 3
+            adjacent_role_header = header_only_current and (has_dates or current.get("has_date_evidence"))
+            if not adjacent_role_header:
+                flush_current()
 
         if current is None:
             current = new_block()
@@ -479,15 +488,65 @@ def _infer_role_field_hints(block: dict[str, Any]) -> dict[str, Any]:
         )
         return {key: value for key, value in hints.items() if value is not None}
 
-    # Pattern: Title date-range, company/location nearby
+    # Pattern: company/location/date line followed by title line.
+    # Example:
+    #   Aldi, Batavia, IL Sep 2023 - Present
+    #   Data Scientist - AI/ML
+    role_title_pattern = re.compile(
+        r"\b(engineer|developer|scientist|analyst|manager|consultant|architect|lead|intern|associate|officer|specialist|administrator|programmer)\b",
+        flags=re.IGNORECASE,
+    )
+
     for idx, line in enumerate(lines):
         date_match = DATE_RANGE_PATTERN.search(line)
         if not date_match:
             continue
 
-        title = line[: date_match.start()].strip(" -|,")
         start_date, end_date, is_current = _split_date_range(date_match.group(0))
+        before_dates = line[: date_match.start()].strip(" -|,")
+        after_dates = line[date_match.end() :].strip(" -|,")
+        nearby_lines = [item for item in lines[idx + 1 :] + context_lines if item]
+        next_line = nearby_lines[0] if nearby_lines else ""
 
+        previous_line = lines[idx - 1] if idx > 0 else ""
+        adjacent_title = ""
+        title_position = ""
+        if next_line and role_title_pattern.search(next_line) and len(next_line.split()) <= 12:
+            adjacent_title = next_line.strip()
+            title_position = "next_line"
+        elif previous_line and role_title_pattern.search(previous_line) and len(previous_line.split()) <= 12:
+            adjacent_title = previous_line.strip()
+            title_position = "previous_line"
+
+        if adjacent_title:
+            company_location = before_dates
+            company = company_location
+            location = None
+
+            if "," in company_location:
+                company_part, location_part = company_location.split(",", 1)
+                company = company_part.strip() or company_location
+                location = location_part.strip() or None
+
+            hints.update(
+                {
+                    "possible_title": adjacent_title,
+                    "possible_company": company,
+                    "possible_location": location,
+                    "possible_company_location_line": company_location,
+                    "possible_start_date": start_date,
+                    "possible_end_date": end_date,
+                    "possible_is_current": is_current,
+                    "hint_source": f"company_location_date_title_adjacent_pattern_{title_position}",
+                }
+            )
+            return {key: value for key, value in hints.items() if value is not None}
+
+        # Pattern: title/date line with company/location nearby.
+        # Example:
+        #   Senior Data Scientist Jan 2020 - Aug 2023
+        #   Fifth Third Bank, Cincinnati, OH
+        title = before_dates or after_dates
         if title:
             hints["possible_title"] = title
 
@@ -495,13 +554,15 @@ def _infer_role_field_hints(block: dict[str, Any]) -> dict[str, Any]:
         hints["possible_end_date"] = end_date
         hints["possible_is_current"] = is_current
 
-        nearby_lines = lines[idx + 1 :] + context_lines
         if nearby_lines:
             company_location = nearby_lines[0].strip()
             hints["possible_company_location_line"] = company_location
-            # Let the LLM decide exact company/location split for this layout.
-            # Example: "Ericsson Noida, India"
-            hints["possible_company"] = company_location
+            if "," in company_location:
+                company_part, location_part = company_location.split(",", 1)
+                hints["possible_company"] = company_part.strip() or company_location
+                hints["possible_location"] = location_part.strip() or None
+            else:
+                hints["possible_company"] = company_location
 
         hints["hint_source"] = "title_date_company_adjacent_pattern"
         return {key: value for key, value in hints.items() if value is not None}
@@ -570,6 +631,61 @@ def _build_simple_blocks(section: dict[str, Any], *, prefix: str, max_blocks: in
     return blocks[:max_blocks]
 
 
+def _looks_like_project_start(line: dict[str, Any]) -> bool:
+    text = (line.get("text_without_bullet") or line.get("text") or "").strip()
+    if not text:
+        return False
+
+    lowered = text.lower()
+    if lowered.startswith(("title:", "project:", "project title:", "name:")):
+        return True
+
+    # Resume project headings are often short non-bullet lines followed by tech
+    # stack/bullets. Keep this conservative to avoid splitting prose.
+    return (
+        not line.get("is_bullet")
+        and len(text.split()) <= 14
+        and any(token in lowered for token in ("chatbot", "rag", "engine", "system", "platform", "app", "application"))
+    )
+
+
+def _build_project_blocks(section: dict[str, Any], *, max_blocks: int = 20) -> list[dict[str, Any]]:
+    """Group PROJECTS into one block per project when headings are visible."""
+    blocks: list[dict[str, Any]] = []
+    current_lines: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        nonlocal current_lines
+        if not current_lines:
+            return
+
+        compact_lines = [_compact_line(line) for line in current_lines[:35]]
+        blocks.append(
+            {
+                "block_id": f"{section['section_id']}_project_{len(blocks) + 1:03d}",
+                "source_section": section.get("original_heading"),
+                "lines": compact_lines,
+                "bullets": [line for line in compact_lines if line.get("is_bullet")][:12],
+                "evidence_text": "\n".join(line["text"] for line in current_lines[:35]),
+            }
+        )
+        current_lines = []
+
+    for line in section.get("lines", []):
+        if _looks_like_project_start(line) and current_lines:
+            flush()
+        current_lines.append(line)
+
+    flush()
+
+    if len(blocks) <= 1:
+        # Fall back to the older generic grouping when no project headings are
+        # visible. This keeps one-line/bullet-only resumes supported.
+        return _build_simple_blocks(section, prefix="project", max_blocks=max_blocks)
+
+    return blocks[:max_blocks]
+
+
 def _build_canonical_resume_ir(markdown: str) -> dict[str, Any]:
     """Layer 2: canonical resume structure normalized as JSON.
 
@@ -594,7 +710,7 @@ def _build_canonical_resume_ir(markdown: str) -> dict[str, Any]:
         elif canonical_type == "skills":
             item["skill_groups"] = _build_skill_groups(section)
         elif canonical_type == "projects":
-            item["project_blocks"] = _build_simple_blocks(section, prefix="project")
+            item["project_blocks"] = _build_project_blocks(section)
         elif canonical_type == "education":
             item["education_blocks"] = _build_simple_blocks(section, prefix="education")
         elif canonical_type in {"certifications", "achievements", "languages"}:
@@ -621,6 +737,284 @@ def _build_canonical_resume_ir(markdown: str) -> dict[str, Any]:
         },
     }
 
+
+
+EVIDENCE_SPAN_TYPES = {
+    "contact",
+    "summary",
+    "skills",
+    "work_experience",
+    "project",
+    "education",
+    "certification",
+    "language",
+    "achievement",
+    "other",
+}
+
+
+def _line_number_from_id(line_id: str | None) -> int | None:
+    match = re.search(r"L(\d+)$", str(line_id or "").strip(), flags=re.IGNORECASE)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _line_index_by_id(lines: list[dict[str, Any]]) -> dict[str, int]:
+    return {str(line.get("line_id")): idx for idx, line in enumerate(lines)}
+
+
+def _compact_lines_for_discovery(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "line_id": line.get("line_id"),
+            "text": line.get("text_without_bullet") if line.get("is_bullet") else line.get("text"),
+            "is_bullet": bool(line.get("is_bullet")),
+        }
+        for line in lines
+        if str(line.get("text") or "").strip()
+    ]
+
+
+def _line_windows(
+    lines: list[dict[str, Any]],
+    *,
+    max_window_lines: int,
+    overlap_lines: int,
+) -> list[dict[str, Any]]:
+    if not lines:
+        return []
+
+    max_window_lines = max(20, int(max_window_lines or 120))
+    overlap_lines = max(0, min(int(overlap_lines or 0), max_window_lines - 1))
+    step = max_window_lines - overlap_lines
+    windows: list[dict[str, Any]] = []
+
+    start = 0
+    while start < len(lines):
+        end = min(len(lines), start + max_window_lines)
+        window_lines = lines[start:end]
+        windows.append(
+            {
+                "window_id": f"win_{len(windows) + 1:03d}",
+                "start_line_id": window_lines[0]["line_id"],
+                "end_line_id": window_lines[-1]["line_id"],
+                "lines": window_lines,
+            }
+        )
+        if end >= len(lines):
+            break
+        start += step
+
+    return windows
+
+
+def _normalize_span_type(value: Any) -> str:
+    text = re.sub(r"[^a-z_]+", "_", str(value or "other").strip().lower()).strip("_")
+    aliases = {
+        "experience": "work_experience",
+        "professional_experience": "work_experience",
+        "employment": "work_experience",
+        "employment_history": "work_experience",
+        "work_history": "work_experience",
+        "role": "work_experience",
+        "job": "work_experience",
+        "work_role": "work_experience",
+        "projects": "project",
+        "project_experience": "project",
+        "educational": "education",
+        "academic": "education",
+        "academics": "education",
+        "certifications": "certification",
+        "certificate": "certification",
+        "languages": "language",
+        "technical_skills": "skills",
+        "core_skills": "skills",
+        "profile": "summary",
+        "professional_summary": "summary",
+        "career_summary": "summary",
+        "header": "contact",
+    }
+    text = aliases.get(text, text)
+    return text if text in EVIDENCE_SPAN_TYPES else "other"
+
+
+def _span_sort_key(span: dict[str, Any]) -> tuple[int, int, str]:
+    start_num = _line_number_from_id(span.get("start_line_id")) or 10**9
+    end_num = _line_number_from_id(span.get("end_line_id")) or start_num
+    return (start_num, end_num, str(span.get("span_type") or ""))
+
+
+def _normalize_discovered_spans(
+    payload: dict[str, Any],
+    *,
+    lines: list[dict[str, Any]],
+    window: dict[str, Any] | None = None,
+    min_confidence: float = 0.55,
+) -> list[dict[str, Any]]:
+    raw_spans = payload.get("spans") if isinstance(payload, dict) else None
+    if not isinstance(raw_spans, list):
+        return []
+
+    index_by_id = _line_index_by_id(lines)
+    window_index_by_id = _line_index_by_id(window.get("lines", [])) if window else {}
+    normalized: list[dict[str, Any]] = []
+
+    for raw in raw_spans:
+        if not isinstance(raw, dict):
+            continue
+
+        span_type = _normalize_span_type(raw.get("span_type") or raw.get("type") or raw.get("evidence_type"))
+        if span_type == "other":
+            continue
+
+        start_line_id = str(raw.get("start_line_id") or raw.get("start") or "").strip()
+        end_line_id = str(raw.get("end_line_id") or raw.get("end") or "").strip()
+        if start_line_id not in index_by_id or end_line_id not in index_by_id:
+            continue
+
+        if window_index_by_id:
+            # Ignore hallucinated line IDs outside the current discovery window.
+            if start_line_id not in window_index_by_id or end_line_id not in window_index_by_id:
+                continue
+
+        start_idx = index_by_id[start_line_id]
+        end_idx = index_by_id[end_line_id]
+        if end_idx < start_idx:
+            start_idx, end_idx = end_idx, start_idx
+            start_line_id, end_line_id = end_line_id, start_line_id
+
+        try:
+            confidence = float(raw.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        if confidence < min_confidence:
+            continue
+
+        normalized.append(
+            {
+                "span_id": str(raw.get("span_id") or f"span_{len(normalized) + 1:03d}"),
+                "span_type": span_type,
+                "start_line_id": start_line_id,
+                "end_line_id": end_line_id,
+                "label": str(raw.get("label") or raw.get("section_label") or span_type).strip()[:120],
+                "confidence": confidence,
+                "reason": str(raw.get("reason") or "").strip()[:300],
+                "start_index": start_idx,
+                "end_index": end_idx,
+            }
+        )
+
+    return normalized
+
+
+def _dedupe_discovered_spans(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Prefer higher confidence and longer spans for duplicates/near duplicates.
+    sorted_spans = sorted(
+        spans,
+        key=lambda item: (
+            str(item.get("span_type") or ""),
+            int(item.get("start_index") or 0),
+            int(item.get("end_index") or 0),
+            -float(item.get("confidence") or 0.0),
+        ),
+    )
+    accepted: list[dict[str, Any]] = []
+
+    for span in sorted_spans:
+        span_type = span.get("span_type")
+        start = int(span.get("start_index") or 0)
+        end = int(span.get("end_index") or start)
+        duplicate_index: int | None = None
+
+        for idx, existing in enumerate(accepted):
+            if existing.get("span_type") != span_type:
+                continue
+            existing_start = int(existing.get("start_index") or 0)
+            existing_end = int(existing.get("end_index") or existing_start)
+            overlap = max(0, min(end, existing_end) - max(start, existing_start) + 1)
+            shorter = max(1, min(end - start + 1, existing_end - existing_start + 1))
+            if overlap / shorter >= 0.80:
+                duplicate_index = idx
+                break
+
+        if duplicate_index is None:
+            accepted.append(span)
+            continue
+
+        existing = accepted[duplicate_index]
+        existing_len = int(existing.get("end_index") or 0) - int(existing.get("start_index") or 0)
+        span_len = end - start
+        if (float(span.get("confidence") or 0.0), span_len) > (
+            float(existing.get("confidence") or 0.0),
+            existing_len,
+        ):
+            accepted[duplicate_index] = span
+
+    return sorted(accepted, key=_span_sort_key)
+
+
+def _lines_for_span(lines: list[dict[str, Any]], span: dict[str, Any], *, max_lines: int = 90) -> list[dict[str, Any]]:
+    start = int(span.get("start_index") or 0)
+    end = int(span.get("end_index") or start)
+    selected = lines[start : end + 1]
+    return selected[:max_lines]
+
+
+def _span_to_block(
+    *,
+    lines: list[dict[str, Any]],
+    span: dict[str, Any],
+    block_prefix: str,
+    max_lines: int,
+) -> dict[str, Any]:
+    selected_lines = _lines_for_span(lines, span, max_lines=max_lines)
+    compact_lines = [_compact_line(line) for line in selected_lines]
+    evidence_text = "\n".join(str(line.get("text") or "") for line in selected_lines).strip()
+
+    return {
+        "block_id": f"llm_span_{block_prefix}_{span.get('span_id')}",
+        "source_section": span.get("label") or "LLM_DISCOVERED_SPAN",
+        "canonical_section": span.get("span_type"),
+        "span_type": span.get("span_type"),
+        "span_confidence": span.get("confidence"),
+        "start_line_id": span.get("start_line_id"),
+        "end_line_id": span.get("end_line_id"),
+        "lines": compact_lines,
+        "context_lines": [line for line in compact_lines if not line.get("is_bullet")][:15],
+        "bullets": [line for line in compact_lines if line.get("is_bullet")][:20],
+        "date_ranges": _dedupe_string_list(
+            [date for line in selected_lines for date in (line.get("date_ranges") or [])]
+        ),
+        "has_date_evidence": any(line.get("date_ranges") for line in selected_lines),
+        "field_hints": {},
+        "evidence_text": evidence_text,
+    }
+
+
+def _limit_spans_by_type(spans: list[dict[str, Any]], parser_settings: ParserSettings) -> list[dict[str, Any]]:
+    limits = {
+        "work_experience": parser_settings.max_discovered_experience_spans,
+        "project": parser_settings.max_discovered_project_spans,
+        "education": parser_settings.max_discovered_education_spans,
+        "contact": 4,
+        "summary": 4,
+        "skills": 6,
+        "certification": 6,
+        "language": 4,
+        "achievement": 6,
+    }
+    counts: dict[str, int] = {}
+    result: list[dict[str, Any]] = []
+
+    for span in sorted(spans, key=_span_sort_key):
+        span_type = str(span.get("span_type") or "other")
+        counts[span_type] = counts.get(span_type, 0) + 1
+        if counts[span_type] <= limits.get(span_type, 3):
+            result.append(span)
+
+    return result
 
 def _write_debug_file(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -846,9 +1240,8 @@ def _profile_quality_errors(profile: ResumeProfile, markdown: str) -> list[str]:
 
 def _critical_quality_errors(errors: list[str]) -> list[str]:
     critical_markers = (
+        "The extracted profile is empty/default",
         "WORK EXPERIENCE exists, but experience[] has no role",
-        "WORK EXPERIENCE exists, but current_title is null",
-        "WORK EXPERIENCE exists, but current_company is null",
         "experience[] contains project-like bullets",
         "Resume states total years of experience, but total_experience_years is null",
     )
@@ -1021,9 +1414,18 @@ def _merge_retry_payload(
 
 
 class ResumeExtractor:
-    def __init__(self, settings: LlmSettings, *, max_markdown_chars: int):
+    def __init__(
+        self,
+        settings: LlmSettings,
+        *,
+        parser_settings: ParserSettings | None = None,
+        max_markdown_chars: int | None = None,
+    ):
         self.settings = settings
-        self.max_markdown_chars = max_markdown_chars
+        self.parser_settings = parser_settings or ParserSettings(
+            max_markdown_chars_for_extraction=max_markdown_chars or 24000
+        )
+        self.max_markdown_chars = self.parser_settings.max_markdown_chars_for_extraction
 
     def _build_prompt(
         self,
@@ -1296,7 +1698,1277 @@ RAW_TEXT_BACKUP_END>>>
 
         return ResumeProfile.model_validate(payload)
 
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(2),
+        wait=wait_exponential_jitter(initial=0.5, max=8),
+        retry=retry_if_exception_type((requests.RequestException, TimeoutError)),
+    )
+    def _call_ollama_json(self, prompt: str, *, resume_id: str, stage: str) -> dict[str, Any]:
+        """Call Ollama for one bounded JSON task and keep generation metadata.
+
+        Sectional extraction uses this instead of the legacy text-only call so a
+        failed block can be diagnosed without failing the entire resume blindly.
+        """
+        if len(prompt) > self.parser_settings.max_prompt_chars:
+            raise ValueError(
+                f"Prompt too large for stage={stage}. "
+                f"prompt_chars={len(prompt)}, "
+                f"max_prompt_chars={self.parser_settings.max_prompt_chars}"
+            )
+
+        url = self.settings.base_url.rstrip("/") + "/api/generate"
+        payload = {
+            "model": self.settings.provider,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "options": {
+                "temperature": self.settings.temperature,
+                "num_predict": self.settings.max_tokens,
+                "num_ctx": getattr(self.settings, "num_ctx", 8192),
+            },
+        }
+
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=self.settings.request_timeout_seconds,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        response_text = data.get("response") or ""
+        metadata = {
+            "response_text": response_text,
+            "ollama_done": data.get("done"),
+            "ollama_done_reason": data.get("done_reason"),
+            "prompt_eval_count": data.get("prompt_eval_count"),
+            "eval_count": data.get("eval_count"),
+            "prompt_chars": len(prompt),
+            "response_chars": len(response_text),
+        }
+        _dump_llm_artifact(resume_id=resume_id, stage=f"{stage}_response", payload=metadata)
+
+        if data.get("done_reason") == "length":
+            raise ValueError(
+                f"Ollama hit output limit before valid JSON completed at stage={stage}. "
+                f"prompt_eval_count={data.get('prompt_eval_count')}, "
+                f"eval_count={data.get('eval_count')}"
+            )
+
+        parsed = _extract_json(response_text)
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"LLM did not return valid JSON at stage={stage}. "
+                f"response_preview={response_text[:1000]}"
+            )
+
+        return parsed
+
+    def _prepare_resume_debug_artifacts(
+        self,
+        markdown: str,
+        *,
+        resume_id: str,
+    ) -> tuple[dict[str, Any], list[str]]:
+        debug_paths: list[str] = []
+
+        _dump_temp_extracted_artifact(
+            resume_id=resume_id,
+            stage="00_input_markdown",
+            payload=markdown,
+            extension="md",
+        )
+        clean_lines, segmented_sections = _segment_resume_sections(markdown)
+        _dump_temp_extracted_artifact(
+            resume_id=resume_id,
+            stage="01_clean_lines",
+            payload={"lines": clean_lines},
+        )
+        _dump_temp_extracted_artifact(
+            resume_id=resume_id,
+            stage="02_segmented_sections",
+            payload={"sections": segmented_sections},
+        )
+
+        canonical_resume = _build_canonical_resume_ir(markdown)
+        canonical_debug_path = _dump_llm_artifact(
+            resume_id=resume_id,
+            stage="03_canonical_resume_ir",
+            payload={"canonical_resume": canonical_resume},
+        )
+        if canonical_debug_path:
+            debug_paths.append(canonical_debug_path)
+
+        return canonical_resume, debug_paths
+
+
+    def _build_span_discovery_prompt(self, *, window: dict[str, Any]) -> str:
+        compact_window = {
+            "window_id": window.get("window_id"),
+            "start_line_id": window.get("start_line_id"),
+            "end_line_id": window.get("end_line_id"),
+            "lines": [
+                {
+                    "line_id": line.get("line_id"),
+                    "text": str(line.get("text") or "")[:180],
+                    "is_bullet": bool(line.get("is_bullet")),
+                }
+                for line in window.get("lines", [])
+            ],
+        }
+        output_template = {
+            "spans": [
+                {
+                    "span_id": "EXP_001",
+                    "span_type": "work_experience",
+                    "start_line_id": "L0001",
+                    "end_line_id": "L0018",
+                    "label": "Company / role / section label",
+                    "confidence": 0.0,
+                    "reason": "short reason based on visible lines",
+                }
+            ]
+        }
+        return f"""
+You are a format-agnostic resume evidence-span detector.
+
+Return ONLY valid JSON.
+No markdown.
+No explanations outside JSON.
+
+Task:
+Identify line ranges that contain useful resume evidence. Do NOT extract final profile fields here.
+Return spans only.
+
+Allowed span_type values:
+contact, summary, skills, work_experience, project, education, certification, language, achievement, other
+
+Rules:
+1. Use only line_id values visible in input.lines.
+2. A work_experience span should represent exactly one role/job when possible.
+3. A role may have company/date on one line and title on another line. Include all adjacent lines that belong to the same role.
+4. Include responsibility bullets for the same role until the next role, next section, or unrelated block starts.
+5. Do not require any specific date wording. Treat "Present", "Till Present", "Currently", "Now", open-ended dates, or year ranges as possible role evidence.
+6. Skills tables, two-column lists, comma-separated skills, and category rows should be one or more skills spans.
+7. Project spans should represent one project when possible.
+8. Education spans should represent one degree/institution block when possible.
+9. Use confidence from 0.0 to 1.0. Return only spans with confidence >= 0.55.
+10. Do not create overlapping spans of the same type unless they are different jobs/projects/degrees.
+
+input:
+{json.dumps(compact_window, ensure_ascii=False, separators=(",", ":"))}
+
+JSON output template:
+{json.dumps(output_template, ensure_ascii=False, separators=(",", ":"))}
+""".strip()
+
+    def _discover_evidence_spans(
+        self,
+        *,
+        resume_id: str,
+        lines: list[dict[str, Any]],
+        parse_warnings: list[str],
+    ) -> list[dict[str, Any]]:
+        compact_lines = _compact_lines_for_discovery(lines)
+        windows = _line_windows(
+            compact_lines,
+            max_window_lines=self.parser_settings.max_window_lines,
+            overlap_lines=self.parser_settings.window_overlap_lines,
+        )
+        discovered: list[dict[str, Any]] = []
+
+        for window in windows:
+            stage = f"span_discovery_{window.get('window_id')}"
+            prompt = self._build_span_discovery_prompt(window=window)
+            _dump_llm_artifact(resume_id=resume_id, stage=f"{stage}_prompt", payload={"prompt": prompt})
+            try:
+                payload = self._call_ollama_json(prompt, resume_id=resume_id, stage=stage)
+                window_spans = _normalize_discovered_spans(
+                    payload,
+                    lines=compact_lines,
+                    window=window,
+                    min_confidence=self.parser_settings.min_span_confidence,
+                )
+                discovered.extend(window_spans)
+            except Exception as exc:
+                parse_warnings.append(f"{stage}: evidence span discovery failed: {exc}")
+                if self.parser_settings.fail_on_single_block_error:
+                    raise
+
+        discovered = _limit_spans_by_type(
+            _dedupe_discovered_spans(discovered),
+            self.parser_settings,
+        )
+
+        _dump_llm_artifact(
+            resume_id=resume_id,
+            stage="span_discovery_final_spans",
+            payload={"spans": discovered, "span_count": len(discovered)},
+        )
+        return discovered
+
+    def _build_root_profile_span_prompt(
+        self,
+        *,
+        lines: list[dict[str, Any]],
+        spans: list[dict[str, Any]],
+        markdown: str,
+    ) -> str:
+        root_span_types = {"contact", "summary", "skills", "certification", "language", "achievement"}
+        root_spans = [span for span in spans if span.get("span_type") in root_span_types]
+
+        evidence_blocks = []
+        for span in root_spans[:18]:
+            selected_lines = _lines_for_span(lines, span, max_lines=50)
+            evidence_blocks.append(
+                {
+                    "span_id": span.get("span_id"),
+                    "span_type": span.get("span_type"),
+                    "label": span.get("label"),
+                    "confidence": span.get("confidence"),
+                    "start_line_id": span.get("start_line_id"),
+                    "end_line_id": span.get("end_line_id"),
+                    "text": "\n".join(str(line.get("text") or "") for line in selected_lines)[: self.parser_settings.max_skills_chars],
+                }
+            )
+
+        compact_input = {
+            "header_lines": _compact_lines_for_discovery(lines[:20]),
+            "evidence_spans": evidence_blocks,
+            "basic_signals": _basic_resume_signals(markdown),
+        }
+
+        output_template = {
+            "contact": {
+                "full_name": None,
+                "email": None,
+                "phone": None,
+                "location": None,
+                "linkedin_url": None,
+                "github_url": None,
+                "portfolio_url": None,
+            },
+            "headline": None,
+            "summary": None,
+            "total_experience_years": None,
+            "primary_skills": [],
+            "secondary_skills": [],
+            "tools_and_platforms": [],
+            "programming_languages": [],
+            "domains": [],
+            "certifications": [],
+            "languages": [],
+        }
+
+        return f"""
+You are an enterprise-grade resume parser.
+
+Return ONLY valid JSON.
+No markdown.
+No explanations.
+
+Task:
+Extract root candidate fields from the discovered contact, summary, skills, certification, language, and achievement spans.
+
+Rules:
+1. Do not invent data.
+2. Prefer explicit contact evidence from header/contact spans.
+3. summary must be concise, maximum 700 characters.
+4. total_experience_years must come from explicit evidence such as "7 years" or "5+ years".
+5. Deduplicate all lists.
+6. primary_skills: maximum 35 items.
+7. secondary_skills: maximum 25 items.
+8. tools_and_platforms: maximum 35 items.
+9. programming_languages: maximum 15 items.
+10. domains: maximum 10 items.
+
+input:
+{json.dumps(compact_input, ensure_ascii=False, separators=(",", ":"))}
+
+JSON output template:
+{json.dumps(output_template, ensure_ascii=False, separators=(",", ":"))}
+""".strip()
+
+    def _extract_root_profile_fields_from_spans(
+        self,
+        *,
+        resume_id: str,
+        lines: list[dict[str, Any]],
+        spans: list[dict[str, Any]],
+        markdown: str,
+        canonical_resume: dict[str, Any],
+        parse_warnings: list[str],
+    ) -> dict[str, Any]:
+        prompt = self._build_root_profile_span_prompt(lines=lines, spans=spans, markdown=markdown)
+        _dump_llm_artifact(resume_id=resume_id, stage="evidence_root_profile_prompt", payload={"prompt": prompt})
+        try:
+            return self._call_ollama_json(prompt, resume_id=resume_id, stage="evidence_root_profile")
+        except Exception as exc:
+            parse_warnings.append(f"evidence_root_profile failed; deterministic fallback used: {exc}")
+            return self._fallback_root_profile_fields(markdown=markdown, canonical_resume=canonical_resume)
+
+    def _extract_experience_items_from_spans(
+        self,
+        *,
+        resume_id: str,
+        lines: list[dict[str, Any]],
+        spans: list[dict[str, Any]],
+        parse_warnings: list[str],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        role_spans = [span for span in spans if span.get("span_type") == "work_experience"]
+
+        for index, span in enumerate(role_spans, start=1):
+            stage = f"evidence_experience_{index:03d}"
+            role_block = _span_to_block(
+                lines=lines,
+                span=span,
+                block_prefix="experience",
+                max_lines=90,
+            )
+            try:
+                prompt = self._build_experience_block_prompt(role_block=role_block)
+                _dump_llm_artifact(resume_id=resume_id, stage=f"{stage}_prompt", payload={"prompt": prompt})
+                payload = self._call_ollama_json(prompt, resume_id=resume_id, stage=stage)
+                item = ExperienceItem.model_validate(payload).model_dump(mode="json")
+                if _experience_item_has_content(ExperienceItem.model_validate(item)):
+                    items.append(item)
+                else:
+                    raise ValueError("extracted empty experience item")
+            except Exception as exc:
+                parse_warnings.append(f"{stage}: span extraction failed; fallback attempted: {exc}")
+                if self.parser_settings.fail_on_single_block_error:
+                    raise
+                fallback_item = self._fallback_experience_from_role_block(role_block)
+                if fallback_item:
+                    items.append(fallback_item)
+
+        return items
+
+    def _extract_project_items_from_spans(
+        self,
+        *,
+        resume_id: str,
+        lines: list[dict[str, Any]],
+        spans: list[dict[str, Any]],
+        parse_warnings: list[str],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        project_spans = [span for span in spans if span.get("span_type") == "project"]
+
+        for index, span in enumerate(project_spans, start=1):
+            stage = f"evidence_project_{index:03d}"
+            project_block = _span_to_block(
+                lines=lines,
+                span=span,
+                block_prefix="project",
+                max_lines=70,
+            )
+            try:
+                prompt = self._build_project_block_prompt(project_block=project_block)
+                _dump_llm_artifact(resume_id=resume_id, stage=f"{stage}_prompt", payload={"prompt": prompt})
+                payload = self._call_ollama_json(prompt, resume_id=resume_id, stage=stage)
+                item = ProjectItem.model_validate(payload).model_dump(mode="json")
+                if _project_item_has_content(ProjectItem.model_validate(item)):
+                    items.append(item)
+                else:
+                    raise ValueError("extracted empty project item")
+            except Exception as exc:
+                parse_warnings.append(f"{stage}: span extraction failed; fallback attempted: {exc}")
+                if self.parser_settings.fail_on_single_block_error:
+                    raise
+                fallback_item = self._fallback_project_from_block(project_block)
+                if fallback_item:
+                    items.append(fallback_item)
+
+        return items
+
+    def _extract_education_items_from_spans(
+        self,
+        *,
+        resume_id: str,
+        lines: list[dict[str, Any]],
+        spans: list[dict[str, Any]],
+        parse_warnings: list[str],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        education_spans = [span for span in spans if span.get("span_type") == "education"]
+
+        for index, span in enumerate(education_spans, start=1):
+            stage = f"evidence_education_{index:03d}"
+            education_block = _span_to_block(
+                lines=lines,
+                span=span,
+                block_prefix="education",
+                max_lines=40,
+            )
+            try:
+                prompt = self._build_education_block_prompt(education_block=education_block)
+                _dump_llm_artifact(resume_id=resume_id, stage=f"{stage}_prompt", payload={"prompt": prompt})
+                payload = self._call_ollama_json(prompt, resume_id=resume_id, stage=stage)
+                item = EducationItem.model_validate(payload).model_dump(mode="json")
+                if _education_item_has_content(EducationItem.model_validate(item)):
+                    items.append(item)
+                else:
+                    raise ValueError("extracted empty education item")
+            except Exception as exc:
+                parse_warnings.append(f"{stage}: span extraction failed; fallback attempted: {exc}")
+                if self.parser_settings.fail_on_single_block_error:
+                    raise
+                fallback_item = self._fallback_education_from_block(education_block)
+                if fallback_item:
+                    items.append(fallback_item)
+
+        return items
+
+    def _extract_evidence_span_sectional(
+        self,
+        markdown: str,
+        *,
+        resume_id: str,
+        file_name: str,
+        sha256: str,
+        ocr_markdown_path: str | None,
+    ) -> ResumeProfile:
+        canonical_resume, debug_paths = self._prepare_resume_debug_artifacts(markdown, resume_id=resume_id)
+        parse_warnings: list[str] = []
+        lines = _clean_resume_lines(markdown)
+
+        spans = self._discover_evidence_spans(
+            resume_id=resume_id,
+            lines=lines,
+            parse_warnings=parse_warnings,
+        )
+
+        if not spans and self.parser_settings.enable_sliding_window_fallback:
+            parse_warnings.append("No LLM evidence spans discovered; falling back to legacy sectional parser.")
+            return self._extract_sectional(
+                markdown,
+                resume_id=resume_id,
+                file_name=file_name,
+                sha256=sha256,
+                ocr_markdown_path=ocr_markdown_path,
+            )
+
+        root_payload = self._extract_root_profile_fields_from_spans(
+            resume_id=resume_id,
+            lines=lines,
+            spans=spans,
+            markdown=markdown,
+            canonical_resume=canonical_resume,
+            parse_warnings=parse_warnings,
+        )
+        experience_items = self._extract_experience_items_from_spans(
+            resume_id=resume_id,
+            lines=lines,
+            spans=spans,
+            parse_warnings=parse_warnings,
+        )
+        project_items = self._extract_project_items_from_spans(
+            resume_id=resume_id,
+            lines=lines,
+            spans=spans,
+            parse_warnings=parse_warnings,
+        )
+        education_items = self._extract_education_items_from_spans(
+            resume_id=resume_id,
+            lines=lines,
+            spans=spans,
+            parse_warnings=parse_warnings,
+        )
+
+        # Safety net: if span discovery missed an entire item class, use the
+        # previous canonical section blocks as fallback without making that path
+        # the default. This avoids production hard failures for rare LLM misses.
+        if not experience_items and self.parser_settings.enable_sliding_window_fallback:
+            parse_warnings.append("No experience items extracted from evidence spans; trying legacy role-block fallback.")
+            experience_items = self._extract_experience_items(
+                resume_id=resume_id,
+                canonical_resume=canonical_resume,
+                parse_warnings=parse_warnings,
+            )
+        if not project_items and self.parser_settings.enable_sliding_window_fallback:
+            project_items = self._extract_project_items(
+                resume_id=resume_id,
+                canonical_resume=canonical_resume,
+                parse_warnings=parse_warnings,
+            )
+        if not education_items and self.parser_settings.enable_sliding_window_fallback:
+            education_items = self._extract_education_items(
+                resume_id=resume_id,
+                canonical_resume=canonical_resume,
+                parse_warnings=parse_warnings,
+            )
+
+        final_payload = {
+            "resume_id": resume_id,
+            "source_file_name": file_name,
+            "sha256": sha256,
+            "contact": root_payload.get("contact") or {},
+            "headline": root_payload.get("headline"),
+            "summary": root_payload.get("summary"),
+            "total_experience_years": root_payload.get("total_experience_years"),
+            "current_title": root_payload.get("current_title"),
+            "current_company": root_payload.get("current_company"),
+            "primary_skills": root_payload.get("primary_skills") or [],
+            "secondary_skills": root_payload.get("secondary_skills") or [],
+            "tools_and_platforms": root_payload.get("tools_and_platforms") or [],
+            "programming_languages": root_payload.get("programming_languages") or [],
+            "domains": root_payload.get("domains") or [],
+            "certifications": root_payload.get("certifications") or [],
+            "experience": experience_items,
+            "education": education_items,
+            "projects": project_items,
+            "languages": root_payload.get("languages") or [],
+            "raw_ocr_markdown_path": ocr_markdown_path,
+            "parse_warnings": _dedupe_string_list(parse_warnings),
+            "extraction_quality": {
+                "mode": "evidence_span_sectional",
+                "llm_debug_paths": debug_paths,
+                "document_stats": {
+                    **canonical_resume.get("document_stats", {}),
+                    "discovered_span_count": len(spans),
+                },
+                "span_counts": {
+                    span_type: sum(1 for span in spans if span.get("span_type") == span_type)
+                    for span_type in sorted({str(span.get("span_type")) for span in spans})
+                },
+                "block_counts": {
+                    "experience": len(experience_items),
+                    "projects": len(project_items),
+                    "education": len(education_items),
+                },
+            },
+        }
+        final_payload = self._fill_current_role_from_experience(final_payload)
+
+        profile = self._validate_payload(
+            final_payload,
+            resume_id=resume_id,
+            file_name=file_name,
+            sha256=sha256,
+            ocr_markdown_path=ocr_markdown_path,
+        )
+
+        if not _profile_has_content(profile):
+            quality_errors = ["The extracted profile is empty/default even though OCR/native text is available."]
+        else:
+            quality_errors = _profile_quality_errors(profile, markdown)
+
+        # In evidence-span mode, non-identity completeness problems should not
+        # fail ingestion. Unknown resume formats should complete with warnings.
+        critical_errors = [
+            error
+            for error in _critical_quality_errors(quality_errors)
+            if "empty/default" in error
+        ]
+        non_critical_errors = [error for error in quality_errors if error not in critical_errors]
+
+        if non_critical_errors:
+            final_payload["parse_warnings"] = _dedupe_string_list(
+                [*final_payload.get("parse_warnings", []), *non_critical_errors]
+            )
+
+        if critical_errors:
+            _dump_llm_artifact(
+                resume_id=resume_id,
+                stage="evidence_failed_critical_quality_gate",
+                payload={
+                    "critical_errors": critical_errors,
+                    "quality_errors": quality_errors,
+                    "payload": final_payload,
+                    "spans": spans,
+                },
+            )
+            raise ValueError(
+                "Resume extraction failed critical quality checks in evidence-span mode: "
+                + "; ".join(critical_errors)
+            )
+
+        final_debug_path = _dump_llm_artifact(
+            resume_id=resume_id,
+            stage="evidence_final_payload",
+            payload={"payload": final_payload, "spans": spans},
+        )
+        if final_debug_path:
+            debug_paths.append(final_debug_path)
+            final_payload.setdefault("extraction_quality", {})["llm_debug_paths"] = debug_paths
+
+        return self._validate_payload(
+            final_payload,
+            resume_id=resume_id,
+            file_name=file_name,
+            sha256=sha256,
+            ocr_markdown_path=ocr_markdown_path,
+        )
+
+    def _build_root_profile_prompt(
+        self,
+        *,
+        canonical_resume: dict[str, Any],
+        markdown: str,
+    ) -> str:
+        sections = canonical_resume.get("sections", [])
+        header_lines = canonical_resume.get("header_lines", [])[:20]
+
+        def section_payload(canonical_type: str, *, max_lines: int) -> list[dict[str, Any]]:
+            result: list[dict[str, Any]] = []
+            for section in sections:
+                if section.get("canonical_type") != canonical_type:
+                    continue
+                item = {
+                    "section_id": section.get("section_id"),
+                    "original_heading": section.get("original_heading"),
+                    "line_count": section.get("line_count"),
+                    "lines": section.get("lines", [])[:max_lines],
+                }
+                if canonical_type == "skills":
+                    item["skill_groups"] = section.get("skill_groups", [])[:35]
+                result.append(item)
+            return result
+
+        compact_input = {
+            "header_lines": header_lines,
+            "summary_sections": section_payload("summary", max_lines=25),
+            "skill_sections": section_payload("skills", max_lines=45),
+            "certification_sections": section_payload("certifications", max_lines=25),
+            "language_sections": section_payload("languages", max_lines=20),
+            "basic_signals": _basic_resume_signals(markdown),
+        }
+
+        output_template = {
+            "contact": {
+                "full_name": None,
+                "email": None,
+                "phone": None,
+                "location": None,
+                "linkedin_url": None,
+                "github_url": None,
+                "portfolio_url": None,
+            },
+            "headline": None,
+            "summary": None,
+            "total_experience_years": None,
+            "primary_skills": [],
+            "secondary_skills": [],
+            "tools_and_platforms": [],
+            "programming_languages": [],
+            "domains": [],
+            "certifications": [],
+            "languages": [],
+        }
+
+        return f"""
+You are an enterprise-grade resume parser.
+
+Return ONLY valid JSON.
+No markdown.
+No explanations.
+
+Task:
+Extract root candidate profile fields from header, summary, skills, certification, and language evidence only.
+
+Rules:
+1. Do not invent data.
+2. summary must be concise, maximum 700 characters.
+3. total_experience_years must come from explicit evidence such as "7 years" or "5+ years".
+4. Deduplicate all lists.
+5. primary_skills: maximum 35 items.
+6. secondary_skills: maximum 25 items.
+7. tools_and_platforms: maximum 35 items.
+8. programming_languages: maximum 15 items.
+9. domains: maximum 10 items.
+10. Keep contact.full_name from the visible header/name lines only.
+
+input:
+{json.dumps(compact_input, ensure_ascii=False, separators=(",", ":"))}
+
+JSON output template:
+{json.dumps(output_template, ensure_ascii=False, separators=(",", ":"))}
+""".strip()
+
+    def _build_experience_block_prompt(self, *, role_block: dict[str, Any]) -> str:
+        compact_block = deepcopy(role_block)
+        compact_block["lines"] = compact_block.get("lines", [])[:24]
+        compact_block["context_lines"] = compact_block.get("context_lines", [])[:12]
+        compact_block["bullets"] = compact_block.get("bullets", [])[: self.parser_settings.max_role_bullets_per_prompt]
+        compact_block["evidence_text"] = str(compact_block.get("evidence_text") or "")[: self.parser_settings.max_role_block_chars]
+
+        output_template = {
+            "company": None,
+            "title": None,
+            "location": None,
+            "start_date": None,
+            "end_date": None,
+            "is_current": None,
+            "responsibilities": [],
+            "technologies": [],
+            "evidence": {
+                "source_section": None,
+                "block_id": None,
+                "evidence_text": None,
+            },
+        }
+
+        return f"""
+You are an enterprise-grade resume parser.
+
+Return ONLY valid JSON.
+No markdown.
+No explanations.
+
+Task:
+Extract exactly one work experience item from role_block.
+
+Rules:
+1. Do not invent data.
+2. Use role_block.field_hints first when available.
+3. company, title, dates, and location must come from this role_block only.
+4. responsibilities must come from bullets in this same role_block.
+5. responsibilities: maximum 6 strongest bullets.
+6. technologies: maximum 15 items.
+7. evidence.block_id must equal role_block.block_id.
+8. evidence.source_section must equal role_block.source_section.
+9. evidence.evidence_text must be a short excerpt from this role_block.
+10. If possible_location exists in field_hints, use it as location.
+
+role_block:
+{json.dumps(compact_block, ensure_ascii=False, separators=(",", ":"))}
+
+JSON output template:
+{json.dumps(output_template, ensure_ascii=False, separators=(",", ":"))}
+""".strip()
+
+    def _build_project_block_prompt(self, *, project_block: dict[str, Any]) -> str:
+        compact_block = deepcopy(project_block)
+        compact_block["lines"] = compact_block.get("lines", [])[:30]
+        compact_block["bullets"] = compact_block.get("bullets", [])[:10]
+        compact_block["evidence_text"] = str(compact_block.get("evidence_text") or "")[: self.parser_settings.max_project_block_chars]
+
+        output_template = {
+            "name": None,
+            "description": None,
+            "technologies": [],
+            "url": None,
+            "evidence": {
+                "source_section": None,
+                "block_id": None,
+                "evidence_text": None,
+            },
+        }
+
+        return f"""
+You are an enterprise-grade resume parser.
+
+Return ONLY valid JSON.
+No markdown.
+No explanations.
+
+Task:
+Extract exactly one project item from project_block.
+
+Rules:
+1. Do not invent data.
+2. name must come from a visible title/name line if present.
+3. description must be concise, maximum 250 characters.
+4. technologies: maximum 15 items.
+5. evidence.block_id must equal project_block.block_id.
+6. evidence.source_section must equal project_block.source_section.
+
+project_block:
+{json.dumps(compact_block, ensure_ascii=False, separators=(",", ":"))}
+
+JSON output template:
+{json.dumps(output_template, ensure_ascii=False, separators=(",", ":"))}
+""".strip()
+
+    def _build_education_block_prompt(self, *, education_block: dict[str, Any]) -> str:
+        compact_block = deepcopy(education_block)
+        compact_block["lines"] = compact_block.get("lines", [])[:20]
+        compact_block["evidence_text"] = str(compact_block.get("evidence_text") or "")[: self.parser_settings.max_education_block_chars]
+
+        output_template = {
+            "institution": None,
+            "degree": None,
+            "field_of_study": None,
+            "start_date": None,
+            "end_date": None,
+            "score_or_grade": None,
+            "evidence": {
+                "source_section": None,
+                "block_id": None,
+                "evidence_text": None,
+            },
+        }
+
+        return f"""
+You are an enterprise-grade resume parser.
+
+Return ONLY valid JSON.
+No markdown.
+No explanations.
+
+Task:
+Extract exactly one education item from education_block.
+
+Rules:
+1. Do not invent data.
+2. Use null for missing dates or grades.
+3. evidence.block_id must equal education_block.block_id.
+4. evidence.source_section must equal education_block.source_section.
+
+education_block:
+{json.dumps(compact_block, ensure_ascii=False, separators=(",", ":"))}
+
+JSON output template:
+{json.dumps(output_template, ensure_ascii=False, separators=(",", ":"))}
+""".strip()
+
+    def _fallback_root_profile_fields(
+        self,
+        *,
+        markdown: str,
+        canonical_resume: dict[str, Any],
+    ) -> dict[str, Any]:
+        signals = _basic_resume_signals(markdown)
+        first_lines = signals.get("first_non_empty_lines") or []
+        full_name = None
+        headline = None
+
+        for line in first_lines:
+            text = str(line).strip()
+            if not text or "@" in text or re.search(r"\d{3}[-.\s]?\d{3}[-.\s]?\d{4}", text):
+                continue
+            if full_name is None:
+                full_name = text[:120]
+            elif headline is None:
+                headline = text[:160]
+                break
+
+        years_match = re.search(r"(?:over|more than|around|approximately)?\s*(\d{1,2}(?:\.\d+)?)\+?\s+years", markdown, flags=re.IGNORECASE)
+
+        skills: list[str] = []
+        for section in canonical_resume.get("sections", []):
+            if section.get("canonical_type") != "skills":
+                continue
+            for group in section.get("skill_groups", []):
+                values_text = str(group.get("values_text") or "")
+                skills.extend(part.strip() for part in re.split(r"[,;|]", values_text) if part.strip())
+
+        return {
+            "contact": {
+                "full_name": full_name,
+                "email": signals.get("detected_email"),
+                "phone": signals.get("detected_phone"),
+                "location": None,
+                "linkedin_url": None,
+                "github_url": None,
+                "portfolio_url": None,
+            },
+            "headline": headline,
+            "summary": None,
+            "total_experience_years": float(years_match.group(1)) if years_match else None,
+            "primary_skills": _dedupe_string_list(skills[:35]),
+            "secondary_skills": [],
+            "tools_and_platforms": [],
+            "programming_languages": [],
+            "domains": [],
+            "certifications": [],
+            "languages": [],
+        }
+
+    def _extract_root_profile_fields(
+        self,
+        *,
+        resume_id: str,
+        canonical_resume: dict[str, Any],
+        markdown: str,
+        parse_warnings: list[str],
+    ) -> dict[str, Any]:
+        prompt = self._build_root_profile_prompt(canonical_resume=canonical_resume, markdown=markdown)
+        _dump_llm_artifact(resume_id=resume_id, stage="sectional_root_profile_prompt", payload={"prompt": prompt})
+
+        try:
+            return self._call_ollama_json(prompt, resume_id=resume_id, stage="sectional_root_profile")
+        except Exception as exc:
+            parse_warnings.append(f"sectional_root_profile failed; deterministic fallback used: {exc}")
+            return self._fallback_root_profile_fields(markdown=markdown, canonical_resume=canonical_resume)
+
+    def _fallback_experience_from_role_block(self, role_block: dict[str, Any]) -> dict[str, Any] | None:
+        hints = role_block.get("field_hints") or {}
+        evidence_text = str(role_block.get("evidence_text") or "").strip()
+
+        company = hints.get("possible_company")
+        title = hints.get("possible_title")
+        start_date = hints.get("possible_start_date")
+        end_date = hints.get("possible_end_date")
+        is_current = hints.get("possible_is_current")
+        location = hints.get("possible_location")
+
+        if not any([company, title, start_date, end_date, is_current]):
+            return None
+
+        return {
+            "company": company,
+            "title": title,
+            "location": location,
+            "start_date": start_date,
+            "end_date": end_date,
+            "is_current": is_current,
+            "responsibilities": [],
+            "technologies": [],
+            "evidence": {
+                "source_section": role_block.get("source_section"),
+                "block_id": role_block.get("block_id"),
+                "evidence_text": evidence_text[:1000],
+            },
+        }
+
+    def _fallback_project_from_block(self, project_block: dict[str, Any]) -> dict[str, Any] | None:
+        evidence_text = str(project_block.get("evidence_text") or "").strip()
+        if not evidence_text:
+            return None
+
+        first_line = evidence_text.splitlines()[0].strip()
+        name = re.sub(r"^(title|project|project title|name)\s*:\s*", "", first_line, flags=re.IGNORECASE).strip()
+        if not name:
+            return None
+
+        description_lines = [line.strip() for line in evidence_text.splitlines()[1:4] if line.strip()]
+        return {
+            "name": name[:180],
+            "description": " ".join(description_lines)[:250] or None,
+            "technologies": [],
+            "url": None,
+            "evidence": {
+                "source_section": project_block.get("source_section"),
+                "block_id": project_block.get("block_id"),
+                "evidence_text": evidence_text[:1000],
+            },
+        }
+
+    def _fallback_education_from_block(self, education_block: dict[str, Any]) -> dict[str, Any] | None:
+        evidence_text = str(education_block.get("evidence_text") or "").strip()
+        if not evidence_text:
+            return None
+
+        lines = [line.strip(" •❖-\t") for line in evidence_text.splitlines() if line.strip()]
+        if not lines:
+            return None
+
+        degree = None
+        institution = None
+        for line in lines:
+            if re.search(r"\b(B\.?Tech|M\.?Tech|Bachelor|Master|MBA|B\.S\.|M\.S\.|Ph\.?D|degree)\b", line, flags=re.IGNORECASE):
+                degree = degree or line
+            elif institution is None:
+                institution = line
+
+        return {
+            "institution": institution,
+            "degree": degree,
+            "field_of_study": None,
+            "start_date": None,
+            "end_date": None,
+            "score_or_grade": None,
+            "evidence": {
+                "source_section": education_block.get("source_section"),
+                "block_id": education_block.get("block_id"),
+                "evidence_text": evidence_text[:1000],
+            },
+        }
+
+    def _extract_experience_items(
+        self,
+        *,
+        resume_id: str,
+        canonical_resume: dict[str, Any],
+        parse_warnings: list[str],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        role_blocks = [
+            role_block
+            for section in canonical_resume.get("sections", [])
+            if section.get("canonical_type") == "work_experience"
+            for role_block in section.get("role_blocks", [])
+        ]
+
+        for index, role_block in enumerate(role_blocks, start=1):
+            stage = f"sectional_experience_{index:03d}"
+            try:
+                prompt = self._build_experience_block_prompt(role_block=role_block)
+                _dump_llm_artifact(resume_id=resume_id, stage=f"{stage}_prompt", payload={"prompt": prompt})
+                payload = self._call_ollama_json(prompt, resume_id=resume_id, stage=stage)
+                item = ExperienceItem.model_validate(payload).model_dump(mode="json")
+                if _dict_experience_has_core_fields(item):
+                    items.append(item)
+                elif _experience_item_has_content(ExperienceItem.model_validate(item)):
+                    parse_warnings.append(f"{stage}: extracted item is missing company/title/date core fields.")
+                    items.append(item)
+                else:
+                    raise ValueError("extracted empty experience item")
+            except Exception as exc:
+                parse_warnings.append(f"{stage}: failed; fallback attempted: {exc}")
+                if self.parser_settings.fail_on_single_block_error:
+                    raise
+                fallback_item = self._fallback_experience_from_role_block(role_block)
+                if fallback_item:
+                    items.append(fallback_item)
+                else:
+                    parse_warnings.append(f"{stage}: no deterministic fallback was possible.")
+
+        return items
+
+    def _extract_project_items(
+        self,
+        *,
+        resume_id: str,
+        canonical_resume: dict[str, Any],
+        parse_warnings: list[str],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        project_blocks = [
+            project_block
+            for section in canonical_resume.get("sections", [])
+            if section.get("canonical_type") == "projects"
+            for project_block in section.get("project_blocks", [])
+        ][:8]
+
+        for index, project_block in enumerate(project_blocks, start=1):
+            stage = f"sectional_project_{index:03d}"
+            try:
+                prompt = self._build_project_block_prompt(project_block=project_block)
+                _dump_llm_artifact(resume_id=resume_id, stage=f"{stage}_prompt", payload={"prompt": prompt})
+                payload = self._call_ollama_json(prompt, resume_id=resume_id, stage=stage)
+                item = ProjectItem.model_validate(payload).model_dump(mode="json")
+                if _project_item_has_content(ProjectItem.model_validate(item)):
+                    items.append(item)
+                else:
+                    raise ValueError("extracted empty project item")
+            except Exception as exc:
+                parse_warnings.append(f"{stage}: failed; fallback attempted: {exc}")
+                if self.parser_settings.fail_on_single_block_error:
+                    raise
+                fallback_item = self._fallback_project_from_block(project_block)
+                if fallback_item:
+                    items.append(fallback_item)
+
+        return items
+
+    def _extract_education_items(
+        self,
+        *,
+        resume_id: str,
+        canonical_resume: dict[str, Any],
+        parse_warnings: list[str],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        education_blocks = [
+            education_block
+            for section in canonical_resume.get("sections", [])
+            if section.get("canonical_type") == "education"
+            for education_block in section.get("education_blocks", [])
+        ][:12]
+
+        for index, education_block in enumerate(education_blocks, start=1):
+            stage = f"sectional_education_{index:03d}"
+            try:
+                prompt = self._build_education_block_prompt(education_block=education_block)
+                _dump_llm_artifact(resume_id=resume_id, stage=f"{stage}_prompt", payload={"prompt": prompt})
+                payload = self._call_ollama_json(prompt, resume_id=resume_id, stage=stage)
+                item = EducationItem.model_validate(payload).model_dump(mode="json")
+                if _education_item_has_content(EducationItem.model_validate(item)):
+                    items.append(item)
+                else:
+                    raise ValueError("extracted empty education item")
+            except Exception as exc:
+                parse_warnings.append(f"{stage}: failed; fallback attempted: {exc}")
+                if self.parser_settings.fail_on_single_block_error:
+                    raise
+                fallback_item = self._fallback_education_from_block(education_block)
+                if fallback_item:
+                    items.append(fallback_item)
+
+        return items
+
+    def _fill_current_role_from_experience(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("current_title") and payload.get("current_company"):
+            return payload
+
+        experience = payload.get("experience") or []
+        current_roles = [
+            item
+            for item in experience
+            if item.get("is_current") is True or str(item.get("end_date") or "").strip().lower() == "present"
+        ]
+        selected = current_roles[0] if current_roles else experience[0] if experience else None
+
+        if selected:
+            payload["current_title"] = payload.get("current_title") or selected.get("title")
+            payload["current_company"] = payload.get("current_company") or selected.get("company")
+
+        return payload
+
+    def _extract_sectional(
+        self,
+        markdown: str,
+        *,
+        resume_id: str,
+        file_name: str,
+        sha256: str,
+        ocr_markdown_path: str | None,
+    ) -> ResumeProfile:
+        canonical_resume, debug_paths = self._prepare_resume_debug_artifacts(markdown, resume_id=resume_id)
+        parse_warnings: list[str] = []
+
+        root_payload = self._extract_root_profile_fields(
+            resume_id=resume_id,
+            canonical_resume=canonical_resume,
+            markdown=markdown,
+            parse_warnings=parse_warnings,
+        )
+        experience_items = self._extract_experience_items(
+            resume_id=resume_id,
+            canonical_resume=canonical_resume,
+            parse_warnings=parse_warnings,
+        )
+        project_items = self._extract_project_items(
+            resume_id=resume_id,
+            canonical_resume=canonical_resume,
+            parse_warnings=parse_warnings,
+        )
+        education_items = self._extract_education_items(
+            resume_id=resume_id,
+            canonical_resume=canonical_resume,
+            parse_warnings=parse_warnings,
+        )
+
+        final_payload = {
+            "resume_id": resume_id,
+            "source_file_name": file_name,
+            "sha256": sha256,
+            "contact": root_payload.get("contact") or {},
+            "headline": root_payload.get("headline"),
+            "summary": root_payload.get("summary"),
+            "total_experience_years": root_payload.get("total_experience_years"),
+            "current_title": root_payload.get("current_title"),
+            "current_company": root_payload.get("current_company"),
+            "primary_skills": root_payload.get("primary_skills") or [],
+            "secondary_skills": root_payload.get("secondary_skills") or [],
+            "tools_and_platforms": root_payload.get("tools_and_platforms") or [],
+            "programming_languages": root_payload.get("programming_languages") or [],
+            "domains": root_payload.get("domains") or [],
+            "certifications": root_payload.get("certifications") or [],
+            "experience": experience_items,
+            "education": education_items,
+            "projects": project_items,
+            "languages": root_payload.get("languages") or [],
+            "raw_ocr_markdown_path": ocr_markdown_path,
+            "parse_warnings": _dedupe_string_list(parse_warnings),
+            "extraction_quality": {
+                "mode": "sectional",
+                "llm_debug_paths": debug_paths,
+                "document_stats": canonical_resume.get("document_stats", {}),
+                "block_counts": {
+                    "experience": len(experience_items),
+                    "projects": len(project_items),
+                    "education": len(education_items),
+                },
+            },
+        }
+        final_payload = self._fill_current_role_from_experience(final_payload)
+
+        profile = self._validate_payload(
+            final_payload,
+            resume_id=resume_id,
+            file_name=file_name,
+            sha256=sha256,
+            ocr_markdown_path=ocr_markdown_path,
+        )
+
+        if not _profile_has_content(profile):
+            quality_errors = ["The extracted profile is empty/default even though OCR/native text is available."]
+        else:
+            quality_errors = _profile_quality_errors(profile, markdown)
+
+        critical_errors = _critical_quality_errors(quality_errors)
+        non_critical_errors = [error for error in quality_errors if error not in critical_errors]
+
+        if non_critical_errors:
+            final_payload["parse_warnings"] = _dedupe_string_list(
+                [*final_payload.get("parse_warnings", []), *non_critical_errors]
+            )
+
+        if critical_errors:
+            _dump_llm_artifact(
+                resume_id=resume_id,
+                stage="sectional_failed_critical_quality_gate",
+                payload={
+                    "critical_errors": critical_errors,
+                    "quality_errors": quality_errors,
+                    "payload": final_payload,
+                },
+            )
+            raise ValueError(
+                "Resume extraction failed critical quality checks in sectional mode: "
+                + "; ".join(critical_errors)
+            )
+
+        final_debug_path = _dump_llm_artifact(
+            resume_id=resume_id,
+            stage="sectional_final_payload",
+            payload={"payload": final_payload},
+        )
+        if final_debug_path:
+            debug_paths.append(final_debug_path)
+            final_payload.setdefault("extraction_quality", {})["llm_debug_paths"] = debug_paths
+
+        return self._validate_payload(
+            final_payload,
+            resume_id=resume_id,
+            file_name=file_name,
+            sha256=sha256,
+            ocr_markdown_path=ocr_markdown_path,
+        )
+
     def extract(
+        self,
+        markdown: str,
+        *,
+        resume_id: str,
+        file_name: str,
+        sha256: str,
+        ocr_markdown_path: str | None,
+    ) -> ResumeProfile:
+        if self.parser_settings.extraction_mode == "monolithic":
+            return self._extract_monolithic(
+                markdown,
+                resume_id=resume_id,
+                file_name=file_name,
+                sha256=sha256,
+                ocr_markdown_path=ocr_markdown_path,
+            )
+
+        if self.parser_settings.extraction_mode == "sectional":
+            return self._extract_sectional(
+                markdown,
+                resume_id=resume_id,
+                file_name=file_name,
+                sha256=sha256,
+                ocr_markdown_path=ocr_markdown_path,
+            )
+
+        return self._extract_evidence_span_sectional(
+            markdown,
+            resume_id=resume_id,
+            file_name=file_name,
+            sha256=sha256,
+            ocr_markdown_path=ocr_markdown_path,
+        )
+
+    def _extract_monolithic(
         self,
         markdown: str,
         *,

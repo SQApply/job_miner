@@ -25,7 +25,41 @@ llm:
 parser:
   enabled: true
   min_markdown_chars: 200
+
+  # Use bounded section/block extraction for every resume. Page count is not a
+  # reliable routing signal; this mode works for both compact two-page resumes
+  # and dense multi-page resumes.
+  extraction_mode: "evidence_span_sectional"
+
+  # Legacy monolithic limit retained for debug fallback only.
   max_markdown_chars_for_extraction: 24000
+
+  # Per-call limits for sectional extraction. The parser processes the whole
+  # resume by splitting it into bounded evidence blocks instead of truncating the
+  # resume globally.
+  max_prompt_chars: 24000
+  max_role_block_chars: 6000
+  max_project_block_chars: 5000
+  max_education_block_chars: 3000
+  max_summary_chars: 3000
+  max_skills_chars: 5000
+  max_llm_retries_per_block: 2
+  max_role_bullets_per_prompt: 10
+  fail_on_single_block_error: false
+
+  # LLM-based evidence-span discovery. This avoids hardcoding resume formats
+  # such as company/date line + title line, title first, tables, DOCX paragraphs,
+  # or unusual date wording. The LLM first discovers line ranges and then each
+  # bounded range is parsed independently.
+  max_window_lines: 80
+  window_overlap_lines: 15
+  min_span_confidence: 0.55
+  max_discovered_experience_spans: 30
+  max_discovered_project_spans: 20
+  max_discovered_education_spans: 12
+  enable_sliding_window_fallback: true
+  require_current_title: false
+  require_current_company: false
 
 output:
   dir: "data/resumes/processed"

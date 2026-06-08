@@ -255,13 +255,35 @@ def list_candidate_recommendations(candidate_id: str, source: str = "llm", limit
             .limit(limit)
         )
 
+    cleaned_rows = [_clean_doc(row) or {} for row in rows]
+    job_ids = sorted({str(row.get("job_id")) for row in cleaned_rows if row.get("job_id")})
+    jobs_by_id: dict[str, dict[str, Any]] = {}
+
+    if job_ids:
+        job_query = {"$and": [_candidate_visible_job_filter(), {"job_id": {"$in": job_ids}}]}
+        for job_doc in db[MongoCollections.JOBS_CURRENT].find(job_query, _job_catalog_projection()):
+            clean_job = _clean_doc(job_doc) or {}
+            job_id = str(clean_job.get("job_id") or "")
+            if job_id:
+                jobs_by_id[job_id] = _job_snapshot(clean_job)
+
     out: list[dict[str, Any]] = []
-    for row in rows:
-        row = _clean_doc(row) or {}
-        job_id = row.get("job_id")
-        job = _clean_doc(db[MongoCollections.JOBS_CURRENT].find_one({"job_id": job_id})) if job_id else None
-        if job:
-            row["job"] = job
+    for row in cleaned_rows:
+        job_id = str(row.get("job_id") or "")
+        job = jobs_by_id.get(job_id)
+
+        if not job and isinstance(row.get("job_snapshot"), dict):
+            snapshot = _job_snapshot(row["job_snapshot"])
+            if _is_candidate_visible_job(snapshot):
+                job = snapshot
+
+        # Defensive guard: recommendation rows can outlive source jobs or point
+        # to raw/invalid jobs. Do not leak bad records into candidate-facing UI.
+        if not job or not _is_candidate_visible_job(job):
+            continue
+
+        row["job"] = job
+        row.setdefault("job_snapshot", job)
         row["source_collection"] = collection
         out.append(row)
     return out
@@ -295,6 +317,56 @@ def _job_catalog_projection() -> dict[str, int]:
         "validation_status": 1,
     }
     
+def _job_snapshot(job: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact, normalized job object safe for candidate-facing UI."""
+    title = str(job.get("title") or job.get("job_title") or "").strip()
+    company = str(job.get("company") or job.get("company_name") or job.get("employer") or "").strip()
+    location_text = str(job.get("location_text") or job.get("location") or "").strip()
+    apply_url = job.get("apply_url") or job.get("job_url") or job.get("source_url") or job.get("url")
+
+    return {
+        "job_id": job.get("job_id"),
+        "title": title,
+        "company": company,
+        "location_text": location_text,
+        "apply_url": apply_url,
+        "job_url": job.get("job_url"),
+        "source_url": job.get("source_url"),
+        "url": job.get("url"),
+        "description": job.get("description"),
+        "summary": job.get("summary"),
+        "required_skills": job.get("required_skills") or [],
+        "preferred_skills": job.get("preferred_skills") or [],
+        "skills": job.get("skills") or [],
+        "employment_type": job.get("employment_type"),
+        "posted_at": job.get("posted_at"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+    }
+
+
+def _is_candidate_visible_job(job: dict[str, Any] | None) -> bool:
+    if not job:
+        return False
+
+    title = str(job.get("title") or job.get("job_title") or "").strip()
+    company = str(job.get("company") or job.get("company_name") or job.get("employer") or "").strip()
+    apply_url = job.get("apply_url") or job.get("job_url") or job.get("source_url") or job.get("url")
+    validation_status = str(job.get("validation_status") or "").strip().lower()
+
+    if job.get("catalog_visible") is False:
+        return False
+    if validation_status in {"invalid", "invalid_missing_title", "invalid_missing_company", "invalid_missing_url"}:
+        return False
+    if not title or title.lower() in {"untitled job", "n/a", "na", "none", "null", "unknown"}:
+        return False
+    if not company:
+        return False
+    if not str(apply_url or "").strip():
+        return False
+    return True
+
+
 def _candidate_visible_job_filter() -> dict[str, Any]:
     """Return Mongo filter for jobs that are safe to show in candidate-facing views.
 
@@ -386,9 +458,11 @@ def list_all_jobs_catalog(*, limit: int = 50, offset: int = 0, q: str | None = N
 
     jobs: list[dict[str, Any]] = []
     for row in rows:
-        job = _clean_doc(row) or {}
+        raw_job = _clean_doc(row) or {}
+        job = _job_snapshot(raw_job)
+        if not _is_candidate_visible_job({**raw_job, **job}):
+            continue
         job["source_collection"] = MongoCollections.JOBS_CURRENT
-        job["apply_url"] = job.get("apply_url") or job.get("job_url") or job.get("source_url") or job.get("url")
         jobs.append(job)
 
     next_offset = safe_offset + safe_limit if safe_offset + safe_limit < total else None

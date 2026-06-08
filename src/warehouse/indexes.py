@@ -143,6 +143,16 @@ INDEXES: dict[str, list[IndexModel]] = {
     "candidate_tower_records": [IndexModel([("candidate_id", ASCENDING)], unique=True), IndexModel([("resume_id", ASCENDING)], unique=True), IndexModel([("embedding_status", ASCENDING)])],
     "qdrant_index_state": [IndexModel([("index_id", ASCENDING)], unique=True), IndexModel([("record_type", ASCENDING), ("record_id", ASCENDING), ("embedding_model", ASCENDING)], unique=True)],
     "candidate_job_matches": [IndexModel([("match_run_id", ASCENDING)]), IndexModel([("candidate_id", ASCENDING), ("rank", ASCENDING)]), IndexModel([("candidate_id", ASCENDING), ("job_id", ASCENDING), ("match_run_id", ASCENDING)], unique=True)],
+    "candidate_job_matches_llm_reranked": [
+        IndexModel([("match_run_id", ASCENDING)]),
+        IndexModel([("candidate_id", ASCENDING), ("match_run_id", ASCENDING), ("final_rank", ASCENDING)]),
+        IndexModel([("candidate_id", ASCENDING), ("job_id", ASCENDING), ("match_run_id", ASCENDING)], unique=True),
+        IndexModel([("candidate_id", ASCENDING), ("evidence.reranker_status", ASCENDING), ("match_run_id", ASCENDING), ("final_rank", ASCENDING)]),
+    ],
+    "candidate_profile_edit_events": [
+        IndexModel([("candidate_id", ASCENDING), ("created_at", ASCENDING)]),
+        IndexModel([("edit_id", ASCENDING)], unique=True),
+    ],
 }
 
 

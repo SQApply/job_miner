@@ -36,7 +36,40 @@ class LlmSettings(BaseModel):
 class ParserSettings(BaseModel):
     enabled: bool = True
     min_markdown_chars: int = 200
+
+    # Backward-compatible limit used by the legacy monolithic extractor.
+    # The production extractor below uses bounded section/block prompts instead
+    # of truncating the full resume.
     max_markdown_chars_for_extraction: int = 24000
+
+    # Production resume extraction mode. Use sectional for all resumes, small or
+    # large. Keep monolithic only for debugging/backward compatibility.
+    extraction_mode: Literal["evidence_span_sectional", "sectional", "monolithic"] = "evidence_span_sectional"
+
+    # Hard guardrails for individual LLM calls. These limits are per prompt, not
+    # per resume, so long resumes are handled by splitting into bounded blocks.
+    max_prompt_chars: int = 24000
+    max_role_block_chars: int = 6000
+    max_project_block_chars: int = 5000
+    max_education_block_chars: int = 3000
+    max_summary_chars: int = 3000
+    max_skills_chars: int = 5000
+    max_llm_retries_per_block: int = 2
+    max_role_bullets_per_prompt: int = 10
+    fail_on_single_block_error: bool = False
+
+    # Format-agnostic evidence-span discovery controls. This is the default
+    # production path: first discover line ranges for contact, summary, skills,
+    # experience, projects, and education; then extract each bounded span.
+    max_window_lines: int = 80
+    window_overlap_lines: int = 15
+    min_span_confidence: float = 0.55
+    max_discovered_experience_spans: int = 30
+    max_discovered_project_spans: int = 20
+    max_discovered_education_spans: int = 12
+    enable_sliding_window_fallback: bool = True
+    require_current_title: bool = False
+    require_current_company: bool = False
 
 
 class OutputSettings(BaseModel):

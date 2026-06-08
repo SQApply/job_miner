@@ -42,6 +42,25 @@ def skills(record: dict[str, Any]) -> set[str]:
     return {x for x in out if x}
 
 
+
+def job_snapshot(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": job.get("job_id"),
+        "title": job.get("title") or job.get("job_title"),
+        "company": job.get("company") or job.get("company_name") or job.get("employer"),
+        "location_text": job.get("location_text") or job.get("location"),
+        "job_url": job.get("job_url"),
+        "apply_url": job.get("apply_url") or job.get("job_url") or job.get("source_url") or job.get("url"),
+        "source_url": job.get("source_url"),
+        "url": job.get("url"),
+        "description": job.get("description"),
+        "summary": job.get("summary"),
+        "required_skills": job.get("required_skills") or [],
+        "preferred_skills": job.get("preferred_skills") or [],
+        "skills": job.get("skills") or [],
+        "employment_type": job.get("employment_type"),
+    }
+
 def location_score(c: str | None, j: str | None) -> float:
     if not c or not j: return 0.0
     c = c.lower(); j = j.lower()
@@ -84,7 +103,8 @@ def match_candidates_from_mongo(
             jskills = skills(job); matched = sorted(cskills & jskills); loc = location_score(cand.get("location"), job.get("location_text"))
             skill_score = len(matched) / max(1, len(jskills)) if jskills else 0.0
             score = round(0.82 * r.score + 0.13 * min(1.0, skill_score) + 0.05 * loc, 6)
-            row = {"match_run_id": run_id, "candidate_id": cand.get("candidate_id"), "resume_id": cand.get("resume_id"), "candidate_name": cand.get("full_name"), "rank": rank, "job_id": job_id, "title": job.get("title"), "company": job.get("company"), "location_text": job.get("location_text"), "job_url": job.get("job_url"), "apply_url": job.get("apply_url"), "score": score, "vector_score": round(r.score, 6), "evidence": {"matched_skills": matched, "candidate_location": cand.get("location"), "job_location": job.get("location_text"), "location_match_score": round(loc, 4), "skill_overlap_score": round(skill_score, 4)}}
+            snapshot = job_snapshot(job)
+            row = {"match_run_id": run_id, "candidate_id": cand.get("candidate_id"), "resume_id": cand.get("resume_id"), "candidate_name": cand.get("full_name"), "rank": rank, "job_id": job_id, "title": snapshot.get("title"), "company": snapshot.get("company"), "location_text": snapshot.get("location_text"), "job_url": snapshot.get("job_url"), "apply_url": snapshot.get("apply_url"), "job_snapshot": snapshot, "score": score, "vector_score": round(r.score, 6), "evidence": {"matched_skills": matched, "candidate_location": cand.get("location"), "job_location": snapshot.get("location_text"), "location_match_score": round(loc, 4), "skill_overlap_score": round(skill_score, 4)}}
             matches.append(row); flat.append(row); docs.append(CandidateJobMatchDocument(_id=f"{run_id}:{cand.get('candidate_id')}:{job_id}", **row))
         grouped.append({"candidate_id": cand.get("candidate_id"), "resume_id": cand.get("resume_id"), "candidate_name": cand.get("full_name"), "top_n": top_n, "matches": matches})
     repo.upsert_matches(docs)
