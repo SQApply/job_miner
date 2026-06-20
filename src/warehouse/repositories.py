@@ -19,6 +19,7 @@ from .documents import (
     WarehouseRunSessionDocument,
 )
 from .hashing import make_candidate_id, make_job_id, make_resume_id_from_sha, stable_hash
+from .job_dates import parse_job_posted_at
 from .serializers import as_str_list, to_plain_data
 from .skill_utils import build_canonical_candidate_skills, unique_skills
 
@@ -82,7 +83,12 @@ class WarehouseRepository:
         payload = to_plain_data(job_payload)
 
         job_id = make_job_id(payload, target_id=target_id)
-        content_hash = stable_hash(payload)
+        # Portal freshness strings (for example, "3 days ago") change on every
+        # crawl even when the job itself has not changed. Keep them out of the
+        # version/history hash while still persisting them on the current record.
+        content_hash_payload = dict(payload)
+        content_hash_payload.pop("posted_date", None)
+        content_hash = stable_hash(content_hash_payload)
         now = utc_now()
 
         existing = self.db[JobCurrentDocument.collection_name].find_one(
@@ -102,6 +108,13 @@ class WarehouseRepository:
             or payload.get("url")
         )
 
+        posted_date = str(payload.get("posted_date") or "").strip() or None
+        parsed_posted_at = parse_job_posted_at(posted_date, reference_time=now) if posted_date else None
+        # A missing/unparseable date on a later crawl must not erase a date that
+        # was successfully captured in an earlier crawl of the same job.
+        effective_posted_date = posted_date or (existing or {}).get("posted_date")
+        effective_posted_at = parsed_posted_at or (existing or {}).get("posted_at")
+
         doc = JobCurrentDocument(
             _id=job_id,
             job_id=job_id,
@@ -116,6 +129,8 @@ class WarehouseRepository:
             duration=payload.get("duration"),
             compensation_text=payload.get("compensation_text")
             or payload.get("salary_text"),
+            posted_date=effective_posted_date,
+            posted_at=effective_posted_at,
             summary=payload.get("summary") or payload.get("description"),
             responsibilities=as_str_list(payload.get("responsibilities")),
             required_skills=as_str_list(payload.get("required_skills")),

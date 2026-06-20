@@ -11,7 +11,7 @@ from ..common.env import load_runtime_env
 
 load_runtime_env()
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
@@ -494,9 +494,33 @@ def my_recommendation_status(user: dict[str, Any] = Depends(require_permission("
 
 
 @app.get("/me/jobs/all")
-def my_all_jobs_catalog(q: str | None = None, limit: int = 50, offset: int = 0, user: dict[str, Any] = Depends(require_permission("recommendations.view_self"))) -> dict[str, Any]:
+def my_all_jobs_catalog(
+    q: str | None = None,
+    freshness: str | None = None,
+    work_modes: list[str] = Query(default=[]),
+    employment_types: list[str] = Query(default=[]),
+    locations: list[str] = Query(default=[]),
+    companies: list[str] = Query(default=[]),
+    skills: list[str] = Query(default=[]),
+    sort: str = "newest",
+    limit: int = 50,
+    offset: int = 0,
+    user: dict[str, Any] = Depends(require_permission("recommendations.view_self")),
+) -> dict[str, Any]:
+    """Browse the candidate-facing job catalog with dynamic facets and freshness filters."""
     link = _require_candidate_link(user)
-    catalog = list_all_jobs_catalog(limit=limit, offset=offset, q=q)
+    catalog = list_all_jobs_catalog(
+        limit=limit,
+        offset=offset,
+        q=q,
+        freshness=freshness,
+        work_modes=work_modes,
+        employment_types=employment_types,
+        locations=locations,
+        companies=companies,
+        skills=skills,
+        sort=sort,
+    )
     return {"candidate_id": link["candidate_id"], **catalog}
 
 

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { api } from './lib/api';
 import { getToken, initKeycloak, logout } from './lib/keycloak';
@@ -294,87 +294,382 @@ function RecommendationCard({ item, onAction, onFeedback }) {
   </article>;
 }
 
+function createEmptyCatalogFilters() {
+  return {
+    freshness: '',
+    work_modes: [],
+    employment_types: [],
+    locations: [],
+    companies: [],
+    skills: [],
+  };
+}
+
+function selectedCatalogFacetOptions(options = [], selectedValues = []) {
+  const visible = Array.isArray(options) ? [...options] : [];
+  const knownValues = new Set(visible.map((option) => String(option?.value || '').toLocaleLowerCase()));
+  for (const selectedValue of selectedValues || []) {
+    const value = String(selectedValue || '').trim();
+    if (!value || knownValues.has(value.toLocaleLowerCase())) continue;
+    visible.push({ value, label: value, count: 0 });
+  }
+  return visible;
+}
+
+function CatalogFilterGroup({
+  title,
+  options = [],
+  selectedValues = [],
+  selectedValue = '',
+  selectionMode = 'multiple',
+  isOpen,
+  onToggleOpen,
+  onToggleValue,
+  emptyMessage = 'No matching options',
+}) {
+  const selected = new Set((selectedValues || []).map((value) => String(value).toLocaleLowerCase()));
+  const renderedOptions = selectionMode === 'multiple'
+    ? selectedCatalogFacetOptions(options, selectedValues)
+    : options;
+
+  return <section className="catalog-filter-group">
+    <button
+      type="button"
+      className="catalog-filter-group-toggle"
+      onClick={onToggleOpen}
+      aria-expanded={isOpen}
+    >
+      <span>{title}</span>
+      <span className={`catalog-filter-chevron ${isOpen ? 'open' : ''}`} aria-hidden="true">⌄</span>
+    </button>
+    {isOpen && <div className="catalog-filter-options">
+      {!renderedOptions.length ? <p className="catalog-filter-empty">{emptyMessage}</p> : renderedOptions.map((option) => {
+        const value = String(option?.value || '');
+        const label = String(option?.label || value);
+        const optionId = `${title.replace(/\s+/g, '-').toLocaleLowerCase()}-${value.replace(/[^a-z0-9]+/gi, '-').toLocaleLowerCase()}`;
+        const isChecked = selectionMode === 'single'
+          ? selectedValue === value
+          : selected.has(value.toLocaleLowerCase());
+        return <label key={value} className={`catalog-filter-option ${isChecked ? 'selected' : ''}`} htmlFor={optionId}>
+          <input
+            id={optionId}
+            type={selectionMode === 'single' ? 'radio' : 'checkbox'}
+            name={selectionMode === 'single' ? 'catalog-freshness' : undefined}
+            value={value}
+            checked={isChecked}
+            onChange={() => onToggleValue(value)}
+          />
+          <span className="catalog-filter-option-label">{label}</span>
+          <span className="catalog-filter-option-count">{option?.count === undefined || option?.count === null ? '' : Number(option.count).toLocaleString()}</span>
+        </label>;
+      })}
+    </div>}
+  </section>;
+}
+
+function catalogJobSkills(job) {
+  const values = [
+    ...(Array.isArray(job?.required_skills) ? job.required_skills : []),
+    ...(Array.isArray(job?.skills) ? job.skills : []),
+    ...(Array.isArray(job?.preferred_skills) ? job.preferred_skills : []),
+  ];
+  const seen = new Set();
+  return values
+    .map((value) => String(value || '').trim())
+    .filter((value) => {
+      const key = value.toLocaleLowerCase();
+      if (!value || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 6);
+}
+
+function formatRelativeJobAge(value) {
+  if (!value) return 'Date unavailable';
+  const timestamp = new Date(value).getTime();
+  if (Number.isNaN(timestamp)) return 'Date unavailable';
+  const elapsed = Math.max(0, Date.now() - timestamp);
+  const minutes = Math.floor(elapsed / 60000);
+  if (minutes < 60) return minutes <= 1 ? 'just now' : `${minutes} minutes ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days} day${days === 1 ? '' : 's'} ago`;
+  return new Date(value).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+function catalogFreshnessText(job) {
+  const rawSourceText = String(job?.posted_date || '').trim();
+  if (job?.freshness_source === 'source_posted_date') {
+    return rawSourceText ? `Posted ${rawSourceText}` : `Posted ${formatRelativeJobAge(job?.freshness_at)}`;
+  }
+  return `Added ${formatRelativeJobAge(job?.freshness_at)}`;
+}
+
+function activeCatalogFilterCount(filters) {
+  if (!filters) return 0;
+  return (filters.freshness ? 1 : 0)
+    + ['work_modes', 'employment_types', 'locations', 'companies', 'skills']
+      .reduce((count, key) => count + (Array.isArray(filters[key]) ? filters[key].length : 0), 0);
+}
+
 function AllJobsPage({ onBack, onAction }) {
   const [jobs, setJobs] = useState([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
-  const [limit] = useState(50);
+  const [limit] = useState(24);
   const [query, setQuery] = useState('');
   const [searchText, setSearchText] = useState('');
+  const [filters, setFilters] = useState(createEmptyCatalogFilters);
+  const [facets, setFacets] = useState({});
+  const [sort, setSort] = useState('newest');
+  const [freshnessNote, setFreshnessNote] = useState('');
+  const [expandedGroups, setExpandedGroups] = useState({
+    freshness: true,
+    work_modes: true,
+    employment_types: false,
+    locations: true,
+    companies: false,
+    skills: false,
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const latestRequestRef = useRef(0);
 
-  async function loadJobs(nextOffset = offset, nextQuery = query) {
+  async function loadJobs({
+    nextOffset = offset,
+    nextQuery = query,
+    nextFilters = filters,
+    nextSort = sort,
+  } = {}) {
+    const requestId = ++latestRequestRef.current;
     setError(null);
     setLoading(true);
     try {
       const params = new URLSearchParams({
         limit: String(limit),
         offset: String(nextOffset),
+        sort: nextSort,
       });
       if (nextQuery) params.set('q', nextQuery);
+      if (nextFilters.freshness) params.set('freshness', nextFilters.freshness);
+      for (const field of ['work_modes', 'employment_types', 'locations', 'companies', 'skills']) {
+        for (const value of nextFilters[field] || []) params.append(field, value);
+      }
+
       const res = await api(`/me/jobs/all?${params.toString()}`, {}, getToken());
+      if (requestId !== latestRequestRef.current) return;
       setJobs(res.jobs || []);
-      setTotal(res.total || 0);
-      setOffset(res.offset || 0);
+      setTotal(Number(res.total || 0));
+      setOffset(Number(res.offset || 0));
       setQuery(res.q || '');
+      setSort(res.sort || nextSort);
+      setFilters({ ...createEmptyCatalogFilters(), ...(res.filters || nextFilters) });
+      setFacets(res.facets || {});
+      setFreshnessNote(res.freshness_note || '');
     } catch (e) {
-      setError(e.message || 'Could not load jobs');
+      if (requestId === latestRequestRef.current) setError(e.message || 'Could not load jobs');
     } finally {
-      setLoading(false);
+      if (requestId === latestRequestRef.current) setLoading(false);
     }
   }
 
   function submitSearch(event) {
     event.preventDefault();
-    loadJobs(0, searchText.trim());
+    loadJobs({ nextOffset: 0, nextQuery: searchText.trim() });
+  }
+
+  function updateFilters(nextFilters) {
+    setFilters(nextFilters);
+    loadJobs({ nextOffset: 0, nextFilters });
+  }
+
+  function toggleMultiFilter(field, value) {
+    const currentValues = Array.isArray(filters[field]) ? filters[field] : [];
+    const present = currentValues.some((currentValue) => String(currentValue).toLocaleLowerCase() === String(value).toLocaleLowerCase());
+    const nextValues = present
+      ? currentValues.filter((currentValue) => String(currentValue).toLocaleLowerCase() !== String(value).toLocaleLowerCase())
+      : [...currentValues, value];
+    updateFilters({ ...filters, [field]: nextValues });
+  }
+
+  function setFreshness(value) {
+    updateFilters({ ...filters, freshness: value });
+  }
+
+  function clearFilters() {
+    updateFilters(createEmptyCatalogFilters());
+  }
+
+  function clearSearch() {
+    setSearchText('');
+    loadJobs({ nextOffset: 0, nextQuery: '' });
+  }
+
+  function toggleGroup(name) {
+    setExpandedGroups((current) => ({ ...current, [name]: !current[name] }));
   }
 
   async function handleAction(item, action) {
     await onAction(item, action);
   }
 
-  useEffect(() => { loadJobs(0, ''); }, []);
+  useEffect(() => {
+    loadJobs({ nextOffset: 0, nextQuery: '', nextFilters: createEmptyCatalogFilters(), nextSort: 'newest' });
+  }, []);
 
   const currentStart = total ? offset + 1 : 0;
-  const currentEnd = Math.min(offset + limit, total);
+  const currentEnd = Math.min(offset + jobs.length, total);
   const canPrevious = offset > 0;
   const canNext = offset + limit < total;
+  const filterCount = activeCatalogFilterCount(filters);
 
   return <div className="all-jobs-page">
-    <Card title="All Jobs" subtitle="Browse the complete job catalog sorted alphabetically by title.">
-      <div className="all-jobs-toolbar">
-        <Button variant="secondary" onClick={onBack}>Back to candidate portal</Button>
-        <form className="all-jobs-search" onSubmit={submitSearch}>
-          <input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="Search title, company, location, or skills" />
-          <Button type="submit">Search</Button>
-          {query && <Button variant="secondary" onClick={() => { setSearchText(''); loadJobs(0, ''); }}>Clear</Button>}
-        </form>
+    <div className="catalog-page-heading">
+      <div>
+        <button type="button" className="catalog-back-link" onClick={onBack}>← Back to candidate portal</button>
+        <h1>All Jobs</h1>
+        <p>Search the complete catalog and narrow the results using job freshness, work mode, skills, location, company, and employment type.</p>
       </div>
+    </div>
 
-      <p className="muted">Showing <b>{currentStart}-{currentEnd}</b> of <b>{total}</b>{query ? <> for <b>{query}</b></> : null}</p>
-
-      {error && <p className="error">{error}</p>}
-      {loading ? <EmptyState message="Loading jobs..." /> : !jobs.length ? <EmptyState message="No jobs found." /> : <div className="job-list all-jobs-list">
-        {jobs.map((job) => <article className="job-card" key={job.job_id}>
-          <div className="job-title">{getJobTitle(job)}</div>
-          <div className="job-company-location">{getCompany(job)} · {getLocation(job)}</div>
-          {job.summary && <p className="reason">{String(job.summary).slice(0, 260)}</p>}
-          <div className="action-bar">
-            <Button onClick={() => handleAction(job, 'save')}>Save</Button>
-            <Button onClick={() => handleAction(job, 'apply-click')} disabled={!getApplyUrl(job)}>Apply</Button>
+    <div className="catalog-layout">
+      <aside className="catalog-filter-sidebar" aria-label="Job filters">
+        <div className="catalog-filter-header">
+          <div>
+            <h2>All Filters</h2>
+            {filterCount > 0 && <span className="catalog-filter-active-count">{filterCount} active</span>}
           </div>
-        </article>)}
-      </div>}
+          <button type="button" className="catalog-clear-filters" onClick={clearFilters} disabled={loading || filterCount === 0}>Clear all</button>
+        </div>
 
-      <div className="pagination-bar">
-        <Button variant="secondary" disabled={!canPrevious || loading} onClick={() => loadJobs(Math.max(offset - limit, 0), query)}>Previous</Button>
-        <Button variant="secondary" disabled={!canNext || loading} onClick={() => loadJobs(offset + limit, query)}>Next</Button>
-      </div>
-    </Card>
+        <CatalogFilterGroup
+          title="Job freshness"
+          options={[{ value: '', label: 'Any time' }, ...(facets.freshness || [])]}
+          selectedValue={filters.freshness}
+          selectionMode="single"
+          isOpen={expandedGroups.freshness}
+          onToggleOpen={() => toggleGroup('freshness')}
+          onToggleValue={setFreshness}
+          emptyMessage="No dated jobs available"
+        />
+        <CatalogFilterGroup
+          title="Work mode"
+          options={facets.work_modes || []}
+          selectedValues={filters.work_modes}
+          isOpen={expandedGroups.work_modes}
+          onToggleOpen={() => toggleGroup('work_modes')}
+          onToggleValue={(value) => toggleMultiFilter('work_modes', value)}
+        />
+        <CatalogFilterGroup
+          title="Employment type"
+          options={facets.employment_types || []}
+          selectedValues={filters.employment_types}
+          isOpen={expandedGroups.employment_types}
+          onToggleOpen={() => toggleGroup('employment_types')}
+          onToggleValue={(value) => toggleMultiFilter('employment_types', value)}
+        />
+        <CatalogFilterGroup
+          title="Location"
+          options={facets.locations || []}
+          selectedValues={filters.locations}
+          isOpen={expandedGroups.locations}
+          onToggleOpen={() => toggleGroup('locations')}
+          onToggleValue={(value) => toggleMultiFilter('locations', value)}
+        />
+        <CatalogFilterGroup
+          title="Company"
+          options={facets.companies || []}
+          selectedValues={filters.companies}
+          isOpen={expandedGroups.companies}
+          onToggleOpen={() => toggleGroup('companies')}
+          onToggleValue={(value) => toggleMultiFilter('companies', value)}
+        />
+        <CatalogFilterGroup
+          title="Skills"
+          options={facets.skills || []}
+          selectedValues={filters.skills}
+          isOpen={expandedGroups.skills}
+          onToggleOpen={() => toggleGroup('skills')}
+          onToggleValue={(value) => toggleMultiFilter('skills', value)}
+        />
+      </aside>
+
+      <section className="catalog-results-panel" aria-live="polite">
+        <form className="catalog-search-row" onSubmit={submitSearch}>
+          <input
+            value={searchText}
+            onChange={(event) => setSearchText(event.target.value)}
+            placeholder="Search title, company, location, or skill"
+            aria-label="Search jobs"
+          />
+          <Button type="submit" disabled={loading}>Search</Button>
+          {query && <Button type="button" variant="secondary" onClick={clearSearch} disabled={loading}>Clear search</Button>}
+        </form>
+
+        <div className="catalog-results-toolbar">
+          <div className="catalog-results-summary">
+            <strong>{loading ? 'Loading jobs…' : `${currentStart}-${currentEnd} of ${total.toLocaleString()} jobs`}</strong>
+            {query && <span>for “{query}”</span>}
+            {filterCount > 0 && <span>· {filterCount} filter{filterCount === 1 ? '' : 's'} applied</span>}
+          </div>
+          <label className="catalog-sort-control">
+            <span>Sort by</span>
+            <select
+              value={sort}
+              onChange={(event) => {
+                const nextSort = event.target.value;
+                setSort(nextSort);
+                loadJobs({ nextOffset: 0, nextSort });
+              }}
+              disabled={loading}
+            >
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+              <option value="title_asc">Title: A to Z</option>
+              <option value="title_desc">Title: Z to A</option>
+            </select>
+          </label>
+        </div>
+
+        {freshnessNote && <p className="catalog-freshness-note">{freshnessNote}</p>}
+        {error && <p className="error">{error}</p>}
+
+        {loading ? <EmptyState message="Loading jobs and filter options…" /> : !jobs.length ? <EmptyState message="No jobs match the current search and filters." /> : <div className="catalog-job-list">
+          {jobs.map((job) => {
+            const skills = catalogJobSkills(job);
+            return <article className="catalog-job-card" key={job.job_id}>
+              <div className="catalog-job-card-main">
+                <div className="catalog-job-title-row">
+                  <h2>{getJobTitle(job)}</h2>
+                  <span className="catalog-job-freshness">◷ {catalogFreshnessText(job)}</span>
+                </div>
+                <div className="catalog-job-company">{getCompany(job)}</div>
+                <div className="catalog-job-meta">
+                  <span>⌖ {getLocation(job)}</span>
+                  {job.employment_type && <span>{job.employment_type}</span>}
+                </div>
+                {job.summary && <p className="catalog-job-summary">{String(job.summary).slice(0, 280)}</p>}
+                {!!skills.length && <div className="catalog-job-skills"><Chips items={skills} max={6} /></div>}
+              </div>
+              <div className="catalog-job-actions">
+                <Button onClick={() => handleAction(job, 'apply-click')} disabled={!getApplyUrl(job)}>Apply</Button>
+                <Button variant="secondary" onClick={() => handleAction(job, 'save')}>Save</Button>
+              </div>
+            </article>;
+          })}
+        </div>}
+
+        <div className="pagination-bar catalog-pagination-bar">
+          <Button variant="secondary" disabled={!canPrevious || loading} onClick={() => loadJobs({ nextOffset: Math.max(offset - limit, 0) })}>Previous</Button>
+          <span className="catalog-pagination-status">Page {total ? Math.floor(offset / limit) + 1 : 0} of {total ? Math.ceil(total / limit) : 0}</span>
+          <Button variant="secondary" disabled={!canNext || loading} onClick={() => loadJobs({ nextOffset: offset + limit })}>Next</Button>
+        </div>
+      </section>
+    </div>
   </div>;
 }
-
 
 function SavedJobCard({ item }) {
   const applyUrl = getApplyUrl(item);

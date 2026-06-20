@@ -197,6 +197,7 @@ class JobPosting(BaseModel):
     employment_type: Optional[str] = Field(default=None, description="Employment type such as Contract or Full-time")
     duration: Optional[str] = Field(default=None, description="Contract duration if stated")
     compensation_text: Optional[str] = Field(default=None, description="Pay or compensation text if stated")
+    posted_date: Optional[str] = Field(default=None, description="Posting date/freshness text exactly as displayed, such as 3 days ago or 2026-06-18")
     summary: Optional[str] = Field(default=None, description="Short summary or overview of the role")
     responsibilities: list[str] = Field(default_factory=list, description="Key responsibilities")
     required_skills: list[str] = Field(default_factory=list, description="Required skills and experience")

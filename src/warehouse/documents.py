@@ -47,6 +47,8 @@ class JobCurrentDocument(MongoDocument):
     employment_type: str | None = None
     duration: str | None = None
     compensation_text: str | None = None
+    posted_date: str | None = None
+    posted_at: datetime | None = None
     summary: str | None = None
     responsibilities: list[str] = Field(default_factory=list)
     required_skills: list[str] = Field(default_factory=list)

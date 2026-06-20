@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pymongo import ASCENDING, IndexModel
+from pymongo import ASCENDING, DESCENDING, IndexModel
 from pymongo.database import Database
 
 # -----------------------------------------------------------------------------
@@ -40,6 +40,12 @@ from pymongo.database import Database
 # Index: last_seen_at
 # Type: Normal index
 # Why: Quickly finds recently seen or stale jobs during incremental runs.
+
+# Collection: jobs_current
+# Index: posted_at / first_seen_at
+# Type: Normal descending indexes
+# Why: Supports the candidate catalog freshness sort and its 1 day, 3 days,
+#      1/2/3 week, 1 month, and older-than-one-month filters.
 
 # Collection: jobs_history
 # Index: history_id
@@ -135,7 +141,14 @@ from pymongo.database import Database
 INDEXES: dict[str, list[IndexModel]] = {
     "warehouse_run_sessions": [IndexModel([("run_session_id", ASCENDING)], unique=True)],
     "job_raw_extractions": [IndexModel([("raw_id", ASCENDING)], unique=True), IndexModel([("target_id", ASCENDING), ("source_url", ASCENDING)])],
-    "jobs_current": [IndexModel([("job_id", ASCENDING)], unique=True), IndexModel([("target_id", ASCENDING), ("job_url", ASCENDING)], unique=True, sparse=True), IndexModel([("is_active", ASCENDING)]), IndexModel([("last_seen_at", ASCENDING)])],
+    "jobs_current": [
+        IndexModel([("job_id", ASCENDING)], unique=True),
+        IndexModel([("target_id", ASCENDING), ("job_url", ASCENDING)], unique=True, sparse=True),
+        IndexModel([("is_active", ASCENDING)]),
+        IndexModel([("last_seen_at", DESCENDING)]),
+        IndexModel([("posted_at", DESCENDING)]),
+        IndexModel([("first_seen_at", DESCENDING)]),
+    ],
     "jobs_history": [IndexModel([("history_id", ASCENDING)], unique=True), IndexModel([("job_id", ASCENDING), ("content_hash", ASCENDING)], unique=True)],
     "resume_profiles_current": [IndexModel([("resume_id", ASCENDING)], unique=True), IndexModel([("sha256", ASCENDING)], unique=True), IndexModel([("contact.email", ASCENDING)], sparse=True)],
     "resume_profiles_history": [IndexModel([("history_id", ASCENDING)], unique=True), IndexModel([("resume_id", ASCENDING), ("content_hash", ASCENDING)], unique=True)],

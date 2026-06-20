@@ -71,6 +71,11 @@ def _normalize_payload(payload: dict[str, Any], fallback_url: str) -> dict[str, 
     if "applyUrl" in payload and "apply_url" not in payload:
         payload["apply_url"] = payload["applyUrl"]
 
+    for alias in ("posted_at", "postedAt", "postedDate", "date_posted", "datePosted", "published_at", "publishedAt", "published_date", "publishedDate", "posting_date", "postingDate", "posted"):
+        if alias in payload and "posted_date" not in payload:
+            payload["posted_date"] = payload[alias]
+            break
+
     for list_field in ("responsibilities", "required_skills", "preferred_skills"):
         value = payload.get(list_field)
 

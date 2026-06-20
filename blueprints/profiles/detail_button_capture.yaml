@@ -48,6 +48,7 @@ detail:
     - employment_type: displayed type such as Contract, Permanent, Full-time, etc.
     - duration: contract duration if stated
     - compensation_text: pay/rate/salary text if stated
+    - posted_date: posting date/freshness exactly as displayed, such as "3 days ago", "Yesterday", or "2026-06-18"; otherwise null
     - summary: concise role summary from the page
     - responsibilities: list of responsibilities found on page
     - required_skills: list of required skills and experience
