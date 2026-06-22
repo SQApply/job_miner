@@ -402,10 +402,19 @@ class WarehouseRepository:
             {"job_id": doc.job_id}
         )
 
-        if existing and existing.get("source_content_hash") == doc.source_content_hash:
-            data["embedding_status"] = existing.get("embedding_status", "pending")
-            data["embedding_model"] = existing.get("embedding_model")
-            data["last_indexed_at"] = existing.get("last_indexed_at")
+        if existing:
+            # A changed job-tower text must be indexed again. Preserving an
+            # already-indexed status would leave Qdrant stale after a portal
+            # refresh changes title, skills, summary, company, or location.
+            source_changed = str(existing.get("source_content_hash") or "") != str(doc.source_content_hash or "")
+            if source_changed:
+                data["embedding_status"] = "pending"
+                data["embedding_model"] = None
+                data["last_indexed_at"] = None
+            else:
+                data["embedding_status"] = existing.get("embedding_status", "pending")
+                data["embedding_model"] = existing.get("embedding_model")
+                data["last_indexed_at"] = existing.get("last_indexed_at")
 
         self.db[JobTowerDocument.collection_name].update_one(
             {"job_id": doc.job_id},
@@ -552,8 +561,13 @@ class WarehouseRepository:
         *,
         only_pending: bool = False,
         limit: int | None = None,
+        job_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        query = {"embedding_status": {"$ne": "indexed"}} if only_pending else {}
+        query: dict[str, Any] = {}
+        if only_pending:
+            query["embedding_status"] = {"$ne": "indexed"}
+        if job_ids:
+            query["job_id"] = {"$in": [str(job_id) for job_id in job_ids if str(job_id).strip()]}
 
         cursor = self.db[JobTowerDocument.collection_name].find(query).sort(
             "updated_at",

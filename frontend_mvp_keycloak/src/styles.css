@@ -1069,3 +1069,192 @@ th, td {
     flex-wrap: wrap;
   }
 }
+
+/* Admin job portal control plane */
+.portal-management {
+  display: grid;
+  gap: 16px;
+}
+
+.portal-form {
+  display: grid;
+  grid-template-columns: minmax(170px, 1fr) minmax(280px, 2.4fr) repeat(4, minmax(120px, 0.8fr));
+  gap: 12px;
+  align-items: end;
+}
+
+.portal-form label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.portal-form input {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 9px 10px;
+  font: inherit;
+  color: #111827;
+  background: #ffffff;
+}
+
+.portal-form-submit {
+  display: flex;
+  align-items: end;
+  min-height: 100%;
+}
+
+.portal-security-note,
+.portal-detection-reason,
+.portal-ingestion-summary {
+  margin: 12px 0 0;
+  color: #4b5563;
+  line-height: 1.45;
+  font-size: 13px;
+}
+
+.portal-list-heading,
+.portal-card-head,
+.portal-statuses,
+.portal-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.portal-list-heading,
+.portal-card-head {
+  justify-content: space-between;
+}
+
+.portal-list {
+  display: grid;
+  gap: 12px;
+}
+
+.portal-card {
+  border: 1px solid #dbe3ee;
+  border-radius: 12px;
+  padding: 14px;
+  background: #fbfdff;
+}
+
+.portal-card h3 {
+  margin: 0 0 5px;
+  font-size: 17px;
+}
+
+.portal-card a {
+  color: #1d4ed8;
+  display: inline-block;
+  max-width: 680px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+  white-space: nowrap;
+}
+
+.portal-statuses {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  text-align: right;
+}
+
+.portal-run-status {
+  color: #64748b;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.status-pill.portal-status-ready_for_activation,
+.status-pill.portal-status-active {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.status-pill.portal-status-needs_review,
+.status-pill.portal-status-blocked,
+.status-pill.portal-status-paused {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.status-pill.portal-status-probing,
+.status-pill.portal-status-test_scraping,
+.status-pill.portal-status-ready_for_test {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.portal-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.portal-meta-grid > div {
+  border-radius: 8px;
+  background: #f1f5f9;
+  padding: 9px;
+  min-width: 0;
+}
+
+.portal-meta-grid span,
+.portal-meta-grid strong {
+  display: block;
+}
+
+.portal-meta-grid span {
+  color: #64748b;
+  font-size: 12px;
+  margin-bottom: 3px;
+}
+
+.portal-meta-grid strong {
+  color: #0f172a;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.portal-actions {
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+
+@media (max-width: 1180px) {
+  .portal-form {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .portal-form-url {
+    grid-column: span 2;
+  }
+}
+
+@media (max-width: 760px) {
+  .portal-form,
+  .portal-meta-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .portal-form-url {
+    grid-column: auto;
+  }
+
+  .portal-list-heading,
+  .portal-card-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .portal-statuses {
+    justify-content: flex-start;
+    text-align: left;
+  }
+}

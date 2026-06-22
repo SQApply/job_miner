@@ -15,6 +15,8 @@ RESULT_BACKEND = os.getenv("JOB_MINER_CELERY_RESULT_BACKEND", REDIS_URL)
 
 RECOMMENDATION_QUEUE = os.getenv("JOB_MINER_RECOMMENDATION_QUEUE", "recommendation_queue")
 RESUME_PROCESSING_QUEUE = os.getenv("JOB_MINER_RESUME_PROCESSING_QUEUE", "resume_processing_queue")
+PORTAL_PROBE_QUEUE = os.getenv("JOB_MINER_PORTAL_PROBE_QUEUE", "portal_probe_queue")
+PORTAL_SCRAPE_QUEUE = os.getenv("JOB_MINER_PORTAL_SCRAPE_QUEUE", "portal_scrape_queue")
 
 celery_app = Celery(
     "job_miner",
@@ -24,6 +26,7 @@ celery_app = Celery(
         "src.tasks.mvp_tasks",
         "src.tasks.recommendation_tasks",
         "src.tasks.resume_tasks",
+        "src.tasks.portal_tasks",
     ],
 )
 
@@ -49,5 +52,8 @@ celery_app.conf.update(
         "src.tasks.resume_tasks.process_candidate_resume_upload_task": {
             "queue": RESUME_PROCESSING_QUEUE
         },
+        "src.tasks.portal_tasks.probe_job_portal_task": {"queue": PORTAL_PROBE_QUEUE},
+        "src.tasks.portal_tasks.test_scrape_job_portal_task": {"queue": PORTAL_SCRAPE_QUEUE},
+        "src.tasks.portal_tasks.scrape_job_portal_task": {"queue": PORTAL_SCRAPE_QUEUE},
     },
 )

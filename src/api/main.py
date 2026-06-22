@@ -26,10 +26,12 @@ from .mongo_views import candidate_exists, create_incomplete_candidate_profile_f
 from .mvp_models import CandidateLinkRequest, CandidateProfileUpdateRequest, FeedbackRequest, JobActionRequest, PipelineRunRequest
 from .resume_upload import process_candidate_resume_upload
 from .profile_edit import update_candidate_profile
+from .portal_routes import router as portal_router
 from .security import get_current_user, keycloak_public_config, require_permission
 
 app = FastAPI(title="Job Miner API", version="1.0.0")
 logger = logging.getLogger(__name__)
+app.include_router(portal_router)
 
 def _cors_origins() -> list[str]:
     raw = os.getenv(EnvironmentVariables.API_CORS_ORIGINS, "http://localhost:5173,http://127.0.0.1:5173")

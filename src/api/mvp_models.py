@@ -49,3 +49,29 @@ class CandidateProfileUpdateRequest(BaseModel):
     notice_period: str | None = None
     expected_compensation: str | None = None
     summary: str | None = None
+
+class JobPortalCreateRequest(BaseModel):
+    display_name: str = Field(min_length=2, max_length=160)
+    listing_url: str = Field(min_length=8, max_length=4096)
+    max_pages_per_run: int = Field(default=50, ge=1, le=250)
+    max_jobs_per_run: int = Field(default=500, ge=1, le=2000)
+    request_rate_limit_per_minute: int = Field(default=30, ge=1, le=120)
+    crawl_timeout_seconds: int = Field(default=1800, ge=30, le=7200)
+    schedule_expression: str | None = Field(default=None, max_length=120)
+
+
+class JobPortalUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None, min_length=2, max_length=160)
+    listing_url: str | None = Field(default=None, min_length=8, max_length=4096)
+    max_pages_per_run: int | None = Field(default=None, ge=1, le=250)
+    max_jobs_per_run: int | None = Field(default=None, ge=1, le=2000)
+    request_rate_limit_per_minute: int | None = Field(default=None, ge=1, le=120)
+    crawl_timeout_seconds: int | None = Field(default=None, ge=30, le=7200)
+    schedule_expression: str | None = Field(default=None, max_length=120)
+    configuration_version: int | None = Field(default=None, ge=1)
+
+
+class JobPortalRunRequest(BaseModel):
+    # Full portal runs are bounded by the portal's persisted max_jobs_per_run.
+    # This optional lower cap is useful for controlled admin refreshes.
+    max_jobs: int | None = Field(default=None, ge=1, le=2000)

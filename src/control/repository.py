@@ -639,7 +639,7 @@ class ControlRepository:
                 """
             ),
             {
-                "org_id": self.get_default_org_id(),
+                "org_id": str((user or {}).get("organization_id") or self.get_default_org_id()),
                 "task_uuid": task_uuid,
                 "task_name": task_name,
                 "queue_name": queue_name,

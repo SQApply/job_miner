@@ -220,20 +220,30 @@ def index_job_towers(
     recreate: bool = False,
     only_pending: bool = False,
     limit: int | None = None,
+    job_ids: list[str] | None = None,
 ) -> dict[str, Any]:
+    """Index job towers, optionally restricting work to known changed job IDs.
+
+    Portal refreshes use ``job_ids`` so they do not re-embed every catalog job.
+    ``only_pending`` remains a second safety gate: a tower that has not changed
+    since its last successful index is not re-sent to Qdrant.
+    """
     started = time.perf_counter()
+    requested_job_ids = [str(job_id) for job_id in (job_ids or []) if str(job_id).strip()]
 
     logger.info(
-        "Starting job tower indexing collection=%s recreate=%s only_pending=%s limit=%s",
+        "Starting job tower indexing collection=%s recreate=%s only_pending=%s limit=%s requested_job_ids=%s",
         collection_name,
         recreate,
         only_pending,
         limit,
+        len(requested_job_ids),
     )
 
     rows_from_mongo = repo.job_towers(
         only_pending=only_pending,
         limit=limit,
+        job_ids=requested_job_ids or None,
     )
 
     logger.info(
@@ -285,6 +295,7 @@ def index_job_towers(
             "skipped_empty_text": skipped_empty_text,
             "skipped_missing_id": skipped_missing_id,
             "embedding_model": embedder.model,
+            "requested_job_ids": len(requested_job_ids),
             "status": "no_indexable_records",
             "elapsed_seconds": round(time.perf_counter() - started, 3),
         }
@@ -410,6 +421,7 @@ def index_job_towers(
         "recreate": recreate,
         "only_pending": only_pending,
         "limit": limit,
+        "requested_job_ids": len(requested_job_ids),
         "embedding_elapsed_seconds": round(embedding_elapsed, 3),
         "qdrant_upsert_elapsed_seconds": round(upsert_elapsed, 3),
         "elapsed_seconds": round(time.perf_counter() - started, 3),

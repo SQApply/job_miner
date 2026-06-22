@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { api } from './lib/api';
 import { getToken, initKeycloak, logout } from './lib/keycloak';
+import AdminPortalManagement from './components/AdminPortalManagement';
 import './styles.css';
 
 function Button({ children, onClick, disabled, variant = 'primary', type = 'button', href }) {
@@ -1055,18 +1056,21 @@ function AdminPortal() {
   }
   async function pollTask(id = taskId) { if (!id) return; try { setTask((await api(`/admin/tasks/${id}`, {}, getToken())).task); } catch (e) { setError(e.message); } }
   useEffect(() => { loadStats(); loadRuns(); }, []);
-  return <div className="grid two">
-    <Card title="Admin Dashboard" subtitle="Run pipeline and monitor warehouse counts.">
-      {error && <p className="error">{error}</p>}
-      <div className="row top-actions"><Button onClick={loadStats}>Refresh Stats</Button><Button onClick={runPipeline}>Run Full Pipeline</Button></div>
-      <AdminStats stats={stats} />
-    </Card>
-    <Card title="Pipeline Runs and Task Status" subtitle="Track latest task state.">
-      <div className="row top-actions"><Button onClick={loadRuns}>Refresh Runs</Button><input placeholder="task id" value={taskId} onChange={e => setTaskId(e.target.value)} /><Button onClick={() => pollTask()}>Check Task</Button></div>
-      <h3>Latest Task</h3><TaskStatus task={task} />
-      <h3>Runs</h3><RunsTable runs={runs} />
-    </Card>
-  </div>;
+  return <>
+    <AdminPortalManagement />
+    <div className="grid two">
+      <Card title="Admin Dashboard" subtitle="Run pipeline and monitor warehouse counts.">
+        {error && <p className="error">{error}</p>}
+        <div className="row top-actions"><Button onClick={loadStats}>Refresh Stats</Button><Button onClick={runPipeline}>Run Full Pipeline</Button></div>
+        <AdminStats stats={stats} />
+      </Card>
+      <Card title="Pipeline Runs and Task Status" subtitle="Track latest task state.">
+        <div className="row top-actions"><Button onClick={loadRuns}>Refresh Runs</Button><input placeholder="task id" value={taskId} onChange={e => setTaskId(e.target.value)} /><Button onClick={() => pollTask()}>Check Task</Button></div>
+        <h3>Latest Task</h3><TaskStatus task={task} />
+        <h3>Runs</h3><RunsTable runs={runs} />
+      </Card>
+    </div>
+  </>;
 }
 
 function App() {
