@@ -12,7 +12,7 @@ from ..observability.correlation import new_uuid
 from ..tasks.application_tasks import run_application_batch_task
 from ..tasks.tracking import create_task_tracking_row, mark_task_failed
 from .mongo_views import get_job_by_id
-from .mvp_models import ApplySavedJobsAgentRequest, RetryApplicationBatchRequest
+from .mvp_models import ApplySavedJobsAgentRequest, CandidateExternalAccountRequest, RetryApplicationBatchRequest
 from .security import require_permission
 
 router = APIRouter(prefix="/me", tags=["candidate-application-agent"])
@@ -80,6 +80,56 @@ def _queue_batch_task(*, batch: dict[str, Any], user: dict[str, Any], request_id
             detail="Application batch could not be queued. Check Redis and the application Celery worker.",
         ) from exc
     return task_id
+
+
+
+@router.get("/application-agent/external-accounts")
+def list_application_agent_external_accounts(
+    user: dict[str, Any] = Depends(require_permission("applications.manage_self")),
+) -> dict[str, Any]:
+    link = _require_candidate_link(user)
+    with postgres_session() as session:
+        accounts = ControlRepository(session).list_candidate_external_accounts(str(user["id"]), str(link["candidate_id"]))
+    return {"accounts": accounts}
+
+
+@router.post("/application-agent/external-accounts")
+def save_application_agent_external_account(
+    payload: CandidateExternalAccountRequest,
+    user: dict[str, Any] = Depends(require_permission("applications.manage_self")),
+) -> dict[str, Any]:
+    link = _require_candidate_link(user)
+    with postgres_session() as session:
+        repo = ControlRepository(session)
+        account = repo.upsert_candidate_external_account(
+            app_user_id=str(user["id"]),
+            candidate_id=str(link["candidate_id"]),
+            portal_domain=payload.portal_domain,
+            username_email=payload.username_email,
+            password_plaintext_dev=payload.password,
+            allow_agent_login=payload.allow_agent_login,
+            allow_agent_signup=payload.allow_agent_signup,
+            metadata={
+                "warning": "password_plaintext_dev is for local demo only; move to Azure Key Vault before production",
+                "request_id": new_uuid(),
+            },
+        )
+    account.pop("password_plaintext_dev", None)
+    account["has_password"] = bool(payload.password)
+    return {"account": account, "message": "External portal credentials saved for the application agent."}
+
+
+@router.delete("/application-agent/external-accounts/{portal_domain}")
+def delete_application_agent_external_account(
+    portal_domain: str,
+    user: dict[str, Any] = Depends(require_permission("applications.manage_self")),
+) -> dict[str, Any]:
+    link = _require_candidate_link(user)
+    with postgres_session() as session:
+        account = ControlRepository(session).delete_candidate_external_account(str(user["id"]), str(link["candidate_id"]), portal_domain)
+    if not account:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="External account not found")
+    return {"deleted": True, "portal_domain": portal_domain}
 
 
 @router.post("/saved-jobs/apply-agent", status_code=status.HTTP_202_ACCEPTED)

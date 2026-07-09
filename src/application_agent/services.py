@@ -14,7 +14,7 @@ from ..observability.correlation import new_uuid
 from .graphs import invoke_job_application_graph
 from .notifications import ApplicationNotificationService
 from .state import JobApplicationState
-from .strategies import GenericExternalReviewStrategy, UnsupportedPortalStrategy
+from .strategies import GenericExternalReviewStrategy, StrategicStaffDirectApplyStrategy, UnsupportedPortalStrategy
 from .strategies.base import SubmissionResult
 
 logger = logging.getLogger(__name__)
@@ -81,6 +81,11 @@ class ApplicationAgentService:
     def __init__(self, *, request_id: str | None = None):
         self.request_id = request_id or new_uuid()
         self.external_submit_enabled = os.getenv("JOB_MINER_APPLICATION_AGENT_ENABLE_EXTERNAL_SUBMIT", "false").strip().lower() in {"1", "true", "yes", "on"}
+        self.auto_submit_domains = {
+            item.strip().lower().replace("www.", "")
+            for item in os.getenv("JOB_MINER_APPLICATION_AGENT_AUTOSUBMIT_DOMAINS", "careers.strategicstaff.com").split(",")
+            if item.strip()
+        }
 
     def create_batch_for_saved_jobs(
         self,
@@ -204,6 +209,7 @@ class ApplicationAgentService:
                             "request_id": self.request_id,
                             "saved_job_id": str(saved.get("id")),
                             "previous_application_status": existing_status or None,
+                            "require_review_before_submit": require_review_before_submit,
                         },
                     )
                 )
@@ -239,7 +245,7 @@ class ApplicationAgentService:
                 "apply_url": run.get("apply_url"),
                 "portal_domain": run.get("portal_domain"),
                 "langgraph_thread_id": run.get("langgraph_thread_id") or f"application-job-{run['id']}",
-                "metadata": {"request_id": self.request_id},
+                "metadata": {"request_id": self.request_id, **(run.get("metadata") or {})},
             }
             repo.set_application_job_run_task(str(run["id"]), str(run.get("celery_task_uuid") or ""), langgraph_thread_id=initial["langgraph_thread_id"])
 
@@ -254,8 +260,11 @@ class ApplicationAgentService:
         resume = (candidate or {}).get("resume_profile") or None
         apply_url = extract_apply_url(job, {"apply_url": state.get("apply_url")})
         portal_domain = portal_domain_from_url(apply_url)
+        external_account = None
         with postgres_session() as session:
             repo = ControlRepository(session)
+            if portal_domain:
+                external_account = repo.get_candidate_external_account(str(state["app_user_id"]), candidate_id, portal_domain)
             repo.update_application_job_run_status(
                 str(state["job_run_id"]),
                 ApplicationRunStatuses.RUNNING,
@@ -275,6 +284,7 @@ class ApplicationAgentService:
             "resume_profile": resume,
             "apply_url": apply_url,
             "portal_domain": portal_domain,
+            "external_account": external_account,
             "run_status": ApplicationRunStatuses.RUNNING,
             "application_status": ApplicationStatuses.AGENT_RUNNING,
         }
@@ -311,12 +321,11 @@ class ApplicationAgentService:
     def select_strategy_node(self, state: JobApplicationState) -> JobApplicationState:
         if state.get("terminal"):
             return state
-        domain = str(state.get("portal_domain") or "")
-        # Conservative default. Enable actual submission only by adding
-        # portal-specific strategies here and setting a strategy to can_submit.
-        strategy = GenericExternalReviewStrategy() if domain else UnsupportedPortalStrategy()
+        domain = str(state.get("portal_domain") or "").lower().replace("www.", "")
+        strategy = self._select_strategy(domain)
+        strategy_job = {**(state.get("job") or {}), "__resume_profile": state.get("resume_profile") or {}}
         decision = strategy.can_apply(
-            job=state.get("job") or {},
+            job=strategy_job,
             candidate_profile=state.get("candidate_profile") or {},
             apply_url=state.get("apply_url"),
         )
@@ -325,7 +334,16 @@ class ApplicationAgentService:
             "strategy_key": decision.strategy_key,
             "metadata": {**(state.get("metadata") or {}), **decision.metadata},
         }
-        if not decision.can_submit or not self.external_submit_enabled:
+        if (state.get("metadata") or {}).get("require_review_before_submit"):
+            return self._terminal(
+                next_state,
+                run_status=ApplicationRunStatuses.NEEDS_REVIEW,
+                application_status=ApplicationStatuses.AGENT_NEEDS_REVIEW,
+                message="Batch was configured for review-before-submit, so the agent prepared this job for manual review instead of submitting.",
+                error_type="review_before_submit_enabled",
+                metadata=decision.metadata,
+            )
+        if not decision.can_submit:
             return self._terminal(
                 next_state,
                 run_status=decision.run_status or ApplicationRunStatuses.NEEDS_REVIEW,
@@ -333,6 +351,19 @@ class ApplicationAgentService:
                 message=decision.message or "This job needs candidate review before application.",
                 error_type=decision.error_type or "manual_review_required",
                 metadata=decision.metadata,
+            )
+        if not self.external_submit_enabled or domain not in self.auto_submit_domains:
+            return self._terminal(
+                next_state,
+                run_status=ApplicationRunStatuses.NEEDS_REVIEW,
+                application_status=ApplicationStatuses.AGENT_NEEDS_REVIEW,
+                message=(
+                    f"Auto-submit is available for {domain}, but it is disabled. "
+                    "Set JOB_MINER_APPLICATION_AGENT_ENABLE_EXTERNAL_SUBMIT=true and include the domain in "
+                    "JOB_MINER_APPLICATION_AGENT_AUTOSUBMIT_DOMAINS for the demo."
+                ),
+                error_type="external_submit_disabled",
+                metadata={"portal_domain": domain, **decision.metadata},
             )
         return next_state
 
@@ -351,14 +382,18 @@ class ApplicationAgentService:
     def submit_application_node(self, state: JobApplicationState) -> JobApplicationState:
         if state.get("terminal"):
             return state
-        # No generic submission is enabled here. Portal-specific strategies should
-        # return a real SubmissionResult once implemented and verified.
-        result = SubmissionResult(
-            run_status=ApplicationRunStatuses.NEEDS_REVIEW,
-            application_status=ApplicationStatuses.AGENT_NEEDS_REVIEW,
-            message="Portal-specific auto-submit strategy is not implemented for this job yet.",
-            error_type="strategy_submit_not_implemented",
-            error_message="Add a supported ATS strategy before enabling external submit.",
+        strategy = self._select_strategy(str(state.get("portal_domain") or "").lower().replace("www.", ""))
+        job_payload = {
+            **(state.get("job") or {}),
+            "__candidate_id": state.get("candidate_id"),
+            "__resume_profile": state.get("resume_profile") or {},
+            "__external_account": state.get("external_account") or {},
+            "__job_run_id": state.get("job_run_id"),
+        }
+        result = strategy.submit(
+            job=job_payload,
+            candidate_profile=state.get("candidate_profile") or {},
+            apply_url=state.get("apply_url"),
         )
         return self._terminal(
             state,
@@ -400,6 +435,30 @@ class ApplicationAgentService:
                         "strategy_key": state.get("strategy_key"),
                     },
                 )
+                if run_status == ApplicationRunStatuses.SUBMITTED:
+                    moved_saved = repo.mark_saved_job_applied(
+                        str(state["app_user_id"]),
+                        str(state["candidate_id"]),
+                        str(state["job_id"]),
+                        application_id=str(state["application_id"]),
+                        job_run_id=str(state["job_run_id"]),
+                    )
+                    if moved_saved:
+                        repo.add_application_event(
+                            app_user_id=str(state["app_user_id"]),
+                            candidate_id=str(state["candidate_id"]),
+                            job_id=str(state["job_id"]),
+                            application_id=str(state["application_id"]),
+                            event_type="saved_job_moved_to_applications",
+                            message="Application agent submitted this job successfully, so it was moved from Saved Jobs to Applications.",
+                            payload={
+                                "batch_id": state.get("batch_id"),
+                                "job_run_id": state.get("job_run_id"),
+                                "saved_job_id": str(moved_saved.get("id")),
+                                "run_status": run_status,
+                                "application_status": application_status,
+                            },
+                        )
                 repo.add_application_event(
                     app_user_id=str(state["app_user_id"]),
                     candidate_id=str(state["candidate_id"]),
@@ -436,6 +495,13 @@ class ApplicationAgentService:
                 payload={"batch_id": batch_id, "notification_id": str(notification["id"])},
             )
             return {"batch": batch, "job_runs": job_runs, "notification": notification}
+
+
+    def _select_strategy(self, domain: str):
+        normalized = str(domain or "").lower().replace("www.", "")
+        if normalized in StrategicStaffDirectApplyStrategy.supported_domains:
+            return StrategicStaffDirectApplyStrategy()
+        return GenericExternalReviewStrategy() if normalized else UnsupportedPortalStrategy()
 
     def _terminal(
         self,

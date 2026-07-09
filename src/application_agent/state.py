@@ -17,6 +17,7 @@ class JobApplicationState(TypedDict, total=False):
     resume_profile: dict[str, Any] | None
     apply_url: str | None
     portal_domain: str | None
+    external_account: dict[str, Any] | None
     strategy_key: str | None
     terminal: bool
     run_status: str | None

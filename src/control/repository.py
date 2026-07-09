@@ -574,9 +574,18 @@ class ControlRepository:
         rows = self.session.execute(
             text(
                 """
-                SELECT * FROM job_miner_control.candidate_saved_jobs
-                WHERE app_user_id = :user_id AND candidate_id = :candidate_id AND is_active = TRUE
-                ORDER BY modified_on DESC
+                SELECT sj.*
+                FROM job_miner_control.candidate_saved_jobs sj
+                LEFT JOIN job_miner_control.candidate_job_applications app
+                    ON app.app_user_id = sj.app_user_id
+                   AND app.candidate_id = sj.candidate_id
+                   AND app.job_id = sj.job_id
+                   AND app.is_active = TRUE
+                WHERE sj.app_user_id = :user_id
+                  AND sj.candidate_id = :candidate_id
+                  AND sj.is_active = TRUE
+                  AND COALESCE(app.application_status, '') NOT IN ('agent_applied', 'applied_manually')
+                ORDER BY sj.modified_on DESC
                 """
             ),
             {"user_id": app_user_id, "candidate_id": candidate_id},
@@ -604,6 +613,45 @@ class ControlRepository:
                 """
             ),
             {"user_id": app_user_id, "candidate_id": candidate_id, "job_id": job_id},
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def mark_saved_job_applied(self, app_user_id: str, candidate_id: str, job_id: str, *, application_id: str | None = None, job_run_id: str | None = None) -> dict[str, Any] | None:
+        """Move a successfully submitted job out of the Saved Jobs list.
+
+        Only call this after the application run reaches a real submitted state.
+        Failed, blocked, and needs-review runs stay visible in Saved Jobs so the
+        candidate can retry or handle them manually. The row is soft-hidden rather
+        than deleted so audit/history remains available and the Applications list
+        remains the source for submitted jobs.
+        """
+        row = self.session.execute(
+            text(
+                """
+                UPDATE job_miner_control.candidate_saved_jobs
+                SET status = 'agent_applied',
+                    is_active = FALSE,
+                    metadata = COALESCE(metadata, '{}'::jsonb) || CAST(:metadata AS jsonb),
+                    modified_on = NOW()
+                WHERE app_user_id = :user_id
+                  AND candidate_id = :candidate_id
+                  AND job_id = :job_id
+                  AND is_active = TRUE
+                  AND status = 'saved'
+                RETURNING *
+                """
+            ),
+            {
+                "user_id": app_user_id,
+                "candidate_id": candidate_id,
+                "job_id": job_id,
+                "metadata": _json({
+                    "moved_to_applications": True,
+                    "application_id": application_id,
+                    "job_run_id": job_run_id,
+                    "moved_reason": "agent_submitted",
+                }),
+            },
         ).mappings().first()
         return dict(row) if row else None
 
@@ -1069,6 +1117,130 @@ class ControlRepository:
             {"user_id": app_user_id, "candidate_id": candidate_id, "limit": max(1, min(int(limit or 10), 50))},
         ).mappings().all()
         return [dict(r) for r in rows]
+
+    def upsert_candidate_external_account(
+        self,
+        *,
+        app_user_id: str,
+        candidate_id: str,
+        portal_domain: str,
+        username_email: str | None,
+        password_plaintext_dev: str | None,
+        allow_agent_login: bool = True,
+        allow_agent_signup: bool = False,
+        account_status: str = "active",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Store external account credentials for development demos.
+
+        password_plaintext_dev is intentionally plaintext only for local demo.
+        Replace it with a Key Vault secret reference before production.
+        """
+        domain = str(portal_domain or "").strip().lower().replace("www.", "")
+        if not domain:
+            raise ValueError("portal_domain is required")
+        row = self.session.execute(
+            text(
+                """
+                INSERT INTO job_miner_control.candidate_external_accounts (
+                    organization_id, app_user_id, candidate_id, portal_domain, username_email,
+                    password_plaintext_dev, allow_agent_login, allow_agent_signup, account_status, metadata
+                ) VALUES (
+                    :org_id, :user_id, :candidate_id, :portal_domain, :username_email,
+                    :password_plaintext_dev, :allow_agent_login, :allow_agent_signup, :account_status, CAST(:metadata AS jsonb)
+                )
+                ON CONFLICT (app_user_id, candidate_id, portal_domain)
+                DO UPDATE SET
+                    username_email = EXCLUDED.username_email,
+                    password_plaintext_dev = COALESCE(EXCLUDED.password_plaintext_dev, job_miner_control.candidate_external_accounts.password_plaintext_dev),
+                    allow_agent_login = EXCLUDED.allow_agent_login,
+                    allow_agent_signup = EXCLUDED.allow_agent_signup,
+                    account_status = EXCLUDED.account_status,
+                    metadata = job_miner_control.candidate_external_accounts.metadata || EXCLUDED.metadata,
+                    modified_on = NOW(),
+                    is_active = TRUE
+                RETURNING *
+                """
+            ),
+            {
+                "org_id": self.get_default_org_id(),
+                "user_id": app_user_id,
+                "candidate_id": candidate_id,
+                "portal_domain": domain,
+                "username_email": _normalize_email(username_email) or username_email,
+                "password_plaintext_dev": password_plaintext_dev,
+                "allow_agent_login": bool(allow_agent_login),
+                "allow_agent_signup": bool(allow_agent_signup),
+                "account_status": account_status,
+                "metadata": _json(metadata or {}),
+            },
+        ).mappings().one()
+        return dict(row)
+
+    def list_candidate_external_accounts(self, app_user_id: str, candidate_id: str) -> list[dict[str, Any]]:
+        rows = self.session.execute(
+            text(
+                """
+                SELECT id, organization_id, app_user_id, candidate_id, portal_domain,
+                       username_email, allow_agent_login, allow_agent_signup, account_status,
+                       last_login_on, last_verified_on, created_by_agent, created_on,
+                       modified_on, is_active, metadata,
+                       CASE WHEN password_plaintext_dev IS NULL OR password_plaintext_dev = '' THEN FALSE ELSE TRUE END AS has_password
+                FROM job_miner_control.candidate_external_accounts
+                WHERE app_user_id = :user_id
+                  AND candidate_id = :candidate_id
+                  AND is_active = TRUE
+                ORDER BY portal_domain ASC
+                """
+            ),
+            {"user_id": app_user_id, "candidate_id": candidate_id},
+        ).mappings().all()
+        return [dict(r) for r in rows]
+
+    def get_candidate_external_account(self, app_user_id: str, candidate_id: str, portal_domain: str) -> dict[str, Any] | None:
+        row = self.session.execute(
+            text(
+                """
+                SELECT *
+                FROM job_miner_control.candidate_external_accounts
+                WHERE app_user_id = :user_id
+                  AND candidate_id = :candidate_id
+                  AND portal_domain = :portal_domain
+                  AND is_active = TRUE
+                LIMIT 1
+                """
+            ),
+            {
+                "user_id": app_user_id,
+                "candidate_id": candidate_id,
+                "portal_domain": str(portal_domain or "").strip().lower().replace("www.", ""),
+            },
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def delete_candidate_external_account(self, app_user_id: str, candidate_id: str, portal_domain: str) -> dict[str, Any] | None:
+        row = self.session.execute(
+            text(
+                """
+                UPDATE job_miner_control.candidate_external_accounts
+                SET is_active = FALSE,
+                    account_status = 'revoked',
+                    modified_on = NOW()
+                WHERE app_user_id = :user_id
+                  AND candidate_id = :candidate_id
+                  AND portal_domain = :portal_domain
+                  AND is_active = TRUE
+                RETURNING *
+                """
+            ),
+            {
+                "user_id": app_user_id,
+                "candidate_id": candidate_id,
+                "portal_domain": str(portal_domain or "").strip().lower().replace("www.", ""),
+            },
+        ).mappings().first()
+        return dict(row) if row else None
+
 
     def create_pipeline_run(self, *, pipeline_name: str, user: dict[str, Any] | None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         run_session_id = f"{pipeline_name}_{utc_now().strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"

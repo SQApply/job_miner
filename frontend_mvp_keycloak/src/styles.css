@@ -309,10 +309,15 @@ textarea {
   gap: 8px;
   align-items: stretch;
   flex-shrink: 0;
+  width: 86px;
 }
 
 .saved-actions .button {
-  width: 100%;
+  width: 86px;
+  min-width: 86px;
+  max-width: 86px;
+  min-height: 34px;
+  padding: 8px 8px;
 }
 
 .compact-list {

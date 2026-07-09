@@ -108,5 +108,13 @@ class ApplySavedJobsAgentRequest(BaseModel):
     max_jobs: int = Field(default=25, ge=1, le=100)
 
 
+class CandidateExternalAccountRequest(BaseModel):
+    portal_domain: str = Field(default="careers.strategicstaff.com", min_length=3, max_length=255)
+    username_email: str | None = Field(default=None, max_length=320)
+    password: str | None = Field(default=None, max_length=512)
+    allow_agent_login: bool = True
+    allow_agent_signup: bool = False
+
+
 class RetryApplicationBatchRequest(BaseModel):
     max_jobs: int = Field(default=25, ge=1, le=100)
