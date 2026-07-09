@@ -1,3 +1,4 @@
+# Run every active static target from blueprints/site_registry.yaml.
+# Put explicit ids here only when you intentionally want a partial fleet run.
 targets:
-  - strategic_staff_jobs
-  - jobdiva_jobs
+  - __all__

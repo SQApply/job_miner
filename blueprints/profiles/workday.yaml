@@ -20,7 +20,9 @@ listing:
     stop_after_stable_rounds: 2
 
 detail:
-  wait_for: "css:h1"
+  # Workday deployments often render job detail pages without a stable h1.
+  # Wait for Workday detail/body content instead of blocking on h1.
+  wait_for: "js:() => !!(document.body && document.body.innerText && document.body.innerText.length > 500 && (document.querySelector('[data-automation-id=\"jobPostingHeader\"]') || document.querySelector('[data-automation-id=\"jobPostingDescription\"]') || /apply|job description|locations|time type|job id|capital group/i.test(document.body.innerText)))"
   instruction: |
     Extract exactly one job posting from this page.
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from pymongo import UpdateOne
+from pymongo.collection import Collection
 from pymongo.database import Database
 
 from .base import utc_now
@@ -19,6 +20,7 @@ from .documents import (
     WarehouseRunSessionDocument,
 )
 from .hashing import make_candidate_id, make_job_id, make_resume_id_from_sha, stable_hash
+from .url_utils import canonical_job_url, canonical_job_urls
 from .job_dates import parse_job_posted_at
 from .serializers import as_str_list, to_plain_data
 from .skill_utils import build_canonical_candidate_skills, unique_skills
@@ -48,6 +50,327 @@ def _split_mongo_update_payload(doc: Any) -> tuple[dict[str, Any], dict[str, Any
 class WarehouseRepository:
     def __init__(self, db: Database):
         self.db = db
+
+    @staticmethod
+    def canonical_job_url(value: str | None) -> str:
+        return canonical_job_url(value)
+
+    @staticmethod
+    def _job_url_candidates(value: str | None) -> list[str]:
+        raw = str(value or "").strip()
+        canonical = canonical_job_url(raw)
+        return [url for url in dict.fromkeys([raw, canonical]) if url]
+
+    @staticmethod
+    def _job_url_filter(target_id: str, urls: list[str]) -> dict[str, Any]:
+        candidates: list[str] = []
+        for url in urls:
+            candidates.extend(WarehouseRepository._job_url_candidates(url))
+        values = list(dict.fromkeys(candidates))
+        if not values:
+            return {"target_id": target_id, "_id": {"$exists": False}}
+        return {
+            "target_id": target_id,
+            "$or": [
+                {"job_url": {"$in": values}},
+                {"source_url": {"$in": values}},
+                {"apply_url": {"$in": values}},
+                {"canonical_job_url": {"$in": values}},
+            ],
+        }
+
+    def _jobs_current(self) -> Collection:
+        return self.db[JobCurrentDocument.collection_name]
+
+    def _find_existing_job_for_payload(self, *, target_id: str, payload: dict[str, Any], computed_job_id: str) -> dict[str, Any] | None:
+        source_url = payload.get("source_url") or payload.get("job_url") or payload.get("url") or payload.get("apply_url")
+        url_candidates = self._job_url_candidates(str(source_url or ""))
+        filters: list[dict[str, Any]] = [{"job_id": computed_job_id}]
+        if url_candidates:
+            filters.append(self._job_url_filter(target_id, url_candidates))
+        job_reference = str(payload.get("job_reference") or payload.get("reference") or "").strip()
+        if job_reference:
+            filters.append({"target_id": target_id, "job_reference": job_reference})
+
+        for query in filters:
+            existing = self._jobs_current().find_one(query)
+            if existing:
+                return existing
+        return None
+
+    def plan_detail_rescrape(
+        self,
+        *,
+        target_id: str,
+        run_session_id: str,
+        discovered_urls: list[str],
+        force_detail_refresh: bool = False,
+        deep_refresh_days: int = 14,
+    ) -> dict[str, Any]:
+        """Decide which discovered URLs need expensive detail-page extraction.
+
+        Discovery runs are cheap and should happen every cycle. Detail extraction
+        is expensive because it opens a detail page and may call the local LLM.
+        This planner marks known jobs as seen immediately and returns only URLs
+        that are new, inactive/reactivated, incomplete, previously failed, or due
+        for a periodic deep refresh.
+        """
+        from datetime import timedelta
+
+        now = utc_now()
+        normalized_urls = canonical_job_urls(discovered_urls)
+        if not normalized_urls:
+            return {
+                "target_id": target_id,
+                "run_session_id": run_session_id,
+                "discovered_urls": 0,
+                "urls_to_extract": [],
+                "known_skipped": 0,
+                "new_urls": 0,
+                "due_for_refresh": 0,
+                "reactivated_or_incomplete": 0,
+                "force_detail_refresh": bool(force_detail_refresh),
+            }
+
+        # Read target docs and compare canonicalized URL keys so older records
+        # saved with tracking parameters still match the new discovery URL.
+        existing_docs = list(self._jobs_current().find({"target_id": target_id}))
+        by_url: dict[str, dict[str, Any]] = {}
+        for doc in existing_docs:
+            for field in ("canonical_job_url", "job_url", "source_url", "apply_url"):
+                key = canonical_job_url(doc.get(field))
+                if key:
+                    by_url[key] = doc
+
+        refresh_cutoff = now - timedelta(days=max(1, int(deep_refresh_days)))
+        urls_to_extract: list[str] = []
+        known_skipped = 0
+        new_urls = 0
+        due_for_refresh = 0
+        reactivated_or_incomplete = 0
+        seen_existing_ids: list[str] = []
+
+        for url in normalized_urls:
+            existing = by_url.get(url)
+            if not existing:
+                new_urls += 1
+                urls_to_extract.append(url)
+                continue
+
+            job_id = str(existing.get("job_id") or existing.get("_id") or "").strip()
+            if job_id:
+                seen_existing_ids.append(job_id)
+
+            inactive = existing.get("is_active") is False
+            failed_or_missing = str(existing.get("freshness_status") or "").lower() in {
+                "detail_extract_failed",
+                "parse_failed",
+                "validation_failed",
+                "inactive",
+                "missing_in_latest_scrape",
+            }
+            incomplete = not str(existing.get("title") or "").strip() or not str(existing.get("company") or "").strip()
+            last_deep = existing.get("last_deep_scraped_at") or existing.get("last_seen_at")
+            due = bool(last_deep and last_deep < refresh_cutoff)
+
+            if force_detail_refresh or inactive or failed_or_missing or incomplete or due:
+                urls_to_extract.append(url)
+                if due:
+                    due_for_refresh += 1
+                if inactive or failed_or_missing or incomplete:
+                    reactivated_or_incomplete += 1
+            else:
+                known_skipped += 1
+
+        if seen_existing_ids:
+            self._jobs_current().update_many(
+                {"job_id": {"$in": sorted(set(seen_existing_ids))}},
+                {
+                    "$set": {
+                        "last_seen_at": now,
+                        "last_run_session_id": run_session_id,
+                        "freshness_status": "active",
+                        "missing_count": 0,
+                        "is_active": True,
+                        "updated_at": now,
+                    },
+                    "$unset": {"inactive_reason": "", "deactivated_at": ""},
+                },
+            )
+
+        return {
+            "target_id": target_id,
+            "run_session_id": run_session_id,
+            "discovered_urls": len(normalized_urls),
+            "urls_to_extract": urls_to_extract,
+            "urls_to_extract_count": len(urls_to_extract),
+            "known_skipped": known_skipped,
+            "new_urls": new_urls,
+            "due_for_refresh": due_for_refresh,
+            "reactivated_or_incomplete": reactivated_or_incomplete,
+            "force_detail_refresh": bool(force_detail_refresh),
+            "deep_refresh_days": int(deep_refresh_days),
+        }
+
+    def reconcile_missing_jobs_after_discovery(
+        self,
+        *,
+        target_id: str,
+        run_session_id: str,
+        discovered_urls: list[str],
+        deactivate_after_misses: int = 2,
+        min_discovery_coverage_ratio: float = 0.25,
+        allow_empty_discovery: bool = False,
+    ) -> dict[str, Any]:
+        """Mark active jobs missing only after a reliable listing-discovery run.
+
+        A single bad scrape must not deactivate the catalog. The coverage guard
+        skips lifecycle reconciliation when a portal suddenly returns a suspicious
+        small number of URLs compared with the current active catalog.
+        """
+        now = utc_now()
+        normalized_urls = canonical_job_urls(discovered_urls)
+        active_count = self._jobs_current().count_documents({"target_id": target_id, "is_active": True})
+
+        if not normalized_urls and not allow_empty_discovery:
+            return {
+                "status": "skipped_empty_discovery",
+                "active_jobs": active_count,
+                "discovered_urls": 0,
+                "missing_marked": 0,
+                "deactivated": 0,
+            }
+
+        if active_count and len(normalized_urls) < max(1, int(active_count * float(min_discovery_coverage_ratio))):
+            return {
+                "status": "skipped_low_coverage",
+                "active_jobs": active_count,
+                "discovered_urls": len(normalized_urls),
+                "min_discovery_coverage_ratio": min_discovery_coverage_ratio,
+                "missing_marked": 0,
+                "deactivated": 0,
+            }
+
+        normalized_set = set(normalized_urls)
+        seen_ids: list[str] = []
+        for doc in self._jobs_current().find({"target_id": target_id, "is_active": True}, {"job_id": 1, "job_url": 1, "source_url": 1, "apply_url": 1, "canonical_job_url": 1}):
+            doc_keys = {
+                canonical_job_url(doc.get("canonical_job_url")),
+                canonical_job_url(doc.get("job_url")),
+                canonical_job_url(doc.get("source_url")),
+                canonical_job_url(doc.get("apply_url")),
+            }
+            if normalized_set.intersection({key for key in doc_keys if key}):
+                seen_ids.append(str(doc.get("job_id") or doc.get("_id")))
+        missing_filter: dict[str, Any] = {"target_id": target_id, "is_active": True}
+        if seen_ids:
+            missing_filter["job_id"] = {"$nin": sorted(set(seen_ids))}
+
+        missing_result = self._jobs_current().update_many(
+            missing_filter,
+            {
+                "$inc": {"missing_count": 1},
+                "$set": {
+                    "freshness_status": "missing_in_latest_scrape",
+                    "last_missing_at": now,
+                    "updated_at": now,
+                },
+            },
+        )
+        deactivate_result = self._jobs_current().update_many(
+            {
+                "target_id": target_id,
+                "is_active": True,
+                "missing_count": {"$gte": max(1, int(deactivate_after_misses))},
+            },
+            {
+                "$set": {
+                    "is_active": False,
+                    "freshness_status": "inactive",
+                    "inactive_reason": "not_seen_in_successive_scrapes",
+                    "deactivated_at": now,
+                    "updated_at": now,
+                }
+            },
+        )
+        return {
+            "status": "completed",
+            "active_jobs_before_reconcile": active_count,
+            "discovered_urls": len(normalized_urls),
+            "missing_marked": int(missing_result.modified_count),
+            "deactivated": int(deactivate_result.modified_count),
+            "deactivate_after_misses": int(deactivate_after_misses),
+        }
+
+    def record_recommendation_refresh_requests(
+        self,
+        *,
+        portal_id: str,
+        target_id: str,
+        run_session_id: str,
+        changed_job_ids: list[str],
+        candidate_limit: int = 250,
+    ) -> dict[str, Any]:
+        """Record a bounded recommendation-refresh backlog instead of immediate fan-out.
+
+        New/changed portal jobs should not trigger recommendation regeneration for
+        every candidate at once. This method records a capped set of pending
+        refresh requests that a separate worker drains in controlled batches.
+        """
+        normalized_jobs = sorted({str(job_id) for job_id in changed_job_ids if str(job_id or "").strip()})
+        if not normalized_jobs:
+            return {"status": "skipped_no_changed_jobs", "requests_created": 0, "changed_job_count": 0}
+
+        now = utc_now()
+        candidates = list(self.db["candidate_tower_records"].find(
+            {
+                "$and": [
+                    {"candidate_id": {"$exists": True, "$ne": None}},
+                    {"profile_state": {"$ne": "incomplete"}},
+                ]
+            },
+            {"candidate_id": 1, "resume_id": 1, "email": 1, "recommendation_status": 1, "updated_at": 1},
+        ).sort("updated_at", -1).limit(max(1, int(candidate_limit))))
+
+        requests = []
+        for candidate in candidates:
+            candidate_id = str(candidate.get("candidate_id") or "").strip()
+            if not candidate_id:
+                continue
+            requests.append(UpdateOne(
+                {"candidate_id": candidate_id, "status": {"$in": ["pending", "queued", "running"]}},
+                {
+                    "$setOnInsert": {
+                        "request_id": stable_hash("recommendation_refresh_request", portal_id, run_session_id, candidate_id)[:32],
+                        "candidate_id": candidate_id,
+                        "resume_id": candidate.get("resume_id"),
+                        "email": candidate.get("email"),
+                        "created_at": now,
+                    },
+                    "$set": {
+                        "status": "pending",
+                        "reason": "portal_jobs_changed",
+                        "portal_id": portal_id,
+                        "target_id": target_id,
+                        "run_session_id": run_session_id,
+                        "changed_job_ids": normalized_jobs[:200],
+                        "changed_job_count": len(normalized_jobs),
+                        "priority": 50,
+                        "updated_at": now,
+                    },
+                },
+                upsert=True,
+            ))
+        if not requests:
+            return {"status": "skipped_no_candidates", "requests_created": 0, "changed_job_count": len(normalized_jobs)}
+        result = self.db["recommendation_refresh_requests"].bulk_write(requests, ordered=False)
+        return {
+            "status": "recorded_pending_requests",
+            "candidate_scan_limit": int(candidate_limit),
+            "changed_job_count": len(normalized_jobs),
+            "requests_created": int(result.upserted_count),
+            "requests_matched_existing": int(result.matched_count),
+        }
 
     def upsert_run_session(self, doc: WarehouseRunSessionDocument) -> None:
         data, set_on_insert = _split_mongo_update_payload(doc)
@@ -82,7 +405,7 @@ class WarehouseRepository:
     ) -> tuple[str, bool, bool]:
         payload = to_plain_data(job_payload)
 
-        job_id = make_job_id(payload, target_id=target_id)
+        computed_job_id = make_job_id(payload, target_id=target_id)
         # Portal freshness strings (for example, "3 days ago") change on every
         # crawl even when the job itself has not changed. Keep them out of the
         # version/history hash while still persisting them on the current record.
@@ -91,9 +414,12 @@ class WarehouseRepository:
         content_hash = stable_hash(content_hash_payload)
         now = utc_now()
 
-        existing = self.db[JobCurrentDocument.collection_name].find_one(
-            {"job_id": job_id}
+        existing = self._find_existing_job_for_payload(
+            target_id=target_id,
+            payload=payload,
+            computed_job_id=computed_job_id,
         )
+        job_id = str((existing or {}).get("job_id") or computed_job_id)
 
         changed = existing is None or existing.get("content_hash") != content_hash
 
@@ -107,6 +433,7 @@ class WarehouseRepository:
             or payload.get("job_url")
             or payload.get("url")
         )
+        canonical_source_url = canonical_job_url(source_url or payload.get("job_url") or payload.get("url"))
 
         posted_date = str(payload.get("posted_date") or "").strip() or None
         parsed_posted_at = parse_job_posted_at(posted_date, reference_time=now) if posted_date else None
@@ -146,6 +473,14 @@ class WarehouseRepository:
         )
 
         data, set_on_insert = _split_mongo_update_payload(doc)
+        data.update({
+            "canonical_job_url": canonical_source_url,
+            "missing_count": 0,
+            "freshness_status": "active",
+            "last_deep_scraped_at": now,
+            "inactive_reason": None,
+            "deactivated_at": None,
+        })
 
         self.db[JobCurrentDocument.collection_name].update_one(
             {"job_id": job_id},
@@ -207,18 +542,19 @@ class WarehouseRepository:
         *,
         target_id: str,
         run_session_id: str | None = None,
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         stats = {
             "input": 0,
             "inserted": 0,
             "changed": 0,
             "unchanged": 0,
+            "changed_job_ids": [],
         }
 
         for job in jobs:
             stats["input"] += 1
 
-            _, inserted, changed = self.upsert_job(
+            job_id, inserted, changed = self.upsert_job(
                 job,
                 target_id=target_id,
                 run_session_id=run_session_id,
@@ -226,8 +562,10 @@ class WarehouseRepository:
 
             if inserted:
                 stats["inserted"] += 1
+                stats["changed_job_ids"].append(job_id)
             elif changed:
                 stats["changed"] += 1
+                stats["changed_job_ids"].append(job_id)
             else:
                 stats["unchanged"] += 1
 
@@ -532,15 +870,74 @@ class WarehouseRepository:
             for name in names
         }
 
-    def active_jobs(self, *, limit: int | None = None) -> list[dict[str, Any]]:
-        cursor = self.db[JobCurrentDocument.collection_name].find(
-            {"is_active": True}
-        ).sort("last_seen_at", -1)
 
-        if limit:
-            cursor = cursor.limit(limit)
+    def reset_missing_state_for_discovered_urls(
+        self,
+        *,
+        target_id: str,
+        run_session_id: str | None,
+        discovered_urls: list[str],
+    ) -> dict[str, int]:
+        normalized_urls = canonical_job_urls(discovered_urls)
+        if not normalized_urls:
+            return {"matched_existing": 0, "modified_existing": 0}
+        matched_ids: set[str] = set()
+        for doc in self._jobs_current().find({"target_id": target_id}, {"job_id": 1, "job_url": 1, "source_url": 1, "apply_url": 1, "canonical_job_url": 1}):
+            doc_keys = {
+                canonical_job_url(doc.get("canonical_job_url")),
+                canonical_job_url(doc.get("job_url")),
+                canonical_job_url(doc.get("source_url")),
+                canonical_job_url(doc.get("apply_url")),
+            }
+            if set(normalized_urls).intersection({key for key in doc_keys if key}):
+                matched_ids.add(str(doc.get("job_id") or doc.get("_id")))
 
-        return list(cursor)
+        if not matched_ids:
+            return {"matched_existing": 0, "modified_existing": 0}
+        result = self._jobs_current().update_many(
+            {"job_id": {"$in": sorted(matched_ids)}},
+            {
+                "$set": {
+                    "last_seen_at": utc_now(),
+                    "last_run_session_id": run_session_id,
+                    "freshness_status": "active",
+                    "missing_count": 0,
+                    "is_active": True,
+                    "updated_at": utc_now(),
+                },
+                "$unset": {"inactive_reason": "", "deactivated_at": ""},
+            },
+        )
+        return {"matched_existing": len(matched_ids), "modified_existing": int(result.modified_count)}
+
+    def active_jobs(
+        self,
+        *,
+        limit: int | None = None,
+        only_pending_tower: bool = False,
+        job_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        query: dict[str, Any] = {"is_active": True}
+        normalized_job_ids = [str(job_id) for job_id in (job_ids or []) if str(job_id).strip()]
+        if normalized_job_ids:
+            query["job_id"] = {"$in": normalized_job_ids}
+
+        cursor = self.db[JobCurrentDocument.collection_name].find(query).sort("last_seen_at", -1)
+
+        if not only_pending_tower:
+            if limit:
+                cursor = cursor.limit(limit)
+            return list(cursor)
+
+        out: list[dict[str, Any]] = []
+        towers = self.db[JobTowerDocument.collection_name]
+        for job in cursor:
+            tower = towers.find_one({"job_id": job.get("job_id")}, {"source_content_hash": 1})
+            if not tower or str(tower.get("source_content_hash") or "") != str(job.get("content_hash") or ""):
+                out.append(job)
+                if limit and len(out) >= int(limit):
+                    break
+        return out
 
     def active_resume_profiles(
         self,

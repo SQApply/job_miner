@@ -55,6 +55,28 @@ class BlueprintHub:
     def list_target_ids(self) -> list[str]:
         return [site.id for site in self.registry.sites]
 
+    def _fleet_target_ids(self) -> list[str]:
+        """Return target ids for launch-fleet.
+
+        Historically ``blueprints/fleet.yaml`` listed only two targets, so
+        ``python -m src --root . launch-fleet`` silently skipped the rest of
+        the registered websites.  ``__all__`` makes the default behavior match
+        production expectations: run every active static target in
+        ``site_registry.yaml``.
+        """
+        fleet = self._load_yaml(self.blueprints_dir / "fleet.yaml")
+        raw_targets = [str(item).strip() for item in (fleet.get("targets") or []) if str(item).strip()]
+
+        if not raw_targets or any(item.lower() in {"__all__", "all", "*"} for item in raw_targets):
+            return self.list_target_ids()
+
+        known = set(self.list_target_ids())
+        unknown = [item for item in raw_targets if item not in known]
+        if unknown:
+            raise KeyError(f"Unknown fleet target id(s): {', '.join(unknown)}")
+
+        return raw_targets
+
     def get_target(self, target_id: str) -> ResolvedBlueprint:
         site = next((item for item in self.registry.sites if item.id == target_id), None)
         if site is None:
@@ -94,6 +116,4 @@ class BlueprintHub:
         return ResolvedBlueprint.model_validate(resolved_raw)
 
     def get_fleet_targets(self) -> list[ResolvedBlueprint]:
-        fleet = self._load_yaml(self.blueprints_dir / "fleet.yaml")
-        target_ids = fleet.get("targets", [])
-        return [self.get_target(target_id) for target_id in target_ids]
+        return [self.get_target(target_id) for target_id in self._fleet_target_ids()]

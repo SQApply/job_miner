@@ -15,8 +15,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     target_cmd = subparsers.add_parser("launch-target", help="Run one target")
     target_cmd.add_argument("--target", required=True, help="Target id from blueprints/site_registry.yaml")
+    target_cmd.add_argument("--force-detail-refresh", action="store_true", help="Ignore incremental planning and deep-scrape every discovered URL")
+    target_cmd.add_argument("--disable-incremental-rescrape", action="store_true", help="Use the old behavior and scrape every discovered detail URL")
+    target_cmd.add_argument("--deep-refresh-days", type=int, default=14, help="Deep-refresh active known jobs after this many days")
 
-    subparsers.add_parser("launch-fleet", help="Run all targets in blueprints/fleet.yaml")
+    fleet_cmd = subparsers.add_parser("launch-fleet", help="Run all targets in blueprints/fleet.yaml")
+    fleet_cmd.add_argument("--force-detail-refresh", action="store_true", help="Ignore incremental planning and deep-scrape every discovered URL")
+    fleet_cmd.add_argument("--disable-incremental-rescrape", action="store_true", help="Use the old behavior and scrape every discovered detail URL")
+    fleet_cmd.add_argument("--deep-refresh-days", type=int, default=14, help="Deep-refresh active known jobs after this many days")
     return parser
 
 
@@ -26,11 +32,26 @@ def main() -> None:
     root = resolve_root(args.root)
 
     if args.command == "launch-target":
-        result = asyncio.run(run_target(root, args.target))
+        result = asyncio.run(
+            run_target(
+                root,
+                args.target,
+                force_detail_refresh=bool(args.force_detail_refresh),
+                incremental_rescrape=not bool(args.disable_incremental_rescrape),
+                deep_refresh_days=int(args.deep_refresh_days),
+            )
+        )
         print(json.dumps(result.model_dump(), indent=2, ensure_ascii=False))
         return
 
     if args.command == "launch-fleet":
-        results = asyncio.run(run_fleet(root))
+        results = asyncio.run(
+            run_fleet(
+                root,
+                force_detail_refresh=bool(args.force_detail_refresh),
+                incremental_rescrape=not bool(args.disable_incremental_rescrape),
+                deep_refresh_days=int(args.deep_refresh_days),
+            )
+        )
         print(json.dumps([item.model_dump() for item in results], indent=2, ensure_ascii=False))
         return

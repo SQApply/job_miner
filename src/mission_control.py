@@ -10,10 +10,12 @@ from .crawl.browser_lane import build_browser_config, detail_run_config, close_s
 from .extract.model_lane import build_llm_strategy, parse_extracted_jobs
 from .extract.promptforge import build_instruction
 from .extract.validator import is_valid_job
+from .infrastructure.mongo import get_mongo_database
 from .gpu_monitor import query_gpu_snapshot
 from .logger import build_session_logger
 from .router import get_adapter
 from .schemas import RunResult
+from .warehouse.repositories import WarehouseRepository
 from .store.storefront import (
     save_jobs_csv,
     save_jobs_json,
@@ -45,7 +47,60 @@ def _new_run_session_id(target_id: str) -> str:
     return f"{target_id}_{stamp}"
 
 
-async def run_target(root: Path, target_id: str) -> RunResult:
+def _plan_incremental_rescrape(
+    *,
+    target_id: str,
+    run_session_id: str,
+    discovered_urls: list[str],
+    force_detail_refresh: bool,
+    incremental_rescrape: bool,
+    deep_refresh_days: int,
+) -> tuple[list[str], dict]:
+    if not incremental_rescrape:
+        return list(dict.fromkeys(discovered_urls)), {
+            "status": "disabled",
+            "discovered_urls": len(set(discovered_urls)),
+            "urls_to_extract_count": len(set(discovered_urls)),
+            "known_skipped": 0,
+            "force_detail_refresh": bool(force_detail_refresh),
+        }
+
+    try:
+        repo = WarehouseRepository(get_mongo_database())
+        plan = repo.plan_detail_rescrape(
+            target_id=target_id,
+            run_session_id=run_session_id,
+            discovered_urls=discovered_urls,
+            force_detail_refresh=force_detail_refresh,
+            deep_refresh_days=deep_refresh_days,
+        )
+        return list(plan.get("urls_to_extract") or []), {**plan, "status": "planned"}
+    except Exception as exc:
+        # Scraping should still work if MongoDB is temporarily unavailable; it
+        # will simply fall back to the old full-detail scrape behavior.
+        return list(dict.fromkeys(discovered_urls)), {
+            "status": "fallback_full_scrape",
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "discovered_urls": len(set(discovered_urls)),
+            "urls_to_extract_count": len(set(discovered_urls)),
+        }
+
+
+def _pending_backfill_reconcile(*, incremental_rescrape: bool) -> dict:
+    if not incremental_rescrape:
+        return {"status": "disabled"}
+    return {"status": "pending_backfill", "message": "Missing/inactive reconciliation runs during warehouse backfill."}
+
+
+async def run_target(
+    root: Path,
+    target_id: str,
+    *,
+    force_detail_refresh: bool = False,
+    incremental_rescrape: bool = True,
+    deep_refresh_days: int = 14,
+) -> RunResult:
     from crawl4ai import AsyncWebCrawler
 
     website_t0 = time.perf_counter()
@@ -81,6 +136,16 @@ async def run_target(root: Path, target_id: str) -> RunResult:
             "discovery_complete",
             discovered_urls=len(job_urls),
         )
+
+        urls_to_extract, rescrape_plan = _plan_incremental_rescrape(
+            target_id=target_id,
+            run_session_id=run_session_id,
+            discovered_urls=job_urls,
+            force_detail_refresh=force_detail_refresh,
+            incremental_rescrape=incremental_rescrape,
+            deep_refresh_days=deep_refresh_days,
+        )
+        session_logger.log("rescrape_plan_complete", **rescrape_plan)
 
         concurrency = system_config.browser.detail_extraction_concurrency
         semaphore = asyncio.Semaphore(concurrency)
@@ -209,14 +274,16 @@ async def run_target(root: Path, target_id: str) -> RunResult:
 
         session_logger.log(
             "parallel_extraction_start",
-            total_job_urls=len(job_urls),
+            total_job_urls=len(urls_to_extract),
+            discovered_urls=len(job_urls),
+            skipped_existing=int(rescrape_plan.get("known_skipped") or 0),
             concurrency=concurrency,
         )
 
         extraction_results = await asyncio.gather(
             *(
                 extract_one_job(job_url, idx)
-                for idx, job_url in enumerate(job_urls, start=1)
+                for idx, job_url in enumerate(urls_to_extract, start=1)
             ),
             return_exceptions=True,
         )
@@ -236,11 +303,13 @@ async def run_target(root: Path, target_id: str) -> RunResult:
 
         session_logger.log(
             "parallel_extraction_complete",
-            attempted_urls=len(job_urls),
+            attempted_urls=len(urls_to_extract),
+            discovered_urls=len(job_urls),
             extracted_jobs=len(jobs),
         )
 
     total_elapsed_seconds = round(time.perf_counter() - website_t0, 3)
+    lifecycle_reconcile = _pending_backfill_reconcile(incremental_rescrape=incremental_rescrape)
 
     output_dir = root / system_config.output.dir
     output_path = save_jobs_json(output_dir, blueprint.output_file, jobs, run_session_id)
@@ -268,6 +337,10 @@ async def run_target(root: Path, target_id: str) -> RunResult:
         output_path=str(output_path),
         log_path=str(log_path),
         total_elapsed_seconds=total_elapsed_seconds,
+        attempted_urls=len(urls_to_extract),
+        discovered_job_urls=job_urls,
+        rescrape_plan=rescrape_plan,
+        lifecycle_reconcile=lifecycle_reconcile,
     )
 
     session_logger.log(
@@ -276,6 +349,11 @@ async def run_target(root: Path, target_id: str) -> RunResult:
         summary_path=str(summary_path),
         discovered_urls=len(job_urls),
         extracted_jobs=len(jobs),
+        attempted_urls=len(urls_to_extract),
+        skipped_existing=int(rescrape_plan.get("known_skipped") or 0),
+        discovered_job_urls=job_urls,
+        rescrape_plan=rescrape_plan,
+        lifecycle_reconcile=lifecycle_reconcile,
         total_elapsed_seconds=total_elapsed_seconds,
     )
 
@@ -285,16 +363,33 @@ async def run_target(root: Path, target_id: str) -> RunResult:
         summary_path=str(summary_path),
         discovered_urls=len(job_urls),
         extracted_jobs=len(jobs),
+        attempted_urls=len(urls_to_extract),
+        skipped_existing=int(rescrape_plan.get("known_skipped") or 0),
+        discovered_job_urls=job_urls,
+        rescrape_plan=rescrape_plan,
+        lifecycle_reconcile=lifecycle_reconcile,
         total_elapsed_seconds=total_elapsed_seconds,
         jobs=jobs,
     )
 
 
-async def run_fleet(root: Path) -> list[RunResult]:
+async def run_fleet(
+    root: Path,
+    *,
+    force_detail_refresh: bool = False,
+    incremental_rescrape: bool = True,
+    deep_refresh_days: int = 14,
+) -> list[RunResult]:
     hub = BlueprintHub(root)
     results: list[RunResult] = []
 
     for target in hub.get_fleet_targets():
-        results.append(await run_target(root, target.id))
+        results.append(await run_target(
+            root,
+            target.id,
+            force_detail_refresh=force_detail_refresh,
+            incremental_rescrape=incremental_rescrape,
+            deep_refresh_days=deep_refresh_days,
+        ))
 
     return results

@@ -318,6 +318,8 @@ def _job_catalog_projection() -> dict[str, int]:
         "updated_at": 1,
         "catalog_visible": 1,
         "validation_status": 1,
+        "is_active": 1,
+        "freshness_status": 1,
     }
 
 
@@ -383,6 +385,8 @@ def _is_candidate_visible_job(job: dict[str, Any] | None) -> bool:
     apply_url = job.get("apply_url") or job.get("job_url") or job.get("source_url") or job.get("url")
     validation_status = str(job.get("validation_status") or "").strip().lower()
 
+    if job.get("is_active") is False:
+        return False
     if job.get("catalog_visible") is False:
         return False
     if validation_status in {"invalid", "invalid_missing_title", "invalid_missing_company", "invalid_missing_url"}:
@@ -400,6 +404,7 @@ def _candidate_visible_job_filter() -> dict[str, Any]:
     """Return a Mongo filter for jobs safe to show in candidate-facing views."""
     return {
         "$and": [
+            {"is_active": {"$ne": False}},
             {"catalog_visible": {"$ne": False}},
             {"validation_status": {"$nin": ["invalid", "invalid_missing_title", "invalid_missing_company", "invalid_missing_url"]}},
             {

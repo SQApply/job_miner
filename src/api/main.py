@@ -27,11 +27,13 @@ from .mvp_models import CandidateLinkRequest, CandidateProfileUpdateRequest, Fee
 from .resume_upload import process_candidate_resume_upload
 from .profile_edit import update_candidate_profile
 from .portal_routes import router as portal_router
+from .application_agent_routes import router as application_agent_router
 from .security import get_current_user, keycloak_public_config, require_permission
 
 app = FastAPI(title="Job Miner API", version="1.0.0")
 logger = logging.getLogger(__name__)
 app.include_router(portal_router)
+app.include_router(application_agent_router)
 
 def _cors_origins() -> list[str]:
     raw = os.getenv(EnvironmentVariables.API_CORS_ORIGINS, "http://localhost:5173,http://127.0.0.1:5173")
@@ -599,6 +601,24 @@ def saved_jobs(user: dict[str, Any] = Depends(require_permission("applications.m
         repo = ControlRepository(session)
         rows = repo.list_saved_jobs(str(user["id"]), link["candidate_id"])
     return {"saved_jobs": _attach_job_details(rows)}
+
+
+@app.delete("/me/saved-jobs/{job_id:path}")
+def remove_saved_job(job_id: str, user: dict[str, Any] = Depends(require_permission("applications.manage_self"))) -> dict[str, Any]:
+    link = _require_candidate_link(user)
+    with postgres_session() as session:
+        repo = ControlRepository(session)
+        removed = repo.remove_saved_job(str(user["id"]), link["candidate_id"], job_id)
+        if not removed:
+            raise HTTPException(status_code=404, detail="Saved job not found")
+        repo.add_application_event(
+            app_user_id=str(user["id"]),
+            candidate_id=link["candidate_id"],
+            job_id=job_id,
+            event_type="saved_job_removed",
+            payload={"removed_saved_job_id": str(removed.get("id")), "job_id": job_id},
+        )
+    return {"status": "removed", "job_id": job_id, "saved_job": removed}
 
 
 @app.get("/me/applications")

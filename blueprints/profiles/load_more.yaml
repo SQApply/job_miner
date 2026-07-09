@@ -15,8 +15,8 @@ listing:
 
   load_more:
     enabled: true
-    max_clicks: 200
-    stop_after_stable_rounds: 3
+    max_clicks: 50
+    stop_after_stable_rounds: 2
     button_text_patterns:
       - "load more"
       - "view more"

@@ -58,6 +58,12 @@ class JobPortalCreateRequest(BaseModel):
     request_rate_limit_per_minute: int = Field(default=30, ge=1, le=120)
     crawl_timeout_seconds: int = Field(default=1800, ge=30, le=7200)
     schedule_expression: str | None = Field(default=None, max_length=120)
+    scheduler_enabled: bool = False
+    refresh_interval_minutes: int | None = Field(default=None, ge=15, le=10080)
+    deactivate_after_misses: int = Field(default=2, ge=1, le=10)
+    min_discovery_coverage_ratio: float = Field(default=0.25, ge=0.05, le=1.0)
+    max_consecutive_failures_before_pause: int = Field(default=5, ge=1, le=20)
+    detail_retry_attempts: int = Field(default=2, ge=0, le=5)
 
 
 class JobPortalUpdateRequest(BaseModel):
@@ -68,6 +74,21 @@ class JobPortalUpdateRequest(BaseModel):
     request_rate_limit_per_minute: int | None = Field(default=None, ge=1, le=120)
     crawl_timeout_seconds: int | None = Field(default=None, ge=30, le=7200)
     schedule_expression: str | None = Field(default=None, max_length=120)
+    scheduler_enabled: bool | None = None
+    refresh_interval_minutes: int | None = Field(default=None, ge=15, le=10080)
+    deactivate_after_misses: int | None = Field(default=None, ge=1, le=10)
+    min_discovery_coverage_ratio: float | None = Field(default=None, ge=0.05, le=1.0)
+    max_consecutive_failures_before_pause: int | None = Field(default=None, ge=1, le=20)
+    detail_retry_attempts: int | None = Field(default=None, ge=0, le=5)
+    configuration_version: int | None = Field(default=None, ge=1)
+
+
+class JobPortalOverrideRequest(BaseModel):
+    profile_name: str = Field(min_length=2, max_length=80)
+    source_platform: str | None = Field(default=None, max_length=80)
+    crawl_strategy: str | None = Field(default=None, max_length=80)
+    profile_overrides: dict = Field(default_factory=dict)
+    notes: str | None = Field(default=None, max_length=2000)
     configuration_version: int | None = Field(default=None, ge=1)
 
 
@@ -75,3 +96,17 @@ class JobPortalRunRequest(BaseModel):
     # Full portal runs are bounded by the portal's persisted max_jobs_per_run.
     # This optional lower cap is useful for controlled admin refreshes.
     max_jobs: int | None = Field(default=None, ge=1, le=2000)
+
+
+class PortalSchedulerRunRequest(BaseModel):
+    limit: int = Field(default=10, ge=1, le=100)
+
+class ApplySavedJobsAgentRequest(BaseModel):
+    job_ids: list[str] | None = None
+    mode: str = Field(default="all_saved", pattern="^(all_saved|selected_jobs)$")
+    require_review_before_submit: bool = False
+    max_jobs: int = Field(default=25, ge=1, le=100)
+
+
+class RetryApplicationBatchRequest(BaseModel):
+    max_jobs: int = Field(default=25, ge=1, le=100)

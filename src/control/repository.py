@@ -583,6 +583,30 @@ class ControlRepository:
         ).mappings().all()
         return [dict(r) for r in rows]
 
+    def remove_saved_job(self, app_user_id: str, candidate_id: str, job_id: str) -> dict[str, Any] | None:
+        """Soft-remove a job from the candidate saved-jobs list.
+
+        The application/history rows are intentionally left untouched. Re-saving the
+        same job later reactivates the saved-job row through save_job().
+        """
+        row = self.session.execute(
+            text(
+                """
+                UPDATE job_miner_control.candidate_saved_jobs
+                SET status = 'removed_from_saved',
+                    is_active = FALSE,
+                    modified_on = NOW()
+                WHERE app_user_id = :user_id
+                  AND candidate_id = :candidate_id
+                  AND job_id = :job_id
+                  AND is_active = TRUE
+                RETURNING *
+                """
+            ),
+            {"user_id": app_user_id, "candidate_id": candidate_id, "job_id": job_id},
+        ).mappings().first()
+        return dict(row) if row else None
+
     def list_applications(self, app_user_id: str, candidate_id: str) -> list[dict[str, Any]]:
         rows = self.session.execute(
             text(
@@ -593,6 +617,456 @@ class ControlRepository:
                 """
             ),
             {"user_id": app_user_id, "candidate_id": candidate_id},
+        ).mappings().all()
+        return [dict(r) for r in rows]
+
+    def list_agent_eligible_saved_jobs(
+        self,
+        app_user_id: str,
+        candidate_id: str,
+        *,
+        job_ids: list[str] | None = None,
+        max_jobs: int = 25,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "user_id": app_user_id,
+            "candidate_id": candidate_id,
+            "max_jobs": max(1, min(int(max_jobs or 25), 100)),
+        }
+        job_filter = ""
+        if job_ids:
+            placeholders: list[str] = []
+            for index, job_id in enumerate(dict.fromkeys(str(j).strip() for j in job_ids if str(j).strip())):
+                key = f"job_id_{index}"
+                placeholders.append(f":{key}")
+                params[key] = job_id
+            if placeholders:
+                job_filter = f"AND sj.job_id IN ({', '.join(placeholders)})"
+
+        rows = self.session.execute(
+            text(
+                f"""
+                SELECT
+                    sj.*,
+                    app.id AS existing_application_id,
+                    app.application_status AS existing_application_status,
+                    app.apply_url AS existing_application_apply_url
+                FROM job_miner_control.candidate_saved_jobs sj
+                LEFT JOIN job_miner_control.candidate_job_applications app
+                    ON app.app_user_id = sj.app_user_id
+                   AND app.candidate_id = sj.candidate_id
+                   AND app.job_id = sj.job_id
+                   AND app.is_active = TRUE
+                WHERE sj.app_user_id = :user_id
+                  AND sj.candidate_id = :candidate_id
+                  AND sj.is_active = TRUE
+                  AND sj.status = 'saved'
+                  {job_filter}
+                ORDER BY sj.modified_on DESC
+                LIMIT :max_jobs
+                """
+            ),
+            params,
+        ).mappings().all()
+        return [dict(r) for r in rows]
+
+    def get_active_application_batch_for_candidate(self, app_user_id: str, candidate_id: str) -> dict[str, Any] | None:
+        row = self.session.execute(
+            text(
+                """
+                SELECT *
+                FROM job_miner_control.candidate_application_batches
+                WHERE app_user_id = :user_id
+                  AND candidate_id = :candidate_id
+                  AND is_active = TRUE
+                  AND batch_status IN ('queued', 'running')
+                ORDER BY created_on DESC
+                LIMIT 1
+                """
+            ),
+            {"user_id": app_user_id, "candidate_id": candidate_id},
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def create_application_batch(
+        self,
+        *,
+        app_user_id: str,
+        candidate_id: str,
+        requested_job_count: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        row = self.session.execute(
+            text(
+                """
+                INSERT INTO job_miner_control.candidate_application_batches (
+                    organization_id, app_user_id, candidate_id, batch_status,
+                    requested_job_count, queued_job_count, metadata
+                ) VALUES (
+                    :org_id, :user_id, :candidate_id, 'queued',
+                    :requested_job_count, :queued_job_count, CAST(:metadata AS jsonb)
+                )
+                RETURNING *
+                """
+            ),
+            {
+                "org_id": self.get_default_org_id(),
+                "user_id": app_user_id,
+                "candidate_id": candidate_id,
+                "requested_job_count": int(requested_job_count or 0),
+                "queued_job_count": int(requested_job_count or 0),
+                "metadata": _json(metadata or {}),
+            },
+        ).mappings().one()
+        return dict(row)
+
+    def set_application_batch_task(self, batch_id: str, task_uuid: str, *, langgraph_thread_id: str | None = None) -> None:
+        self.session.execute(
+            text(
+                """
+                UPDATE job_miner_control.candidate_application_batches
+                SET celery_task_uuid = :task_uuid,
+                    langgraph_thread_id = COALESCE(:langgraph_thread_id, langgraph_thread_id),
+                    modified_on = NOW()
+                WHERE id = :batch_id
+                """
+            ),
+            {"batch_id": batch_id, "task_uuid": task_uuid, "langgraph_thread_id": langgraph_thread_id},
+        )
+
+    def get_application_batch(self, batch_id: str, *, app_user_id: str | None = None) -> dict[str, Any] | None:
+        params: dict[str, Any] = {"batch_id": batch_id}
+        user_filter = ""
+        if app_user_id:
+            user_filter = "AND app_user_id = :user_id"
+            params["user_id"] = app_user_id
+        row = self.session.execute(
+            text(
+                f"""
+                SELECT *
+                FROM job_miner_control.candidate_application_batches
+                WHERE id = :batch_id AND is_active = TRUE {user_filter}
+                LIMIT 1
+                """
+            ),
+            params,
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def list_application_batches(self, app_user_id: str, candidate_id: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        rows = self.session.execute(
+            text(
+                """
+                SELECT *
+                FROM job_miner_control.candidate_application_batches
+                WHERE app_user_id = :user_id
+                  AND candidate_id = :candidate_id
+                  AND is_active = TRUE
+                ORDER BY created_on DESC
+                LIMIT :limit
+                """
+            ),
+            {"user_id": app_user_id, "candidate_id": candidate_id, "limit": max(1, min(int(limit or 10), 50))},
+        ).mappings().all()
+        return [dict(r) for r in rows]
+
+    def update_application_batch_status(
+        self,
+        batch_id: str,
+        status: str,
+        *,
+        error_message: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        started_expr = "started_on = COALESCE(started_on, NOW())," if status == "running" else ""
+        completed_expr = "completed_on = COALESCE(completed_on, NOW())," if status in {"completed", "completed_with_failures", "failed", "cancelled"} else ""
+        row = self.session.execute(
+            text(
+                f"""
+                UPDATE job_miner_control.candidate_application_batches
+                SET batch_status = :status,
+                    {started_expr}
+                    {completed_expr}
+                    metadata = metadata || CAST(:metadata AS jsonb),
+                    modified_on = NOW()
+                WHERE id = :batch_id
+                RETURNING *
+                """
+            ),
+            {
+                "batch_id": batch_id,
+                "status": status,
+                "metadata": _json({"error_message": error_message} if error_message else (metadata or {})),
+            },
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def create_application_job_run(
+        self,
+        *,
+        batch_id: str,
+        app_user_id: str,
+        candidate_id: str,
+        job_id: str,
+        application_id: str | None,
+        apply_url: str | None,
+        portal_domain: str | None,
+        apply_strategy: str | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        row = self.session.execute(
+            text(
+                """
+                INSERT INTO job_miner_control.candidate_application_job_runs (
+                    batch_id, organization_id, app_user_id, candidate_id, job_id,
+                    application_id, run_status, apply_url, portal_domain, apply_strategy, metadata
+                ) VALUES (
+                    :batch_id, :org_id, :user_id, :candidate_id, :job_id,
+                    :application_id, 'queued', :apply_url, :portal_domain, :apply_strategy, CAST(:metadata AS jsonb)
+                )
+                ON CONFLICT (batch_id, app_user_id, candidate_id, job_id)
+                DO UPDATE SET
+                    application_id = COALESCE(EXCLUDED.application_id, job_miner_control.candidate_application_job_runs.application_id),
+                    apply_url = COALESCE(EXCLUDED.apply_url, job_miner_control.candidate_application_job_runs.apply_url),
+                    portal_domain = COALESCE(EXCLUDED.portal_domain, job_miner_control.candidate_application_job_runs.portal_domain),
+                    apply_strategy = COALESCE(EXCLUDED.apply_strategy, job_miner_control.candidate_application_job_runs.apply_strategy),
+                    metadata = job_miner_control.candidate_application_job_runs.metadata || EXCLUDED.metadata,
+                    modified_on = NOW(),
+                    is_active = TRUE
+                RETURNING *
+                """
+            ),
+            {
+                "batch_id": batch_id,
+                "org_id": self.get_default_org_id(),
+                "user_id": app_user_id,
+                "candidate_id": candidate_id,
+                "job_id": job_id,
+                "application_id": application_id,
+                "apply_url": apply_url,
+                "portal_domain": portal_domain,
+                "apply_strategy": apply_strategy,
+                "metadata": _json(metadata or {}),
+            },
+        ).mappings().one()
+        return dict(row)
+
+    def set_application_job_run_task(self, job_run_id: str, task_uuid: str, *, langgraph_thread_id: str | None = None) -> None:
+        self.session.execute(
+            text(
+                """
+                UPDATE job_miner_control.candidate_application_job_runs
+                SET celery_task_uuid = :task_uuid,
+                    langgraph_thread_id = COALESCE(:langgraph_thread_id, langgraph_thread_id),
+                    modified_on = NOW()
+                WHERE id = :job_run_id
+                """
+            ),
+            {"job_run_id": job_run_id, "task_uuid": task_uuid, "langgraph_thread_id": langgraph_thread_id},
+        )
+
+    def get_application_job_run(self, job_run_id: str) -> dict[str, Any] | None:
+        row = self.session.execute(
+            text(
+                """
+                SELECT *
+                FROM job_miner_control.candidate_application_job_runs
+                WHERE id = :job_run_id AND is_active = TRUE
+                LIMIT 1
+                """
+            ),
+            {"job_run_id": job_run_id},
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def list_application_job_runs(self, batch_id: str) -> list[dict[str, Any]]:
+        rows = self.session.execute(
+            text(
+                """
+                SELECT *
+                FROM job_miner_control.candidate_application_job_runs
+                WHERE batch_id = :batch_id AND is_active = TRUE
+                ORDER BY created_on ASC
+                """
+            ),
+            {"batch_id": batch_id},
+        ).mappings().all()
+        return [dict(r) for r in rows]
+
+    def update_application_job_run_status(
+        self,
+        job_run_id: str,
+        status: str,
+        *,
+        apply_strategy: str | None = None,
+        portal_domain: str | None = None,
+        error_type: str | None = None,
+        error_message: str | None = None,
+        external_confirmation_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        started_expr = "started_on = COALESCE(started_on, NOW())," if status == "running" else ""
+        completed_expr = "completed_on = COALESCE(completed_on, NOW())," if status in {"submitted", "failed", "needs_review", "precheck_failed", "blocked_external_login", "blocked_captcha", "unsupported_portal", "skipped_duplicate"} else ""
+        submitted_expr = "submitted_on = COALESCE(submitted_on, NOW())," if status == "submitted" else ""
+        row = self.session.execute(
+            text(
+                f"""
+                UPDATE job_miner_control.candidate_application_job_runs
+                SET run_status = :status,
+                    {started_expr}
+                    {completed_expr}
+                    {submitted_expr}
+                    apply_strategy = COALESCE(:apply_strategy, apply_strategy),
+                    portal_domain = COALESCE(:portal_domain, portal_domain),
+                    error_type = :error_type,
+                    error_message = :error_message,
+                    external_confirmation_id = COALESCE(:external_confirmation_id, external_confirmation_id),
+                    metadata = metadata || CAST(:metadata AS jsonb),
+                    modified_on = NOW()
+                WHERE id = :job_run_id
+                RETURNING *
+                """
+            ),
+            {
+                "job_run_id": job_run_id,
+                "status": status,
+                "apply_strategy": apply_strategy,
+                "portal_domain": portal_domain,
+                "error_type": error_type,
+                "error_message": error_message,
+                "external_confirmation_id": external_confirmation_id,
+                "metadata": _json(metadata or {}),
+            },
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def update_application_status_by_id(
+        self,
+        application_id: str,
+        status: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        applied: bool = False,
+    ) -> dict[str, Any] | None:
+        row = self.session.execute(
+            text(
+                """
+                UPDATE job_miner_control.candidate_job_applications
+                SET application_status = :status,
+                    last_status_on = NOW(),
+                    applied_on = CASE WHEN :applied THEN COALESCE(applied_on, NOW()) ELSE applied_on END,
+                    agent_enabled = TRUE,
+                    metadata = metadata || CAST(:metadata AS jsonb),
+                    modified_on = NOW()
+                WHERE id = :application_id
+                RETURNING *
+                """
+            ),
+            {"application_id": application_id, "status": status, "metadata": _json(metadata or {}), "applied": applied},
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def refresh_application_batch_counts(self, batch_id: str) -> dict[str, Any] | None:
+        row = self.session.execute(
+            text(
+                """
+                WITH counts AS (
+                    SELECT
+                        COUNT(*) FILTER (WHERE run_status = 'queued') AS queued_count,
+                        COUNT(*) FILTER (WHERE run_status = 'running') AS running_count,
+                        COUNT(*) FILTER (WHERE run_status = 'submitted') AS success_count,
+                        COUNT(*) FILTER (WHERE run_status IN ('failed', 'precheck_failed', 'blocked_external_login', 'blocked_captcha', 'unsupported_portal')) AS failed_count,
+                        COUNT(*) FILTER (WHERE run_status = 'needs_review') AS needs_review_count,
+                        COUNT(*) FILTER (WHERE run_status = 'skipped_duplicate') AS skipped_count,
+                        COUNT(*) AS total_count
+                    FROM job_miner_control.candidate_application_job_runs
+                    WHERE batch_id = :batch_id AND is_active = TRUE
+                ), final_status AS (
+                    SELECT
+                        CASE
+                            WHEN total_count = 0 THEN 'completed'
+                            WHEN queued_count > 0 OR running_count > 0 THEN 'running'
+                            WHEN failed_count > 0 OR needs_review_count > 0 THEN 'completed_with_failures'
+                            ELSE 'completed'
+                        END AS batch_status,
+                        *
+                    FROM counts
+                )
+                UPDATE job_miner_control.candidate_application_batches b
+                SET queued_job_count = final_status.queued_count,
+                    running_job_count = final_status.running_count,
+                    success_count = final_status.success_count,
+                    failed_count = final_status.failed_count,
+                    needs_review_count = final_status.needs_review_count,
+                    skipped_count = final_status.skipped_count,
+                    batch_status = final_status.batch_status,
+                    completed_on = CASE
+                        WHEN final_status.batch_status IN ('completed', 'completed_with_failures') THEN COALESCE(b.completed_on, NOW())
+                        ELSE b.completed_on
+                    END,
+                    modified_on = NOW()
+                FROM final_status
+                WHERE b.id = :batch_id
+                RETURNING b.*
+                """
+            ),
+            {"batch_id": batch_id},
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def create_candidate_notification(
+        self,
+        *,
+        app_user_id: str,
+        candidate_id: str,
+        notification_type: str,
+        title: str,
+        body: str | None,
+        payload: dict[str, Any] | None = None,
+        channel: str = "candidate_portal",
+        status: str = "visible",
+    ) -> dict[str, Any]:
+        row = self.session.execute(
+            text(
+                """
+                INSERT INTO job_miner_control.candidate_notifications (
+                    organization_id, app_user_id, candidate_id, notification_type,
+                    channel, status, title, body, payload
+                ) VALUES (
+                    :org_id, :user_id, :candidate_id, :notification_type,
+                    :channel, :status, :title, :body, CAST(:payload AS jsonb)
+                )
+                RETURNING *
+                """
+            ),
+            {
+                "org_id": self.get_default_org_id(),
+                "user_id": app_user_id,
+                "candidate_id": candidate_id,
+                "notification_type": notification_type,
+                "channel": channel,
+                "status": status,
+                "title": title,
+                "body": body,
+                "payload": _json(payload or {}),
+            },
+        ).mappings().one()
+        return dict(row)
+
+    def list_candidate_notifications(self, app_user_id: str, candidate_id: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        rows = self.session.execute(
+            text(
+                """
+                SELECT *
+                FROM job_miner_control.candidate_notifications
+                WHERE app_user_id = :user_id
+                  AND candidate_id = :candidate_id
+                  AND is_active = TRUE
+                ORDER BY created_on DESC
+                LIMIT :limit
+                """
+            ),
+            {"user_id": app_user_id, "candidate_id": candidate_id, "limit": max(1, min(int(limit or 10), 50))},
         ).mappings().all()
         return [dict(r) for r in rows]
 

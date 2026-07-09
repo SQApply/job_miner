@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
 from ..control.portal_repository import JobPortalRepository
 from ..control.postgres import postgres_session
-from ..infrastructure.celery_app import celery_app
+from ..infrastructure.celery_app import PORTAL_SCRAPE_QUEUE, celery_app
 from ..infrastructure.mongo import get_mongo_database
 from ..infrastructure.settings import load_app_settings
 from ..matching.mongo_qdrant_sync import build_embedder, build_vector_store, index_job_towers
@@ -21,6 +22,11 @@ from ..warehouse.tower_builders import build_job_tower_document
 logger = logging.getLogger(__name__)
 REPO_ROOT = Path(os.getenv("JOB_MINER_REPO_ROOT", ".")).resolve()
 TEST_SCRAPE_MAX_JOBS = int(os.getenv("JOB_MINER_PORTAL_TEST_SCRAPE_MAX_JOBS", "5"))
+TEST_SCRAPE_MAX_PAGES = int(os.getenv("JOB_MINER_PORTAL_TEST_SCRAPE_MAX_PAGES", "3"))
+TEST_SCRAPE_DETAIL_RETRIES = int(os.getenv("JOB_MINER_PORTAL_TEST_SCRAPE_DETAIL_RETRIES", "1"))
+TEST_SCRAPE_TIMEOUT_SECONDS = int(os.getenv("JOB_MINER_PORTAL_TEST_SCRAPE_TIMEOUT_SECONDS", "600"))
+PORTAL_SCHEDULER_BATCH_SIZE = int(os.getenv("JOB_MINER_PORTAL_SCHEDULER_BATCH_SIZE", "10"))
+PORTAL_RECOMMENDATION_REFRESH_CANDIDATE_LIMIT = int(os.getenv("JOB_MINER_PORTAL_RECOMMENDATION_REFRESH_CANDIDATE_LIMIT", "250"))
 
 
 def _run_with_portal_timeout(coroutine: Any, timeout_seconds: int) -> Any:
@@ -171,6 +177,41 @@ def _index_changed_jobs(*, job_ids: list[str]) -> dict[str, Any]:
     )
 
 
+def _record_artifacts(*, portal: dict[str, Any], pipeline_run_id: str, artifacts: list[dict[str, Any]] | None) -> dict[str, Any]:
+    if not artifacts:
+        return {"status": "skipped_no_artifacts", "artifact_count": 0}
+    with postgres_session() as session:
+        repo = JobPortalRepository(session)
+        repo.record_file_artifacts(portal=portal, pipeline_run_id=pipeline_run_id, artifacts=artifacts)
+    return {"status": "recorded", "artifact_count": len(artifacts)}
+
+
+def _reconcile_lifecycle_after_ingestion(*, portal: dict[str, Any], run_session_id: str, discovered_urls: list[str] | None) -> dict[str, Any]:
+    urls = list(discovered_urls or [])
+    if not urls:
+        return {"status": "skipped_no_discovered_urls", "missing_marked": 0, "deactivated": 0}
+    warehouse = WarehouseRepository(get_mongo_database())
+    return warehouse.reconcile_missing_jobs_after_discovery(
+        target_id=str(portal["target_id"]),
+        run_session_id=run_session_id,
+        discovered_urls=urls,
+        deactivate_after_misses=int(portal.get("deactivate_after_misses") or 2),
+        min_discovery_coverage_ratio=float(portal.get("min_discovery_coverage_ratio") or 0.25),
+        allow_empty_discovery=False,
+    )
+
+
+def _record_recommendation_refresh_policy(*, portal: dict[str, Any], run_session_id: str, changed_job_ids: list[str]) -> dict[str, Any]:
+    warehouse = WarehouseRepository(get_mongo_database())
+    return warehouse.record_recommendation_refresh_requests(
+        portal_id=str(portal["id"]),
+        target_id=str(portal["target_id"]),
+        run_session_id=run_session_id,
+        changed_job_ids=changed_job_ids,
+        candidate_limit=PORTAL_RECOMMENDATION_REFRESH_CANDIDATE_LIMIT,
+    )
+
+
 @celery_app.task(bind=True, name="src.tasks.portal_tasks.probe_job_portal_task")
 def probe_job_portal_task(self, portal_id: str, pipeline_run_id: str) -> dict[str, Any]:
     task_uuid = self.request.id
@@ -190,6 +231,7 @@ def probe_job_portal_task(self, portal_id: str, pipeline_run_id: str) -> dict[st
             int(portal["crawl_timeout_seconds"]),
         )
         metrics = probe_result.to_dict()
+        metrics["artifacts"] = _record_artifacts(portal=portal, pipeline_run_id=pipeline_run_id, artifacts=probe_result.artifacts)
         with postgres_session() as session:
             repo = JobPortalRepository(session)
             updated = repo.save_probe_result(portal_id=portal_id, result=metrics)
@@ -242,13 +284,53 @@ def test_scrape_job_portal_task(self, portal_id: str, pipeline_run_id: str) -> d
             step_key=step_key,
             step_name=step_name,
         )
+        
+        # max_jobs = min(TEST_SCRAPE_MAX_JOBS, int(portal["max_jobs_per_run"]))
+        # result = _run_with_portal_timeout(
+        #     scrape_portal(
+        #         root=REPO_ROOT,
+        #         portal=portal,
+        #         run_session_id=str(pipeline_run_id),
+        #         max_jobs=max_jobs,
+        #         incremental_rescrape=False,
+        #         reconcile_lifecycle=False,
+        #     ),
+        #     int(portal["crawl_timeout_seconds"]),
+        # )
         max_jobs = min(TEST_SCRAPE_MAX_JOBS, int(portal["max_jobs_per_run"]))
+
+        test_portal = dict(portal)
+        test_portal["max_pages_per_run"] = min(
+            TEST_SCRAPE_MAX_PAGES,
+            int(portal.get("max_pages_per_run") or TEST_SCRAPE_MAX_PAGES),
+        )
+        test_portal["detail_retry_attempts"] = min(
+            int(portal.get("detail_retry_attempts") or 0),
+            TEST_SCRAPE_DETAIL_RETRIES,
+        )
+
+        test_timeout = min(
+            int(portal.get("crawl_timeout_seconds") or TEST_SCRAPE_TIMEOUT_SECONDS),
+            TEST_SCRAPE_TIMEOUT_SECONDS,
+        )
+
         result = _run_with_portal_timeout(
-            scrape_portal(root=REPO_ROOT, portal=portal, run_session_id=str(pipeline_run_id), max_jobs=max_jobs),
-            int(portal["crawl_timeout_seconds"]),
+            scrape_portal(
+                root=REPO_ROOT,
+                portal=test_portal,
+                run_session_id=str(pipeline_run_id),
+                max_jobs=max_jobs,
+                incremental_rescrape=False,
+                reconcile_lifecycle=False,
+            ),
+            test_timeout,
         )
         metrics = result.metrics()
+        metrics["artifacts"] = _record_artifacts(portal=portal, pipeline_run_id=pipeline_run_id, artifacts=result.artifacts)
         metrics["test_max_jobs"] = max_jobs
+        metrics["test_max_pages"] = int(test_portal["max_pages_per_run"])
+        metrics["test_detail_retries"] = int(test_portal["detail_retry_attempts"])
+        metrics["test_timeout_seconds"] = test_timeout
         metrics["sample_titles"] = [job.title for job in result.extracted_jobs[:5] if job.title]
         successful = bool(result.extracted_jobs) and result.discovered_urls > 0
         lifecycle_status = "ready_for_activation" if successful else "needs_review"
@@ -302,16 +384,21 @@ def scrape_job_portal_task(self, portal_id: str, pipeline_run_id: str, max_jobs:
                 portal=portal,
                 run_session_id=str(pipeline_run_id),
                 max_jobs=effective_max_jobs,
+                incremental_rescrape=True,
+                reconcile_lifecycle=False,
             ),
             int(portal["crawl_timeout_seconds"]),
         )
-        if not result.extracted_jobs:
+        artifact_metrics = _record_artifacts(portal=portal, pipeline_run_id=pipeline_run_id, artifacts=result.artifacts)
+        if not result.extracted_jobs and int(result.skipped_existing or 0) == 0:
             raise RuntimeError("Portal scrape completed without a valid job record. Existing catalog jobs were left unchanged.")
         with postgres_session() as session:
             repo = JobPortalRepository(session)
             run = repo.get_pipeline_run(pipeline_run_id)
             run_session_id = str((run or {}).get("run_session_id") or pipeline_run_id)
         ingestion, changed_job_ids = _ingest_jobs(portal=portal, run_session_id=run_session_id, jobs=result.extracted_jobs)
+        lifecycle_reconcile = _reconcile_lifecycle_after_ingestion(portal=portal, run_session_id=run_session_id, discovered_urls=result.discovered_job_urls)
+        recommendation_refresh = _record_recommendation_refresh_policy(portal=portal, run_session_id=run_session_id, changed_job_ids=changed_job_ids)
 
         with postgres_session() as session:
             repo = JobPortalRepository(session)
@@ -378,7 +465,7 @@ def scrape_job_portal_task(self, portal_id: str, pipeline_run_id: str, max_jobs:
                     payload={"portal_id": portal_id, **incremental_indexing},
                 )
 
-        metrics = {**result.metrics(), "ingestion": ingestion, "incremental_indexing": incremental_indexing}
+        metrics = {**result.metrics(), "artifacts": artifact_metrics, "ingestion": ingestion, "lifecycle_reconcile": lifecycle_reconcile, "incremental_indexing": incremental_indexing, "recommendation_refresh": recommendation_refresh}
         portal_out = _pipeline_completed(
             portal_id=portal_id,
             pipeline_run_id=pipeline_run_id,
@@ -405,3 +492,71 @@ def scrape_job_portal_task(self, portal_id: str, pipeline_run_id: str, max_jobs:
             step_name=step_name,
         )
         raise
+
+
+@celery_app.task(bind=True, name="src.tasks.portal_tasks.schedule_due_job_portals_task")
+def schedule_due_job_portals_task(self, limit: int | None = None) -> dict[str, Any]:
+    """Enqueue bounded refresh runs for active portals whose next_run_at is due.
+
+    Safe to run from Celery beat or manually. It uses the per-portal lease so
+    two schedulers cannot queue the same portal concurrently.
+    """
+    task_uuid = str(getattr(self.request, "id", "") or uuid.uuid4())
+    batch_limit = max(1, min(int(limit or PORTAL_SCHEDULER_BATCH_SIZE), 100))
+    queued: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    with postgres_session() as session:
+        repo = JobPortalRepository(session)
+        due_portals = repo.list_due_portals(limit=batch_limit)
+
+    for portal in due_portals:
+        portal_id = str(portal["id"])
+        scrape_task_id = str(uuid.uuid4())
+        lease_seconds = int(portal.get("crawl_timeout_seconds") or 1800) + 900
+        try:
+            with postgres_session() as session:
+                repo = JobPortalRepository(session)
+                if not repo.acquire_lease(portal_id=portal_id, lease_token=scrape_task_id, seconds=lease_seconds):
+                    skipped.append({"portal_id": portal_id, "reason": "lease_busy"})
+                    continue
+                run = repo.create_portal_pipeline_run(
+                    portal=portal,
+                    pipeline_name="portal_scheduled_refresh",
+                    user=None,
+                    metadata={"requested_action": "scheduled_refresh", "scheduler_task_id": task_uuid},
+                )
+                repo.control.create_task_row(
+                    task_uuid=scrape_task_id,
+                    task_name="scrape_job_portal_task",
+                    queue_name=PORTAL_SCRAPE_QUEUE,
+                    pipeline_run_id=str(run["id"]),
+                    user=None,
+                    payload={"portal_id": portal_id, "requested_action": "scheduled_refresh"},
+                )
+                repo.control.add_task_event(
+                    scrape_task_id,
+                    "task_queued_by_scheduler",
+                    "Scheduled portal refresh queued.",
+                    progress_percent=0,
+                    payload={"portal_id": portal_id, "pipeline_run_id": str(run["id"]), "scheduler_task_id": task_uuid},
+                )
+                repo.set_portal_queued_by_scheduler(portal_id=portal_id, lease_token=scrape_task_id)
+            scrape_job_portal_task.apply_async(
+                args=[portal_id, str(run["id"]), None],
+                queue=PORTAL_SCRAPE_QUEUE,
+                task_id=scrape_task_id,
+            )
+            queued.append({"portal_id": portal_id, "task_id": scrape_task_id, "pipeline_run_id": str(run["id"])})
+        except Exception as exc:
+            logger.exception("Failed to enqueue scheduled portal refresh portal_id=%s", portal_id)
+            try:
+                with postgres_session() as session:
+                    repo = JobPortalRepository(session)
+                    repo.release_lease(portal_id=portal_id, lease_token=scrape_task_id)
+                    repo.mark_portal_run_failed(portal_id=portal_id, error_message=f"scheduler_enqueue_failed: {exc}")
+            except Exception:
+                logger.exception("Failed to release portal scheduler lease portal_id=%s", portal_id)
+            skipped.append({"portal_id": portal_id, "reason": "enqueue_failed", "error": str(exc)})
+
+    return {"status": "completed", "due_count": len(due_portals), "queued_count": len(queued), "skipped_count": len(skipped), "queued": queued, "skipped": skipped}

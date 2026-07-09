@@ -7,10 +7,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..control.portal_repository import JobPortalRepository
 from ..control.postgres import postgres_session
-from ..infrastructure.celery_app import PORTAL_PROBE_QUEUE, PORTAL_SCRAPE_QUEUE
+from ..infrastructure.celery_app import PORTAL_PROBE_QUEUE, PORTAL_SCHEDULER_QUEUE, PORTAL_SCRAPE_QUEUE
 from ..portals.safety import PortalUrlSafetyError, validate_public_http_url
-from ..tasks.portal_tasks import probe_job_portal_task, scrape_job_portal_task, test_scrape_job_portal_task
-from .mvp_models import JobPortalCreateRequest, JobPortalRunRequest, JobPortalUpdateRequest
+from ..tasks.portal_tasks import probe_job_portal_task, scrape_job_portal_task, schedule_due_job_portals_task, test_scrape_job_portal_task
+from .mvp_models import JobPortalCreateRequest, JobPortalOverrideRequest, JobPortalRunRequest, JobPortalUpdateRequest, PortalSchedulerRunRequest
 from .security import require_permission
 
 router = APIRouter(prefix="/admin/job-portals", tags=["Admin Job Portals"])
@@ -140,6 +140,12 @@ def create_job_portal(
             request_rate_limit_per_minute=payload.request_rate_limit_per_minute,
             crawl_timeout_seconds=payload.crawl_timeout_seconds,
             schedule_expression=payload.schedule_expression,
+            scheduler_enabled=payload.scheduler_enabled,
+            refresh_interval_minutes=payload.refresh_interval_minutes,
+            deactivate_after_misses=payload.deactivate_after_misses,
+            min_discovery_coverage_ratio=payload.min_discovery_coverage_ratio,
+            max_consecutive_failures_before_pause=payload.max_consecutive_failures_before_pause,
+            detail_retry_attempts=payload.detail_retry_attempts,
         )
     return _queue_task(
         portal=portal,
@@ -194,6 +200,12 @@ def update_job_portal(
                 request_rate_limit_per_minute=payload.request_rate_limit_per_minute,
                 crawl_timeout_seconds=payload.crawl_timeout_seconds,
                 schedule_expression=payload.schedule_expression,
+                scheduler_enabled=payload.scheduler_enabled,
+                refresh_interval_minutes=payload.refresh_interval_minutes,
+                deactivate_after_misses=payload.deactivate_after_misses,
+                min_discovery_coverage_ratio=payload.min_discovery_coverage_ratio,
+                max_consecutive_failures_before_pause=payload.max_consecutive_failures_before_pause,
+                detail_retry_attempts=payload.detail_retry_attempts,
                 expected_configuration_version=payload.configuration_version,
             )
         except ValueError as exc:
@@ -294,6 +306,69 @@ def run_active_job_portal(
         task_args_factory=lambda run_id: [portal_id, run_id, payload.max_jobs],
         metadata={"requested_action": "manual_refresh", "max_jobs": payload.max_jobs},
     )
+
+
+@router.get("/health/summary")
+def portal_health_summary(
+    limit: int = Query(default=200, ge=1, le=500),
+    user: dict[str, Any] = Depends(require_permission("portal.health")),
+) -> dict[str, Any]:
+    with postgres_session() as session:
+        repo = JobPortalRepository(session)
+        rows = repo.portal_health_summary(
+            organization_id=_org_id(user),
+            platform_admin=_is_platform_admin(user),
+            limit=limit,
+        )
+    target_ids = [str(row.get("target_id") or "") for row in rows]
+    try:
+        from ..infrastructure.mongo import get_mongo_database
+        from ..warehouse.repositories import WarehouseRepository
+        counts = WarehouseRepository(get_mongo_database()).portal_job_lifecycle_counts(target_ids)
+    except Exception:
+        counts = {}
+    return {"portals": [{**row, "job_counts": counts.get(str(row.get("target_id") or ""), {})} for row in rows]}
+
+
+@router.post("/scheduler/run", status_code=status.HTTP_202_ACCEPTED)
+def run_portal_scheduler_once(
+    payload: PortalSchedulerRunRequest,
+    user: dict[str, Any] = Depends(require_permission("portal.run")),
+) -> dict[str, Any]:
+    task_id = str(uuid.uuid4())
+    try:
+        schedule_due_job_portals_task.apply_async(args=[payload.limit], queue=PORTAL_SCHEDULER_QUEUE, task_id=task_id)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Portal scheduler task could not be queued.") from exc
+    return {"task_id": task_id, "queue_name": PORTAL_SCHEDULER_QUEUE, "limit": payload.limit}
+
+
+@router.post("/{portal_id}/override")
+def override_job_portal_profile(
+    portal_id: str,
+    payload: JobPortalOverrideRequest,
+    user: dict[str, Any] = Depends(require_permission("portal.override")),
+) -> dict[str, Any]:
+    from ..portals.blueprint import SUPPORTED_PROFILES
+    if payload.profile_name not in SUPPORTED_PROFILES:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Unsupported profile_name. Use one of: {sorted(SUPPORTED_PROFILES)}")
+    with postgres_session() as session:
+        repo = JobPortalRepository(session)
+        current = _get_portal_or_404(repo, portal_id=portal_id, user=user)
+        try:
+            updated = repo.save_admin_override(
+                portal=current,
+                actor=user,
+                profile_name=payload.profile_name,
+                source_platform=payload.source_platform,
+                crawl_strategy=payload.crawl_strategy,
+                profile_overrides=payload.profile_overrides,
+                notes=payload.notes,
+                expected_configuration_version=payload.configuration_version,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return {"portal": _public(updated)}
 
 
 @router.post("/{portal_id}/pause")

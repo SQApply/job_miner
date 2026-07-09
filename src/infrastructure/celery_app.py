@@ -17,6 +17,11 @@ RECOMMENDATION_QUEUE = os.getenv("JOB_MINER_RECOMMENDATION_QUEUE", "recommendati
 RESUME_PROCESSING_QUEUE = os.getenv("JOB_MINER_RESUME_PROCESSING_QUEUE", "resume_processing_queue")
 PORTAL_PROBE_QUEUE = os.getenv("JOB_MINER_PORTAL_PROBE_QUEUE", "portal_probe_queue")
 PORTAL_SCRAPE_QUEUE = os.getenv("JOB_MINER_PORTAL_SCRAPE_QUEUE", "portal_scrape_queue")
+PORTAL_SCHEDULER_QUEUE = os.getenv("JOB_MINER_PORTAL_SCHEDULER_QUEUE", "portal_scheduler_queue")
+PORTAL_ARTIFACT_QUEUE = os.getenv("JOB_MINER_PORTAL_ARTIFACT_QUEUE", "portal_artifact_queue")
+RECOMMENDATION_REFRESH_QUEUE = os.getenv("JOB_MINER_RECOMMENDATION_REFRESH_QUEUE", "recommendation_refresh_queue")
+APPLICATION_ORCHESTRATION_QUEUE = os.getenv("JOB_MINER_APPLICATION_ORCHESTRATION_QUEUE", "application_orchestration_queue")
+APPLICATION_JOB_QUEUE = os.getenv("JOB_MINER_APPLICATION_JOB_QUEUE", "application_job_queue")
 
 celery_app = Celery(
     "job_miner",
@@ -27,6 +32,7 @@ celery_app = Celery(
         "src.tasks.recommendation_tasks",
         "src.tasks.resume_tasks",
         "src.tasks.portal_tasks",
+        "src.tasks.application_tasks",
     ],
 )
 
@@ -55,5 +61,25 @@ celery_app.conf.update(
         "src.tasks.portal_tasks.probe_job_portal_task": {"queue": PORTAL_PROBE_QUEUE},
         "src.tasks.portal_tasks.test_scrape_job_portal_task": {"queue": PORTAL_SCRAPE_QUEUE},
         "src.tasks.portal_tasks.scrape_job_portal_task": {"queue": PORTAL_SCRAPE_QUEUE},
+        "src.tasks.portal_tasks.schedule_due_job_portals_task": {"queue": PORTAL_SCHEDULER_QUEUE},
+        "src.tasks.recommendation_tasks.process_recommendation_refresh_batch_task": {"queue": RECOMMENDATION_REFRESH_QUEUE},
+        "src.tasks.application_tasks.run_application_batch_task": {"queue": APPLICATION_ORCHESTRATION_QUEUE},
+        "src.tasks.application_tasks.run_single_job_application_task": {"queue": APPLICATION_JOB_QUEUE},
     },
 )
+
+
+if os.getenv("JOB_MINER_ENABLE_PORTAL_BEAT", "0").lower() in {"1", "true", "yes"}:
+    celery_app.conf.beat_schedule = {
+        **getattr(celery_app.conf, "beat_schedule", {}),
+        "schedule-due-job-portals": {
+            "task": "src.tasks.portal_tasks.schedule_due_job_portals_task",
+            "schedule": int(os.getenv("JOB_MINER_PORTAL_SCHEDULER_INTERVAL_SECONDS", "300")),
+            "options": {"queue": PORTAL_SCHEDULER_QUEUE},
+        },
+        "process-recommendation-refresh-batch": {
+            "task": "src.tasks.recommendation_tasks.process_recommendation_refresh_batch_task",
+            "schedule": int(os.getenv("JOB_MINER_RECOMMENDATION_REFRESH_INTERVAL_SECONDS", "900")),
+            "options": {"queue": RECOMMENDATION_REFRESH_QUEUE},
+        },
+    }

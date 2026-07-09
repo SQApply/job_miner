@@ -40,6 +40,7 @@ class JobCurrentDocument(MongoDocument):
     target_id: str
     source_url: str | None = None
     job_url: str | None = None
+    canonical_job_url: str | None = None
     apply_url: str | None = None
     title: str | None = None
     company: str | None = None
@@ -57,7 +58,13 @@ class JobCurrentDocument(MongoDocument):
     content_hash: str
     first_seen_at: datetime = Field(default_factory=utc_now)
     last_seen_at: datetime = Field(default_factory=utc_now)
+    last_deep_scraped_at: datetime | None = None
+    last_missing_at: datetime | None = None
     last_run_session_id: str | None = None
+    missing_count: int = 0
+    freshness_status: str = "active"
+    inactive_reason: str | None = None
+    deactivated_at: datetime | None = None
     is_active: bool = True
     version: int = 1
     raw_payload: dict[str, Any] = Field(default_factory=dict)
@@ -125,6 +132,7 @@ class JobTowerDocument(MongoDocument):
     title: str | None = None
     company: str | None = None
     job_url: str | None = None
+    canonical_job_url: str | None = None
     apply_url: str | None = None
     location_text: str | None = None
     employment_type: str | None = None
@@ -204,5 +212,6 @@ class CandidateJobMatchDocument(MongoDocument):
     company: str | None = None
     location_text: str | None = None
     job_url: str | None = None
+    canonical_job_url: str | None = None
     apply_url: str | None = None
     evidence: dict[str, Any] = Field(default_factory=dict)

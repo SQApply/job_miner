@@ -145,7 +145,11 @@ INDEXES: dict[str, list[IndexModel]] = {
         IndexModel([("job_id", ASCENDING)], unique=True),
         IndexModel([("target_id", ASCENDING), ("job_url", ASCENDING)], unique=True, sparse=True),
         IndexModel([("is_active", ASCENDING)]),
+        IndexModel([("target_id", ASCENDING), ("is_active", ASCENDING), ("missing_count", ASCENDING)]),
+        IndexModel([("target_id", ASCENDING), ("canonical_job_url", ASCENDING)], sparse=True),
+        IndexModel([("target_id", ASCENDING), ("freshness_status", ASCENDING)]),
         IndexModel([("last_seen_at", DESCENDING)]),
+        IndexModel([("last_deep_scraped_at", DESCENDING)]),
         IndexModel([("posted_at", DESCENDING)]),
         IndexModel([("first_seen_at", DESCENDING)]),
     ],
@@ -165,6 +169,12 @@ INDEXES: dict[str, list[IndexModel]] = {
     "candidate_profile_edit_events": [
         IndexModel([("candidate_id", ASCENDING), ("created_at", ASCENDING)]),
         IndexModel([("edit_id", ASCENDING)], unique=True),
+    ],
+    "recommendation_refresh_requests": [
+        IndexModel([("request_id", ASCENDING)], unique=True, sparse=True),
+        IndexModel([("status", ASCENDING), ("priority", DESCENDING), ("updated_at", ASCENDING)]),
+        IndexModel([("candidate_id", ASCENDING), ("status", ASCENDING)]),
+        IndexModel([("portal_id", ASCENDING), ("run_session_id", ASCENDING)]),
     ],
 }
 

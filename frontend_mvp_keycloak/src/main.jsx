@@ -672,7 +672,7 @@ function AllJobsPage({ onBack, onAction }) {
   </div>;
 }
 
-function SavedJobCard({ item }) {
+function SavedJobCard({ item, onRemove, removing }) {
   const applyUrl = getApplyUrl(item);
   return <div className="saved-row">
     <div className="saved-main">
@@ -680,7 +680,10 @@ function SavedJobCard({ item }) {
       <p>{getCompany(item)} · {getLocation(item)}</p>
       <span className="status-pill">{item.status || item.application_status || 'saved'}</span>
     </div>
-    {applyUrl && <Button href={applyUrl}>Open job</Button>}
+    <div className="saved-actions">
+      {applyUrl && <Button href={applyUrl}>Open job</Button>}
+      <Button variant="danger" onClick={() => onRemove(item)} disabled={removing}>{removing ? 'Removing...' : 'Remove'}</Button>
+    </div>
   </div>;
 }
 
@@ -697,11 +700,24 @@ function ApplicationCard({ item }) {
   </div>;
 }
 
-function SavedJobsCard({ saved, onRefresh }) {
+function SavedJobsCard({ saved, onRefresh, onApplyAll, applying, onRemove, removingJobId }) {
+  const savedCount = saved.filter((item) => String(item.status || '').toLowerCase() === 'saved').length;
   return <Card title="Saved Jobs" subtitle="Jobs you saved or marked for later.">
-    <div className="row top-actions"><Button onClick={onRefresh}>Refresh</Button></div>
+    <div className="row top-actions">
+      <Button onClick={onRefresh}>Refresh</Button>
+      <Button onClick={onApplyAll} disabled={!savedCount || applying}>{applying ? 'Starting agent...' : `Apply to saved jobs (${savedCount})`}</Button>
+    </div>
+    <p className="muted">The agent creates tracked application attempts for your saved jobs. External portals that need login, CAPTCHA, OTP, or unknown form logic are marked for review instead of being faked as successful.</p>
     {!saved.length ? <EmptyState message="No saved jobs yet. Click Save on a recommendation to see it here." /> : <div className="compact-list">
-      {saved.map((item) => <SavedJobCard key={item.id || `${item.job_id}-${item.status}`} item={item} />)}
+      {saved.map((item) => {
+        const jobId = getJobId(item);
+        return <SavedJobCard
+          key={item.id || `${item.job_id}-${item.status}`}
+          item={item}
+          onRemove={onRemove}
+          removing={Boolean(jobId && removingJobId === jobId)}
+        />;
+      })}
     </div>}
   </Card>;
 }
@@ -712,6 +728,50 @@ function ApplicationsCard({ apps, onRefresh }) {
     {!apps.length ? <EmptyState message="No applications yet. Click Apply or Select on a recommendation to see it here." /> : <div className="compact-list">
       {apps.map((item) => <ApplicationCard key={item.id || `${item.job_id}-${item.application_status}`} item={item} />)}
     </div>}
+  </Card>;
+}
+
+function ApplicationAgentBatchCard({ batches, notifications, activeBatch, batchDetails, onRefresh, onRetry }) {
+  const latest = activeBatch || batches[0] || null;
+  const latestNotice = notifications[0] || null;
+  const totalJobs = Math.max(Number(latest?.requested_job_count || 0), batchDetails.length);
+  return <Card title="Application Agent" subtitle="Batch progress for applying to saved jobs.">
+    <div className="row top-actions"><Button onClick={onRefresh}>Refresh agent status</Button></div>
+    {latestNotice && <div className="agent-notification">
+      <strong>{latestNotice.title}</strong>
+      {latestNotice.body && <p>{latestNotice.body}</p>}
+    </div>}
+    {!latest ? <EmptyState message="No agent application batch has been started yet." /> : <>
+      <div className="agent-summary-grid">
+        <div><span>Total</span><strong>{totalJobs}</strong></div>
+        <div><span>Submitted</span><strong>{latest.success_count || 0}</strong></div>
+        <div><span>Failed</span><strong>{latest.failed_count || 0}</strong></div>
+        <div><span>Needs review</span><strong>{latest.needs_review_count || 0}</strong></div>
+        <div><span>Skipped</span><strong>{latest.skipped_count || 0}</strong></div>
+        <div><span>Running</span><strong>{latest.running_job_count || 0}</strong></div>
+        <div><span>Queued</span><strong>{latest.queued_job_count || 0}</strong></div>
+      </div>
+      <div className="agent-batch-header">
+        <span className={`status-pill agent-status-${String(latest.batch_status || '').replaceAll('_', '-')}`}>{latest.batch_status || 'unknown'}</span>
+        <span className="muted">Started: {formatDate(latest.started_on || latest.created_on)}</span>
+      </div>
+      {['completed_with_failures', 'failed'].includes(String(latest.batch_status || '')) && <div className="row top-actions">
+        <Button variant="secondary" onClick={() => onRetry(latest.id)}>Retry failed jobs</Button>
+      </div>}
+      {totalJobs > 0 && batchDetails.length === 0 && <p className="muted">No per-job run details are loaded for this batch yet. Click Refresh agent status; if it remains empty, start a new batch after applying the latest backend patch.</p>}
+      {batchDetails.length > 0 && <div className="compact-list agent-job-runs">
+        {batchDetails.map((item) => <div className="saved-row" key={item.id}>
+          <div className="saved-main">
+            <h4>{getJobTitle(item)}</h4>
+            <p>{getCompany(item)} · {getLocation(item)}</p>
+            <span className={`status-pill agent-run-${String(item.run_status || '').replaceAll('_', '-')}`}>{item.run_status || 'queued'}</span>
+            {item.error_message && <p className="muted">{item.error_message}</p>}
+          </div>
+          {getApplyUrl(item) && <Button href={getApplyUrl(item)}>Open job</Button>}
+        </div>)}
+      </div>}
+      {batches.length > 1 && <p className="muted">Showing latest batch. Previous batches are stored in history.</p>}
+    </>}
   </Card>;
 }
 
@@ -863,6 +923,12 @@ function CandidatePortal({ me, refreshMe, candidateView, setCandidateView }) {
   const [source, setSource] = useState('llm');
   const [saved, setSaved] = useState([]);
   const [apps, setApps] = useState([]);
+  const [applicationBatches, setApplicationBatches] = useState([]);
+  const [applicationNotifications, setApplicationNotifications] = useState([]);
+  const [activeBatch, setActiveBatch] = useState(null);
+  const [activeBatchDetails, setActiveBatchDetails] = useState([]);
+  const [agentStarting, setAgentStarting] = useState(false);
+  const [removingSavedJobId, setRemovingSavedJobId] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
   const [recommendationStatus, setRecommendationStatus] = useState(null);
@@ -907,9 +973,83 @@ function CandidatePortal({ me, refreshMe, candidateView, setCandidateView }) {
     }
   }
 
+  async function loadApplicationBatches() {
+    try {
+      const res = await api('/me/application-batches?limit=10', {}, getToken());
+      const batches = res.batches || [];
+      setApplicationBatches(batches);
+      setApplicationNotifications(res.notifications || []);
+      const current = batches.find((batch) => ['queued', 'running'].includes(String(batch.batch_status || '').toLowerCase())) || batches[0] || null;
+      setActiveBatch(current);
+      if (current?.id) {
+        const details = await api(`/me/application-batches/${current.id}`, {}, getToken());
+        setActiveBatch(details.batch || current);
+        setActiveBatchDetails(details.jobs || []);
+      } else {
+        setActiveBatchDetails([]);
+      }
+    } catch {}
+  }
+
   async function loadSavedAndApps() {
     try { setSaved((await api('/me/saved-jobs', {}, getToken())).saved_jobs || []); } catch {}
     try { setApps((await api('/me/applications', {}, getToken())).applications || []); } catch {}
+    await loadApplicationBatches();
+  }
+
+  async function startApplicationAgent() {
+    const savedCount = saved.filter((item) => String(item.status || '').toLowerCase() === 'saved').length;
+    if (!savedCount) return;
+    const confirmed = window.confirm(`Start the application agent for up to ${Math.min(savedCount, 25)} saved jobs? Jobs needing login, CAPTCHA, OTP, or unsupported external forms will be marked for review.`);
+    if (!confirmed) return;
+    setAgentStarting(true);
+    setError(null);
+    try {
+      const res = await api('/me/saved-jobs/apply-agent', {
+        method: 'POST',
+        body: JSON.stringify({ mode: 'all_saved', max_jobs: 25, require_review_before_submit: false }),
+      }, getToken());
+      setNotice(res.message || 'Application agent started.');
+      await loadSavedAndApps();
+    } catch (e) {
+      setError(e.message || 'Could not start application agent');
+    } finally {
+      setAgentStarting(false);
+    }
+  }
+
+  async function retryFailedApplicationBatch(batchId) {
+    if (!batchId) return;
+    setError(null);
+    try {
+      const res = await api(`/me/application-batches/${batchId}/retry-failed`, {
+        method: 'POST',
+        body: JSON.stringify({ max_jobs: 25 }),
+      }, getToken());
+      setNotice(res.message || 'Retry batch queued.');
+      await loadSavedAndApps();
+    } catch (e) {
+      setError(e.message || 'Could not retry failed applications');
+    }
+  }
+
+  async function removeSavedJob(item) {
+    const jobId = getJobId(item);
+    if (!jobId) return;
+    const title = getJobTitle(item);
+    const confirmed = window.confirm(`Remove "${title}" from your saved jobs list? This will not delete application history for this job.`);
+    if (!confirmed) return;
+    setRemovingSavedJobId(jobId);
+    setError(null);
+    try {
+      await api(`/me/saved-jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' }, getToken());
+      setNotice('Saved job removed.');
+      await loadSavedAndApps();
+    } catch (e) {
+      setError(e.message || 'Could not remove saved job');
+    } finally {
+      setRemovingSavedJobId(null);
+    }
   }
 
   async function jobAction(item, action) {
@@ -950,6 +1090,13 @@ function CandidatePortal({ me, refreshMe, candidateView, setCandidateView }) {
     return () => window.clearInterval(timer);
   }, [recommendationStatus?.status, source]);
 
+  useEffect(() => {
+    const status = String(activeBatch?.batch_status || '').toLowerCase();
+    if (!['queued', 'running'].includes(status)) return undefined;
+    const timer = window.setInterval(loadSavedAndApps, 8000);
+    return () => window.clearInterval(timer);
+  }, [activeBatch?.id, activeBatch?.batch_status]);
+
   if (me.profile_state === 'conflict') {
     return <Card title="Profile resolution needed" subtitle="We found more than one candidate profile for your verified email.">
       <p>No candidate data is shown until an administrator resolves the duplicate profile safely.</p>
@@ -982,7 +1129,22 @@ function CandidatePortal({ me, refreshMe, candidateView, setCandidateView }) {
   return <div className="candidate-layout">
     <div className="left-column">
       <CandidateProfileCard profile={profile} onRefresh={loadProfile} onEdit={() => setCandidateView('profile')} />
-      <SavedJobsCard saved={saved} onRefresh={loadSavedAndApps} />
+      <SavedJobsCard
+        saved={saved}
+        onRefresh={loadSavedAndApps}
+        onApplyAll={startApplicationAgent}
+        applying={agentStarting}
+        onRemove={removeSavedJob}
+        removingJobId={removingSavedJobId}
+      />
+      <ApplicationAgentBatchCard
+        batches={applicationBatches}
+        notifications={applicationNotifications}
+        activeBatch={activeBatch}
+        batchDetails={activeBatchDetails}
+        onRefresh={loadSavedAndApps}
+        onRetry={retryFailedApplicationBatch}
+      />
       <ApplicationsCard apps={apps} onRefresh={loadSavedAndApps} />
     </div>
     <div className="right-column">

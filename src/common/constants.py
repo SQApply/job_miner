@@ -99,10 +99,38 @@ class ApplicationStatuses:
     APPLIED_MANUALLY = "applied_manually"
     NOT_INTERESTED = "not_interested"
     AGENT_APPLY_REQUESTED = "agent_apply_requested"
+    AGENT_RUNNING = "agent_running"
     AGENT_DRAFT_READY = "agent_draft_ready"
     USER_APPROVED_AGENT_APPLY = "user_approved_agent_apply"
+    AGENT_NEEDS_REVIEW = "agent_needs_review"
+    AGENT_BLOCKED_LOGIN = "agent_blocked_login"
+    AGENT_BLOCKED_CAPTCHA = "agent_blocked_captcha"
+    AGENT_UNSUPPORTED_PORTAL = "agent_unsupported_portal"
+    AGENT_SKIPPED_DUPLICATE = "agent_skipped_duplicate"
     AGENT_APPLIED = "agent_applied"
     AGENT_FAILED = "agent_failed"
+
+
+class ApplicationBatchStatuses:
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    COMPLETED_WITH_FAILURES = "completed_with_failures"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class ApplicationRunStatuses:
+    QUEUED = "queued"
+    RUNNING = "running"
+    PRECHECK_FAILED = "precheck_failed"
+    NEEDS_REVIEW = "needs_review"
+    BLOCKED_EXTERNAL_LOGIN = "blocked_external_login"
+    BLOCKED_CAPTCHA = "blocked_captcha"
+    UNSUPPORTED_PORTAL = "unsupported_portal"
+    SUBMITTED = "submitted"
+    FAILED = "failed"
+    SKIPPED_DUPLICATE = "skipped_duplicate"
 
 
 class UserRoles:

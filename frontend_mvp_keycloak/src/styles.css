@@ -303,6 +303,18 @@ textarea {
   color: #374151;
 }
 
+.saved-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: stretch;
+  flex-shrink: 0;
+}
+
+.saved-actions .button {
+  width: 100%;
+}
+
 .compact-list {
   max-height: 420px;
   overflow: auto;
@@ -387,6 +399,10 @@ th, td {
 
   .saved-row {
     flex-direction: column;
+  }
+
+  .saved-actions {
+    width: 100%;
   }
 }
 
@@ -1256,5 +1272,202 @@ th, td {
   .portal-statuses {
     justify-content: flex-start;
     text-align: left;
+  }
+}
+
+/* Production portal controls */
+.portal-form-expanded {
+  grid-template-columns: minmax(170px, 1fr) minmax(280px, 2.2fr) repeat(5, minmax(110px, 0.8fr));
+}
+
+.portal-form select,
+.portal-inline-editor select,
+.portal-inline-editor input,
+.portal-inline-editor textarea {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 9px 10px;
+  font: inherit;
+  color: #111827;
+  background: #ffffff;
+}
+
+.portal-health-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.portal-health-grid > div {
+  border-radius: 10px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  padding: 12px;
+}
+
+.portal-health-grid span,
+.portal-health-grid strong {
+  display: block;
+}
+
+.portal-health-grid span {
+  color: #64748b;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.portal-health-grid strong {
+  color: #0f172a;
+  font-size: 18px;
+}
+
+.portal-inline-editor {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  border-radius: 10px;
+  background: #f8fafc;
+  border: 1px solid #dbe3ee;
+  margin-top: 14px;
+  padding: 12px;
+}
+
+.portal-inline-editor label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.portal-textarea-label {
+  grid-column: span 4;
+}
+
+.portal-alert-note {
+  margin: 12px 0 0;
+  color: #991b1b;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+@media (max-width: 1180px) {
+  .portal-form-expanded,
+  .portal-health-grid,
+  .portal-inline-editor {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .portal-textarea-label {
+    grid-column: span 2;
+  }
+}
+
+@media (max-width: 760px) {
+  .portal-form-expanded,
+  .portal-health-grid,
+  .portal-inline-editor {
+    grid-template-columns: 1fr;
+  }
+
+  .portal-textarea-label {
+    grid-column: auto;
+  }
+}
+
+.agent-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.agent-summary-grid div {
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  background: #f9fafb;
+  padding: 10px;
+}
+
+.agent-summary-grid span {
+  display: block;
+  color: #6b7280;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.agent-summary-grid strong {
+  display: block;
+  color: #111827;
+  font-size: 20px;
+  margin-top: 4px;
+}
+
+.agent-batch-header {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+
+.agent-notification {
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin: 10px 0;
+}
+
+.agent-notification p {
+  margin: 4px 0 0;
+  color: #1f2937;
+}
+
+.agent-job-runs {
+  max-height: 360px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.status-pill.agent-status-running,
+.status-pill.agent-status-queued,
+.status-pill.agent-run-running,
+.status-pill.agent-run-queued {
+  background: #fffbeb;
+  border-color: #fde68a;
+  color: #92400e;
+}
+
+.status-pill.agent-status-completed,
+.status-pill.agent-run-submitted {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+  color: #065f46;
+}
+
+.status-pill.agent-run-skipped-duplicate {
+  background: #f3f4f6;
+  border-color: #d1d5db;
+  color: #374151;
+}
+
+.status-pill.agent-status-completed-with-failures,
+.status-pill.agent-run-needs-review,
+.status-pill.agent-run-precheck-failed,
+.status-pill.agent-run-unsupported-portal,
+.status-pill.agent-run-blocked-external-login,
+.status-pill.agent-run-blocked-captcha,
+.status-pill.agent-run-failed {
+  background: #fff7ed;
+  border-color: #fed7aa;
+  color: #9a3412;
+}
+
+@media (max-width: 760px) {
+  .agent-summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

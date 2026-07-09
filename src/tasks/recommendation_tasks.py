@@ -7,10 +7,10 @@ from typing import Any
 from celery.exceptions import SoftTimeLimitExceeded
 
 from ..api.recommendation_generation import generate_candidate_recommendations_after_upload
-from ..infrastructure.celery_app import celery_app
+from ..infrastructure.celery_app import RECOMMENDATION_QUEUE, RECOMMENDATION_REFRESH_QUEUE, celery_app
 from ..infrastructure.mongo import get_mongo_database
 from .concurrency import acquire_candidate_recommendation_lock
-from .tracking import mark_task_completed, mark_task_failed, mark_task_running
+from .tracking import create_task_tracking_row, mark_task_completed, mark_task_failed, mark_task_running
 
 logger = logging.getLogger(__name__)
 
@@ -218,3 +218,55 @@ def generate_recommendations_after_resume_upload_task(
 
     finally:
         lock.release()
+
+
+@celery_app.task(bind=True, name="src.tasks.recommendation_tasks.process_recommendation_refresh_batch_task")
+def process_recommendation_refresh_batch_task(self, batch_size: int = 25) -> dict[str, Any]:
+    """Drain pending portal-driven recommendation refresh requests in bounded batches.
+
+    This avoids faning out recommendation generation to every candidate immediately
+    after a portal scrape. Run it from a scheduled worker or manually when capacity
+    is available.
+    """
+    task_id = str(getattr(self.request, "id", "") or "")
+    mark_task_running(task_uuid=task_id, message="Recommendation refresh batch started.", payload={"batch_size": batch_size})
+    db = get_mongo_database()
+    now = _utc_now()
+    batch = list(db["recommendation_refresh_requests"].find(
+        {"status": "pending"},
+        {"candidate_id": 1, "resume_id": 1, "email": 1, "request_id": 1, "run_session_id": 1},
+    ).sort([("priority", -1), ("updated_at", 1)]).limit(max(1, min(int(batch_size), 100))))
+
+    queued = []
+    for request in batch:
+        candidate_id = str(request.get("candidate_id") or "").strip()
+        if not candidate_id:
+            continue
+        child_task_id = f"portal_reco_{candidate_id}_{int(now.timestamp())}"
+        create_task_tracking_row(
+            task_uuid=child_task_id,
+            task_name="generate_recommendations_after_resume_upload_task",
+            queue_name=RECOMMENDATION_QUEUE,
+            payload={"candidate_id": candidate_id, "source": "portal_refresh_policy"},
+        )
+        generate_recommendations_after_resume_upload_task.apply_async(
+            kwargs={
+                "candidate_id": candidate_id,
+                "resume_id": request.get("resume_id"),
+                "email": request.get("email"),
+                "run_session_id": request.get("run_session_id"),
+                "source": "portal_refresh_policy",
+                "request_id": str(request.get("request_id") or ""),
+            },
+            queue=RECOMMENDATION_QUEUE,
+            task_id=child_task_id,
+        )
+        db["recommendation_refresh_requests"].update_one(
+            {"_id": request["_id"]},
+            {"$set": {"status": "queued", "queued_task_id": child_task_id, "queued_at": now, "updated_at": now}},
+        )
+        queued.append({"candidate_id": candidate_id, "task_id": child_task_id})
+
+    result = {"status": "completed", "requested_batch_size": int(batch_size), "queued_count": len(queued), "queued": queued[:50]}
+    mark_task_completed(task_uuid=task_id, result=result, message="Recommendation refresh batch completed.")
+    return result

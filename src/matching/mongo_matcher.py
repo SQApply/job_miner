@@ -99,7 +99,12 @@ def match_candidates_from_mongo(
         results = store.search(jobs_collection, query_vector=embedder.embed_one(text), top_n=top_n)
         cskills = skills(cand); matches = []
         for rank, r in enumerate(results, 1):
-            payload = r.payload; job_id = str(payload.get("job_id") or ""); job = repo.get_job(job_id) or payload
+            payload = r.payload; job_id = str(payload.get("job_id") or "")
+            if not job_id:
+                continue
+            job = repo.get_job(job_id)
+            if not job:
+                continue
             jskills = skills(job); matched = sorted(cskills & jskills); loc = location_score(cand.get("location"), job.get("location_text"))
             skill_score = len(matched) / max(1, len(jskills)) if jskills else 0.0
             score = round(0.82 * r.score + 0.13 * min(1.0, skill_score) + 0.05 * loc, 6)

@@ -50,7 +50,7 @@ class LoadMoreButtonAdapter(ListingAdapterMixin, BaseAdapter):
 
         stable_rounds = 0
         click_index = 0
-        max_stable = listing.load_more.stop_after_stable_rounds
+        max_stable = max(1, int(listing.load_more.stop_after_stable_rounds or 1))
 
         while listing.load_more.enabled and click_index < listing.load_more.max_clicks:
             if click_index > 0 and not page_has_load_more(latest_result):
@@ -131,7 +131,16 @@ class LoadMoreButtonAdapter(ListingAdapterMixin, BaseAdapter):
                     discovered_urls=len(urls),
                     has_load_more=page_has_load_more(latest_result),
                 )
-                if stable_rounds >= max_stable and not page_has_load_more(latest_result):
+                if stable_rounds >= max_stable:
+                    self._log(
+                        session_logger,
+                        "load_more_stable_limit_reached",
+                        page_url=listing.page_url,
+                        click_index=click_index,
+                        stable_rounds=stable_rounds,
+                        discovered_urls=len(urls),
+                        has_load_more=page_has_load_more(latest_result),
+                    )
                     break
 
         final_urls = unique_keep_order(urls + self._collect_links(latest_result, blueprint))

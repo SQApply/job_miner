@@ -29,6 +29,12 @@ def normalize_url(url: str | None) -> str:
 def make_job_identity_key(job: dict[str, Any], *, target_id: str) -> str:
     url = normalize_url(job.get("job_url") or job.get("source_url") or job.get("url") or job.get("apply_url"))
     if url:
+        try:
+            from .url_utils import canonical_job_url
+
+            url = canonical_job_url(url) or url
+        except Exception:
+            pass
         return f"{target_id}|url|{url}"
     return "|".join([
         target_id,

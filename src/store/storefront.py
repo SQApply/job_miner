@@ -39,6 +39,10 @@ def save_run_summary(
     output_path: str,
     log_path: str,
     total_elapsed_seconds: float,
+    attempted_urls: int | None = None,
+    discovered_job_urls: list[str] | None = None,
+    rescrape_plan: dict | None = None,
+    lifecycle_reconcile: dict | None = None,
 ) -> Path:
     summaries_dir = ensure_dir(output_dir / "summaries")
 
@@ -46,7 +50,11 @@ def save_run_summary(
         "target_id": target_id,
         "run_session_id": run_session_id,
         "discovered_urls": discovered_urls,
+        "attempted_urls": attempted_urls if attempted_urls is not None else extracted_jobs,
         "extracted_jobs": extracted_jobs,
+        "discovered_job_urls": list(discovered_job_urls or []),
+        "rescrape_plan": rescrape_plan or {},
+        "lifecycle_reconcile": lifecycle_reconcile or {},
         "output_path": output_path,
         "log_path": log_path,
         "total_elapsed_seconds": total_elapsed_seconds,

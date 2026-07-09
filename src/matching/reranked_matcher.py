@@ -312,6 +312,8 @@ def match_candidates_with_llm_rerank(
                 continue
 
             mongo_job = repo.get_job(job_id)
+            if not mongo_job:
+                continue
             job_payload = _merge_job_payload(
                 qdrant_payload=qdrant_payload,
                 mongo_job=mongo_job,
