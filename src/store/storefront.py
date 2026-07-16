@@ -43,15 +43,19 @@ def save_run_summary(
     discovered_job_urls: list[str] | None = None,
     rescrape_plan: dict | None = None,
     lifecycle_reconcile: dict | None = None,
+    status: str = "success",
+    extraction_failures: int = 0,
 ) -> Path:
     summaries_dir = ensure_dir(output_dir / "summaries")
 
     payload = {
         "target_id": target_id,
         "run_session_id": run_session_id,
+        "status": status,
         "discovered_urls": discovered_urls,
         "attempted_urls": attempted_urls if attempted_urls is not None else extracted_jobs,
         "extracted_jobs": extracted_jobs,
+        "extraction_failures": extraction_failures,
         "discovered_job_urls": list(discovered_job_urls or []),
         "rescrape_plan": rescrape_plan or {},
         "lifecycle_reconcile": lifecycle_reconcile or {},
@@ -89,11 +93,13 @@ def save_jobs_csv(output_dir: str, output_file: str, jobs, run_session_id: str):
         "company",
         "location_text",
         "employment_type",
-        "salary_text",
+        "duration",
+        "compensation_text",
         "posted_date",
-        "description",
+        "summary",
         "apply_url",
         "job_url",
+        "job_reference",
     ]
 
     for path in (versioned_path, latest_path):
@@ -125,14 +131,14 @@ def save_jobs_markdown(output_dir: str, output_file: str, jobs, run_session_id: 
                 f"- Company: {data.get('company') or ''}",
                 f"- Location: {data.get('location_text') or ''}",
                 f"- Employment Type: {data.get('employment_type') or ''}",
-                f"- Salary: {data.get('salary_text') or ''}",
+                f"- Compensation: {data.get('compensation_text') or ''}",
                 f"- Posted Date: {data.get('posted_date') or ''}",
                 f"- Apply URL: {data.get('apply_url') or ''}",
                 f"- Job URL: {data.get('job_url') or ''}",
                 "",
                 "### Description",
                 "",
-                data.get("description") or "",
+                data.get("summary") or "",
                 "",
                 "---",
                 "",

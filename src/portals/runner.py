@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import asyncio
-import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from ..blueprint_hub import BlueprintHub
-from ..crawl.browser_lane import build_browser_config, close_session, detail_run_config, listing_run_config
-from ..extract.model_lane import build_llm_strategy, parse_extracted_jobs
-from ..extract.validator import is_valid_job
+from ..crawl.browser_lane import (
+    build_browser_config,
+    close_session,
+    listing_run_config,
+)
 from ..infrastructure.mongo import get_mongo_database
 from ..router import get_adapter
 from ..schemas import JobPosting
@@ -17,6 +17,11 @@ from ..warehouse.repositories import WarehouseRepository
 from .artifacts import result_artifacts, save_portal_artifact
 from .blueprint import build_portal_blueprint
 from .detector import PortalDetection, detect_portal
+from .orchestrator import (
+    ScrapeExecutionOptions,
+    ScrapeOrchestrator,
+    ScrapeOrchestratorHooks,
+)
 from .safety import PortalUrlSafetyError, validate_public_http_url
 
 
@@ -229,28 +234,11 @@ async def scrape_portal(
     does not deactivate missing jobs. Lifecycle reconciliation is a post-ingestion
     decision made by the task after the scrape is known to be successful.
     """
-    from crawl4ai import AsyncWebCrawler
-
-    started = time.perf_counter()
     hub = BlueprintHub(root)
     settings = hub.system.browser
     blueprint = build_portal_blueprint(root=root, portal=portal, run_session_id=run_session_id)
-    adapter = get_adapter(blueprint)
-    instruction = blueprint.detail.instruction
-    llm_strategy = build_llm_strategy(hub.system.llm, instruction)
 
-    browser_config = build_browser_config(settings)
-    rejected_urls = 0
-    artifacts: list[dict[str, Any]] = []
-    detail_failures: list[dict[str, Any]] = []
-    safe_urls: list[str] = []
-    rescrape_plan: dict[str, Any] = {}
-    attempted_urls: list[str] = []
-
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        urls = await adapter.discover_job_urls(crawler, blueprint, hub.system)
-        safe_urls, rejected = _safe_discovered_urls(urls, list(blueprint.allowed_hosts))
-        rejected_urls += rejected
+    def discovery_artifacts(safe_urls: list[str]) -> list[dict[str, Any]]:
         discovered_artifact = save_portal_artifact(
             root=root,
             portal_id=str(portal["id"]),
@@ -263,107 +251,67 @@ async def scrape_portal(
             extension=".json",
             metadata={"stage": "scrape"},
         )
-        if discovered_artifact:
-            artifacts.append(discovered_artifact)
+        return [discovered_artifact] if discovered_artifact else []
 
-        urls_to_extract, rescrape_plan = _plan_portal_detail_rescrape(
-            target_id=str(portal["target_id"]),
+    def failure_artifacts(index: int, job_url: str, attempt: int, result: Any) -> list[dict[str, Any]]:
+        return result_artifacts(
+            root=root,
+            portal_id=str(portal["id"]),
             run_session_id=run_session_id,
-            safe_urls=safe_urls,
-            incremental_rescrape=incremental_rescrape,
-            force_detail_refresh=force_detail_refresh,
-            deep_refresh_days=deep_refresh_days,
-        )
-        attempted_urls = urls_to_extract[:max(1, max_jobs)]
-        concurrency = max(1, min(int(settings.detail_extraction_concurrency), 5, len(attempted_urls) or 1))
-        semaphore = asyncio.Semaphore(concurrency)
-        request_interval_seconds = 60.0 / max(1, int(portal.get("request_rate_limit_per_minute") or 1))
-        detail_retry_attempts = max(0, min(int(portal.get("detail_retry_attempts") or 0), 5))
-        rate_lock = asyncio.Lock()
-        next_request_monotonic = 0.0
-
-        async def throttle_detail_request() -> None:
-            nonlocal next_request_monotonic
-            async with rate_lock:
-                now = time.monotonic()
-                wait_seconds = max(0.0, next_request_monotonic - now)
-                next_request_monotonic = max(now, next_request_monotonic) + request_interval_seconds
-            if wait_seconds:
-                await asyncio.sleep(wait_seconds)
-
-        async def extract_one(index: int, job_url: str) -> JobPosting | None:
-            nonlocal rejected_urls
-            async with semaphore:
-                last_error: str | None = None
-                for attempt in range(1, detail_retry_attempts + 2):
-                    detail_session_id = f"portal_detail_{str(portal['id']).replace('-', '')[:12]}_{index}_{attempt}"
-                    try:
-                        validate_public_http_url(job_url, allowed_hosts=blueprint.allowed_hosts)
-                        await throttle_detail_request()
-                        result = await crawler.arun(
-                            url=job_url,
-                            config=detail_run_config(
-                                settings,
-                                blueprint.detail.wait_for,
-                                llm_strategy,
-                                session_id=detail_session_id,
-                            ),
-                        )
-                        if not getattr(result, "success", False):
-                            last_error = str(getattr(result, "error_message", "detail scrape failed"))
-                            if attempt == detail_retry_attempts + 1:
-                                artifacts.extend(result_artifacts(
-                                    root=root,
-                                    portal_id=str(portal["id"]),
-                                    run_session_id=run_session_id,
-                                    prefix=f"detail_{index}_failed",
-                                    result=result,
-                                    metadata={"job_url": job_url, "attempt": attempt},
-                                ))
-                            continue
-                        final_url = _result_final_url(result, job_url)
-                        validate_public_http_url(final_url, allowed_hosts=blueprint.allowed_hosts)
-                        job = parse_extracted_jobs(getattr(result, "extracted_content", None), final_url)
-                        if job and is_valid_job(job):
-                            return job
-                        last_error = "LLM extraction returned no valid job"
-                    except PortalUrlSafetyError as exc:
-                        rejected_urls += 1
-                        last_error = str(exc)
-                        break
-                    except Exception as exc:
-                        last_error = f"{type(exc).__name__}: {exc}"
-                    finally:
-                        try:
-                            await close_session(crawler, detail_session_id)
-                        except Exception:
-                            pass
-                    if attempt <= detail_retry_attempts:
-                        await asyncio.sleep(min(2 ** (attempt - 1), 8))
-                detail_failures.append({"job_url": job_url, "attempts": detail_retry_attempts + 1, "error": last_error or "unknown"})
-                return None
-
-        results = await asyncio.gather(
-            *(extract_one(index, job_url) for index, job_url in enumerate(attempted_urls, start=1)),
-            return_exceptions=True,
+            prefix=f"detail_{index}_failed",
+            result=result,
+            metadata={"job_url": job_url, "attempt": attempt},
         )
 
-    jobs = [row for row in results if isinstance(row, JobPosting)]
-    exception_failures = [row for row in results if isinstance(row, BaseException)]
-    for exc in exception_failures[:25]:
-        detail_failures.append({"job_url": None, "attempts": 1, "error": f"{type(exc).__name__}: {exc}"})
+    orchestrator = ScrapeOrchestrator(
+        blueprint=blueprint,
+        system_config=hub.system,
+        run_session_id=run_session_id,
+        instruction=blueprint.detail.instruction,
+    )
+    orchestration = await orchestrator.run(
+        options=ScrapeExecutionOptions(
+            detail_concurrency=max(1, min(int(settings.detail_extraction_concurrency), 5)),
+            detail_retry_attempts=max(0, min(int(portal.get("detail_retry_attempts") or 0), 5)),
+            requests_per_minute=max(1, int(portal.get("request_rate_limit_per_minute") or 1)),
+            max_jobs=max(1, int(max_jobs)),
+            fail_on_zero_discovery=True,
+            session_prefix=f"portal_detail_{str(portal['id']).replace('-', '')[:12]}",
+        ),
+        hooks=ScrapeOrchestratorHooks(
+            normalize_discovered_urls=lambda urls: _safe_discovered_urls(
+                urls,
+                list(blueprint.allowed_hosts),
+            ),
+            plan_detail_urls=lambda safe_urls: _plan_portal_detail_rescrape(
+                target_id=str(portal["target_id"]),
+                run_session_id=run_session_id,
+                safe_urls=safe_urls,
+                incremental_rescrape=incremental_rescrape,
+                force_detail_refresh=force_detail_refresh,
+                deep_refresh_days=deep_refresh_days,
+            ),
+            validate_detail_url=lambda url: validate_public_http_url(
+                url,
+                allowed_hosts=blueprint.allowed_hosts,
+            ).normalized_url,
+            is_rejected_error=lambda exc: isinstance(exc, PortalUrlSafetyError),
+            on_discovery_artifacts=discovery_artifacts,
+            on_failure_artifacts=failure_artifacts,
+        )
+    )
 
     lifecycle_reconcile = {"status": "pending_post_ingestion" if reconcile_lifecycle else "disabled"}
     return PortalScrapeResult(
-        discovered_urls=len(safe_urls),
-        attempted_urls=len(attempted_urls),
-        extracted_jobs=jobs,
-        rejected_urls=rejected_urls,
-        elapsed_seconds=round(time.perf_counter() - started, 3),
-        artifacts=artifacts,
-        detail_failures=detail_failures,
-        skipped_existing=int((rescrape_plan or {}).get("known_skipped") or 0),
-        rescrape_plan=rescrape_plan,
+        discovered_urls=len(orchestration.discovered_job_urls),
+        attempted_urls=len(orchestration.attempted_job_urls),
+        extracted_jobs=orchestration.jobs,
+        rejected_urls=orchestration.rejected_urls,
+        elapsed_seconds=orchestration.elapsed_seconds,
+        artifacts=orchestration.artifacts,
+        detail_failures=orchestration.detail_failures,
+        skipped_existing=orchestration.skipped_existing,
+        rescrape_plan=orchestration.rescrape_plan,
         lifecycle_reconcile=lifecycle_reconcile,
-        discovered_job_urls=safe_urls,
+        discovered_job_urls=orchestration.discovered_job_urls,
     )

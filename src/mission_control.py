@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import asyncio
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .blueprint_hub import BlueprintHub
-from .crawl.browser_lane import build_browser_config, detail_run_config, close_session
-from .extract.model_lane import build_llm_strategy, parse_extracted_jobs
 from .extract.promptforge import build_instruction
-from .extract.validator import is_valid_job
 from .infrastructure.mongo import get_mongo_database
 from .gpu_monitor import query_gpu_snapshot
 from .logger import build_session_logger
-from .router import get_adapter
+from .portals.orchestrator import (
+    ScrapeExecutionOptions,
+    ScrapeOrchestrator,
+    ScrapeOrchestratorHooks,
+)
 from .schemas import RunResult
 from .warehouse.repositories import WarehouseRepository
 from .store.storefront import (
@@ -100,18 +100,14 @@ async def run_target(
     force_detail_refresh: bool = False,
     incremental_rescrape: bool = True,
     deep_refresh_days: int = 14,
+    max_jobs: int | None = None,
 ) -> RunResult:
-    from crawl4ai import AsyncWebCrawler
-
     website_t0 = time.perf_counter()
 
     hub = BlueprintHub(root)
     system_config = hub.system
     blueprint = hub.get_target(target_id)
-    adapter = get_adapter(blueprint)
-    browser_config = build_browser_config(system_config.browser)
     instruction = build_instruction(blueprint)
-    llm_strategy = build_llm_strategy(system_config.llm, instruction)
 
     run_session_id = _new_run_session_id(target_id)
     session_logger = build_session_logger(root, target_id, run_session_id)
@@ -124,192 +120,49 @@ async def run_target(
         model=system_config.llm.provider,
     )
 
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        job_urls = await adapter.discover_job_urls(
-            crawler,
-            blueprint,
-            system_config,
-            session_logger=session_logger,
-        )
-
-        session_logger.log(
-            "discovery_complete",
-            discovered_urls=len(job_urls),
-        )
-
-        urls_to_extract, rescrape_plan = _plan_incremental_rescrape(
-            target_id=target_id,
-            run_session_id=run_session_id,
-            discovered_urls=job_urls,
-            force_detail_refresh=force_detail_refresh,
-            incremental_rescrape=incremental_rescrape,
-            deep_refresh_days=deep_refresh_days,
-        )
-        session_logger.log("rescrape_plan_complete", **rescrape_plan)
-
-        concurrency = system_config.browser.detail_extraction_concurrency
-        semaphore = asyncio.Semaphore(concurrency)
-
-        async def extract_one_job(job_url: str, item_index: int):
-            async with semaphore:
-                session_logger.log(
-                    "extract_start",
-                    job_url=job_url,
-                    item_index=item_index,
-                )
-
-                gpu_before = query_gpu_snapshot()
-                session_logger.log(
-                    "gpu_before_extract",
-                    job_url=job_url,
-                    item_index=item_index,
-                    gpu=gpu_before,
-                )
-
-                t0 = time.perf_counter()
-                detail_session_id = f"{target_id}_detail_session_{item_index}"
-
-                async def cleanup_detail_session() -> None:
-                    try:
-                        await close_session(crawler, detail_session_id)
-                    except Exception as cleanup_exc:
-                        session_logger.log(
-                            "detail_session_cleanup_failed",
-                            job_url=job_url,
-                            item_index=item_index,
-                            detail_session_id=detail_session_id,
-                            error_message=str(cleanup_exc),
-                        )
-
-                try:
-                    result = await crawler.arun(
-                        url=job_url,
-                        config=detail_run_config(
-                            system_config.browser,
-                            blueprint.detail.wait_for,
-                            llm_strategy,
-                            session_id=detail_session_id,
-                        ),
-                    )
-
-                    elapsed = round(time.perf_counter() - t0, 3)
-
-                    gpu_after = query_gpu_snapshot()
-                    session_logger.log(
-                        "gpu_after_extract",
-                        job_url=job_url,
-                        item_index=item_index,
-                        elapsed_seconds=elapsed,
-                        gpu=gpu_after,
-                    )
-
-                    if not result.success:
-                        _save_failed_payload(
-                            root,
-                            target_id,
-                            _slugify(job_url),
-                            f"CRAWL FAILED: {result.error_message}",
-                        )
-                        session_logger.log(
-                            "extract_failed",
-                            job_url=job_url,
-                            item_index=item_index,
-                            elapsed_seconds=elapsed,
-                            error_message=result.error_message,
-                        )
-                        return None
-
-                    raw_content = result.extracted_content
-                    job = parse_extracted_jobs(raw_content, job_url)
-
-                    if job is None:
-                        _save_failed_payload(root, target_id, _slugify(job_url), raw_content)
-                        session_logger.log(
-                            "parse_failed",
-                            job_url=job_url,
-                            item_index=item_index,
-                            elapsed_seconds=elapsed,
-                        )
-                        return None
-
-                    if is_valid_job(job):
-                        session_logger.log(
-                            "extract_saved",
-                            job_url=job_url,
-                            item_index=item_index,
-                            elapsed_seconds=elapsed,
-                            title=job.title,
-                        )
-                        return job
-
-                    _save_failed_payload(root, target_id, _slugify(job_url), raw_content)
-                    session_logger.log(
-                        "validation_failed",
-                        job_url=job_url,
-                        item_index=item_index,
-                        elapsed_seconds=elapsed,
-                        parsed_title=job.title,
-                    )
-                    return None
-
-                except Exception as exc:
-                    elapsed = round(time.perf_counter() - t0, 3)
-                    _save_failed_payload(
-                        root,
-                        target_id,
-                        _slugify(job_url),
-                        f"CRAWL EXCEPTION: {exc}",
-                    )
-                    session_logger.log(
-                        "extract_exception",
-                        job_url=job_url,
-                        item_index=item_index,
-                        elapsed_seconds=elapsed,
-                        error_message=str(exc),
-                    )
-                    return None
-
-                finally:
-                    await cleanup_detail_session()
-
-        session_logger.log(
-            "parallel_extraction_start",
-            total_job_urls=len(urls_to_extract),
-            discovered_urls=len(job_urls),
-            skipped_existing=int(rescrape_plan.get("known_skipped") or 0),
-            concurrency=concurrency,
-        )
-
-        extraction_results = await asyncio.gather(
-            *(
-                extract_one_job(job_url, idx)
-                for idx, job_url in enumerate(urls_to_extract, start=1)
+    orchestrator = ScrapeOrchestrator(
+        blueprint=blueprint,
+        system_config=system_config,
+        run_session_id=run_session_id,
+        instruction=instruction,
+    )
+    orchestration = await orchestrator.run(
+        options=ScrapeExecutionOptions(
+            detail_concurrency=system_config.browser.detail_extraction_concurrency,
+            detail_retry_attempts=0,
+            max_jobs=max(1, int(max_jobs)) if max_jobs is not None else None,
+            fail_on_zero_discovery=True,
+            session_prefix=f"{target_id}_detail_session",
+        ),
+        hooks=ScrapeOrchestratorHooks(
+            plan_detail_urls=lambda discovered_urls: _plan_incremental_rescrape(
+                target_id=target_id,
+                run_session_id=run_session_id,
+                discovered_urls=discovered_urls,
+                force_detail_refresh=force_detail_refresh,
+                incremental_rescrape=incremental_rescrape,
+                deep_refresh_days=deep_refresh_days,
             ),
-            return_exceptions=True,
-        )
-
-        jobs = []
-
-        for item in extraction_results:
-            if isinstance(item, Exception):
-                session_logger.log(
-                    "extract_task_exception",
-                    error_message=str(item),
-                )
-                continue
-
-            if item is not None:
-                jobs.append(item)
-
-        session_logger.log(
-            "parallel_extraction_complete",
-            attempted_urls=len(urls_to_extract),
-            discovered_urls=len(job_urls),
-            extracted_jobs=len(jobs),
-        )
+            on_event=lambda event, payload: session_logger.log(event, **payload),
+            on_failed_payload=lambda job_url, payload: _save_failed_payload(
+                root,
+                target_id,
+                _slugify(job_url),
+                payload,
+            ),
+            adapter_session_logger=session_logger,
+            gpu_snapshot=query_gpu_snapshot,
+        ),
+    )
+    job_urls = orchestration.discovered_job_urls
+    urls_to_extract = orchestration.attempted_job_urls
+    jobs = orchestration.jobs
+    rescrape_plan = orchestration.rescrape_plan
 
     total_elapsed_seconds = round(time.perf_counter() - website_t0, 3)
     lifecycle_reconcile = _pending_backfill_reconcile(incremental_rescrape=incremental_rescrape)
+    extraction_failures = max(0, len(urls_to_extract) - len(jobs))
+    run_status = "partial" if extraction_failures else "success"
 
     output_dir = root / system_config.output.dir
     output_path = save_jobs_json(output_dir, blueprint.output_file, jobs, run_session_id)
@@ -341,6 +194,8 @@ async def run_target(
         discovered_job_urls=job_urls,
         rescrape_plan=rescrape_plan,
         lifecycle_reconcile=lifecycle_reconcile,
+        status=run_status,
+        extraction_failures=extraction_failures,
     )
 
     session_logger.log(
@@ -355,10 +210,13 @@ async def run_target(
         rescrape_plan=rescrape_plan,
         lifecycle_reconcile=lifecycle_reconcile,
         total_elapsed_seconds=total_elapsed_seconds,
+        status=run_status,
+        extraction_failures=extraction_failures,
     )
 
     return RunResult(
         target_id=target_id,
+        status=run_status,
         output_path=str(output_path),
         summary_path=str(summary_path),
         discovered_urls=len(job_urls),
@@ -379,17 +237,37 @@ async def run_fleet(
     force_detail_refresh: bool = False,
     incremental_rescrape: bool = True,
     deep_refresh_days: int = 14,
+    max_jobs: int | None = None,
+    target_ids: list[str] | None = None,
 ) -> list[RunResult]:
     hub = BlueprintHub(root)
     results: list[RunResult] = []
 
-    for target in hub.get_fleet_targets():
-        results.append(await run_target(
-            root,
-            target.id,
-            force_detail_refresh=force_detail_refresh,
-            incremental_rescrape=incremental_rescrape,
-            deep_refresh_days=deep_refresh_days,
-        ))
+    targets = [hub.get_target(target_id) for target_id in target_ids] if target_ids else hub.get_fleet_targets()
+    for target in targets:
+        try:
+            results.append(await run_target(
+                root,
+                target.id,
+                force_detail_refresh=force_detail_refresh,
+                incremental_rescrape=incremental_rescrape,
+                deep_refresh_days=deep_refresh_days,
+                max_jobs=max_jobs,
+            ))
+        except Exception as exc:
+            results.append(RunResult(
+                target_id=target.id,
+                status="failed",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                output_path="",
+                summary_path="",
+                discovered_urls=0,
+                attempted_urls=0,
+                skipped_existing=0,
+                extracted_jobs=0,
+                total_elapsed_seconds=0.0,
+                jobs=[],
+            ))
 
     return results

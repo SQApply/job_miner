@@ -194,8 +194,8 @@ def interaction_run_config(settings: BrowserSettings, session_id: str, click_js:
 
 def detail_run_config(
     settings: BrowserSettings,
-    wait_for: str,
-    extraction_strategy,
+    wait_for: str | None,
+    extraction_strategy=None,
     session_id: str | None = None,
 ):
     from crawl4ai import CacheMode, CrawlerRunConfig
@@ -211,6 +211,30 @@ def detail_run_config(
         geolocation=_geolocation_config(settings),
         extraction_strategy=extraction_strategy,
     )
+
+
+def detail_llm_run_config(settings: BrowserSettings, extraction_strategy, session_id: str):
+    """Run LLM extraction against the already-rendered detail page."""
+    from crawl4ai import CacheMode, CrawlerRunConfig
+
+    return CrawlerRunConfig(
+        session_id=session_id,
+        cache_mode=CacheMode.BYPASS,
+        js_only=True,
+        delay_before_return_html=0.1,
+        remove_overlay_elements=settings.remove_overlay_elements,
+        remove_consent_popups=settings.remove_consent_popups,
+        geolocation=_geolocation_config(settings),
+        extraction_strategy=extraction_strategy,
+    )
+
+
+def resilient_detail_wait(wait_for: str | None) -> str | None:
+    """Replace the fragile h1-only gate with layout-independent readiness."""
+    value = str(wait_for or "").strip()
+    if not value or value.lower() == "css:h1":
+        return "js:() => !!(document.body && document.body.innerText && document.body.innerText.trim().length > 100)"
+    return value
 
 
 async def close_session(crawler, session_id: str) -> None:

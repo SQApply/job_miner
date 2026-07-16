@@ -207,6 +207,9 @@ class JobPosting(BaseModel):
 
 class RunResult(BaseModel):
     target_id: str
+    status: Literal["success", "partial", "failed"] = "success"
+    error_type: str | None = None
+    error_message: str | None = None
     output_path: str
     summary_path: str
     discovered_urls: int
