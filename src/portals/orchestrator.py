@@ -19,6 +19,7 @@ from ..router import get_adapter
 from ..schemas import JobPosting, ResolvedBlueprint, SystemConfig
 from .acquisition import (
     AcquisitionContext,
+    AcquisitionOutcome,
     AcquisitionRegistry,
     default_acquisition_registry,
 )
@@ -172,13 +173,48 @@ class ScrapeOrchestrator:
         *,
         options: ScrapeExecutionOptions,
         hooks: ScrapeOrchestratorHooks | None = None,
+        acquisition_outcome: AcquisitionOutcome | None = None,
     ) -> OrchestratedScrapeResult:
-        """Create the Crawl4AI browser and execute one complete source scrape."""
+        """Execute one source scrape and avoid launching a browser for full API feeds."""
+        if acquisition_outcome is None and options.prefer_platform_api:
+            try:
+                acquisition_outcome = await self.acquisition_registry.acquire(
+                    self._acquisition_context(options)
+                )
+            except Exception as exc:
+                acquisition_outcome = AcquisitionOutcome(
+                    selected=None,
+                    attempts=[
+                        {
+                            "status": "failed",
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc)[:500],
+                        }
+                    ],
+                )
+
+        selected = acquisition_outcome.selected if acquisition_outcome is not None else None
+        if selected is not None and selected.discovered_urls and all(
+            url in selected.preextracted_jobs and is_valid_job(selected.preextracted_jobs[url])
+            for url in selected.discovered_urls
+        ):
+            return await self.run_with_crawler(
+                _UnavailableCrawler(),
+                options=options,
+                hooks=hooks,
+                acquisition_outcome=acquisition_outcome,
+            )
+
         from crawl4ai import AsyncWebCrawler
 
         browser_config = build_browser_config(self.system_config.browser)
         async with AsyncWebCrawler(config=browser_config) as crawler:
-            return await self.run_with_crawler(crawler, options=options, hooks=hooks)
+            return await self.run_with_crawler(
+                crawler,
+                options=options,
+                hooks=hooks,
+                acquisition_outcome=acquisition_outcome,
+            )
 
     async def run_with_crawler(
         self,
@@ -186,6 +222,7 @@ class ScrapeOrchestrator:
         *,
         options: ScrapeExecutionOptions,
         hooks: ScrapeOrchestratorHooks | None = None,
+        acquisition_outcome: AcquisitionOutcome | None = None,
     ) -> OrchestratedScrapeResult:
         """Execute with an existing crawler; useful for probes and deterministic tests."""
         started = time.perf_counter()
@@ -203,17 +240,13 @@ class ScrapeOrchestrator:
         }
 
         selected_acquisition = None
-        if options.prefer_platform_api:
+        if acquisition_outcome is not None:
+            selected_acquisition = acquisition_outcome.selected
+            acquisition = acquisition_outcome.metrics()
+        elif options.prefer_platform_api:
             try:
                 outcome = await self.acquisition_registry.acquire(
-                    AcquisitionContext(
-                        listing_url=self.blueprint.listing.page_url,
-                        source_platform_hint=self.source_platform_hint,
-                        acquisition_hints=self.acquisition_hints,
-                        max_pages=options.max_acquisition_pages,
-                        timeout_seconds=options.acquisition_timeout_seconds,
-                        require_complete=options.require_complete_acquisition,
-                    )
+                    self._acquisition_context(options)
                 )
                 selected_acquisition = outcome.selected
                 acquisition = outcome.metrics()
@@ -639,3 +672,18 @@ class ScrapeOrchestrator:
     def _safe_session_component(value: str) -> str:
         normalized = "".join(character if character.isalnum() else "_" for character in value)
         return normalized.strip("_")[:40] or "source"
+
+    def _acquisition_context(self, options: ScrapeExecutionOptions) -> AcquisitionContext:
+        return AcquisitionContext(
+            listing_url=self.blueprint.listing.page_url,
+            source_platform_hint=self.source_platform_hint,
+            acquisition_hints=self.acquisition_hints,
+            max_pages=options.max_acquisition_pages,
+            timeout_seconds=options.acquisition_timeout_seconds,
+            require_complete=options.require_complete_acquisition,
+        )
+
+
+class _UnavailableCrawler:
+    async def arun(self, **_: Any) -> Any:
+        raise RuntimeError("A browser was not launched because acquisition supplied complete job records")

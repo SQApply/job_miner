@@ -8,6 +8,21 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 
+KNOWN_BROWSER_ATS_HOSTS: dict[str, tuple[str, ...]] = {
+    "workable": ("app.workable.com", "apply.workable.com", "jobs.workable.com"),
+    "smartrecruiters": ("jobs.smartrecruiters.com",),
+    "icims": ("icims.com",),
+    "jobvite": ("jobs.jobvite.com",),
+    "oracle_recruiting": ("taleo.net", "oraclecloud.com"),
+    "successfactors": ("successfactors.com",),
+    "dayforce": ("jobs.dayforcehcm.com",),
+    "ukg": ("recruiting.ultipro.com", "recruiting2.ultipro.com"),
+    "adp": ("workforcenow.adp.com", "jobs.adp.com"),
+    "bamboohr": ("bamboohr.com",),
+    "paylocity": ("recruiting.paylocity.com",),
+}
+
+
 @dataclass(frozen=True)
 class PortalDetection:
     source_platform: str
@@ -44,17 +59,34 @@ def _safe_token(value: Any) -> str | None:
     return None
 
 
+def known_browser_ats_platform(value: str) -> str | None:
+    try:
+        hostname = (urlsplit(value).hostname or value).lower().rstrip(".")
+    except ValueError:
+        return None
+    for platform, suffixes in KNOWN_BROWSER_ATS_HOSTS.items():
+        if any(hostname == suffix or hostname.endswith(f".{suffix}") for suffix in suffixes):
+            return platform
+    return None
+
+
 def _embedded_urls(value: str) -> list[str]:
     normalized = html_module.unescape(str(value or "")).replace(r"\/", "/")
-    patterns = (
-        r"https?://(?:boards|job-boards)\.greenhouse\.io/[^\s\"'<>]+",
-        r"https?://jobs(?:\.eu)?\.lever\.co/[^\s\"'<>]+",
-        r"https?://jobs\.ashbyhq\.com/[^\s\"'<>]+",
-        r"https?://[a-z0-9-]+(?:\.wd\d+)?\.myworkdayjobs\.com/[^\s\"'<>]+",
-    )
+    candidates = re.findall(r"https?://[^\s\"'<>\\]+", normalized, flags=re.IGNORECASE)
     urls: list[str] = []
-    for pattern in patterns:
-        urls.extend(match.rstrip(").,;]") for match in re.findall(pattern, normalized, flags=re.IGNORECASE))
+    for raw in candidates:
+        candidate = raw.rstrip(").,;]}")
+        hostname = str(urlsplit(candidate).hostname or "").lower()
+        api_provider = any(
+            (
+                hostname.endswith("greenhouse.io"),
+                hostname in {"jobs.lever.co", "jobs.eu.lever.co"},
+                hostname == "jobs.ashbyhq.com",
+                hostname.endswith("myworkdayjobs.com"),
+            )
+        )
+        if api_provider or known_browser_ats_platform(candidate):
+            urls.append(candidate)
     return list(dict.fromkeys(urls))
 
 
@@ -95,6 +127,10 @@ def _acquisition_signature(listing_url: str, page_content: str) -> tuple[str, di
                     "tenant": workday.group("tenant"),
                     "site_token": site,
                 }
+
+        browser_platform = known_browser_ats_platform(candidate)
+        if browser_platform:
+            return browser_platform, {"listing_url": candidate}
     return None
 
 
@@ -189,6 +225,20 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
             acquisition_hints=acquisition[1] if acquisition and acquisition[0] == "ashby" else {},
+        )
+
+    if acquisition and acquisition[0] in KNOWN_BROWSER_ATS_HOSTS:
+        platform = acquisition[0]
+        return PortalDetection(
+            source_platform=platform,
+            profile_name="generic_listing",
+            crawl_strategy="generic_listing",
+            confidence=0.82,
+            requires_review=True,
+            reasons=[f"A known {platform} job-board URL was detected and will be tested automatically."],
+            page_title=_page_title(html_value),
+            content_fingerprint=fingerprint,
+            acquisition_hints=acquisition[1],
         )
 
     if "#" in listing_url or "hash-router" in combined or "hash route" in combined:
