@@ -220,6 +220,7 @@ class RunResult(BaseModel):
     discovered_job_urls: list[str] = Field(default_factory=list)
     rescrape_plan: dict = Field(default_factory=dict)
     lifecycle_reconcile: dict = Field(default_factory=dict)
+    acquisition: dict = Field(default_factory=dict)
     jobs: list[JobPosting]
 
 

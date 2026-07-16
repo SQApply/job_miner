@@ -186,7 +186,20 @@ def _record_artifacts(*, portal: dict[str, Any], pipeline_run_id: str, artifacts
     return {"status": "recorded", "artifact_count": len(artifacts)}
 
 
-def _reconcile_lifecycle_after_ingestion(*, portal: dict[str, Any], run_session_id: str, discovered_urls: list[str] | None) -> dict[str, Any]:
+def _reconcile_lifecycle_after_ingestion(
+    *,
+    portal: dict[str, Any],
+    run_session_id: str,
+    discovered_urls: list[str] | None,
+    acquisition: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    acquisition_metrics = acquisition or {}
+    if bool(acquisition_metrics.get("selected")) and not bool(acquisition_metrics.get("reconciliation_safe")):
+        return {
+            "status": "skipped_incomplete_acquisition",
+            "missing_marked": 0,
+            "deactivated": 0,
+        }
     urls = list(discovered_urls or [])
     if not urls:
         return {"status": "skipped_no_discovered_urls", "missing_marked": 0, "deactivated": 0}
@@ -385,7 +398,7 @@ def scrape_job_portal_task(self, portal_id: str, pipeline_run_id: str, max_jobs:
                 run_session_id=str(pipeline_run_id),
                 max_jobs=effective_max_jobs,
                 incremental_rescrape=True,
-                reconcile_lifecycle=False,
+                reconcile_lifecycle=True,
             ),
             int(portal["crawl_timeout_seconds"]),
         )
@@ -397,7 +410,12 @@ def scrape_job_portal_task(self, portal_id: str, pipeline_run_id: str, max_jobs:
             run = repo.get_pipeline_run(pipeline_run_id)
             run_session_id = str((run or {}).get("run_session_id") or pipeline_run_id)
         ingestion, changed_job_ids = _ingest_jobs(portal=portal, run_session_id=run_session_id, jobs=result.extracted_jobs)
-        lifecycle_reconcile = _reconcile_lifecycle_after_ingestion(portal=portal, run_session_id=run_session_id, discovered_urls=result.discovered_job_urls)
+        lifecycle_reconcile = _reconcile_lifecycle_after_ingestion(
+            portal=portal,
+            run_session_id=run_session_id,
+            discovered_urls=result.discovered_job_urls,
+            acquisition=result.acquisition,
+        )
         recommendation_refresh = _record_recommendation_refresh_policy(portal=portal, run_session_id=run_session_id, changed_job_ids=changed_job_ids)
 
         with postgres_session() as session:

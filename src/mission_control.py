@@ -133,6 +133,10 @@ async def run_target(
             max_jobs=max(1, int(max_jobs)) if max_jobs is not None else None,
             fail_on_zero_discovery=True,
             session_prefix=f"{target_id}_detail_session",
+            prefer_platform_api=True,
+            max_acquisition_pages=max(1, int(blueprint.listing.pagination.max_turns or 50)),
+            acquisition_timeout_seconds=20.0,
+            require_complete_acquisition=max_jobs is None,
         ),
         hooks=ScrapeOrchestratorHooks(
             plan_detail_urls=lambda discovered_urls: _plan_incremental_rescrape(
@@ -194,6 +198,7 @@ async def run_target(
         discovered_job_urls=job_urls,
         rescrape_plan=rescrape_plan,
         lifecycle_reconcile=lifecycle_reconcile,
+        acquisition=orchestration.acquisition,
         status=run_status,
         extraction_failures=extraction_failures,
     )
@@ -209,6 +214,7 @@ async def run_target(
         discovered_job_urls=job_urls,
         rescrape_plan=rescrape_plan,
         lifecycle_reconcile=lifecycle_reconcile,
+        acquisition=orchestration.acquisition,
         total_elapsed_seconds=total_elapsed_seconds,
         status=run_status,
         extraction_failures=extraction_failures,
@@ -226,6 +232,7 @@ async def run_target(
         discovered_job_urls=job_urls,
         rescrape_plan=rescrape_plan,
         lifecycle_reconcile=lifecycle_reconcile,
+        acquisition=orchestration.acquisition,
         total_elapsed_seconds=total_elapsed_seconds,
         jobs=jobs,
     )

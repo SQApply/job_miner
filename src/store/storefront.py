@@ -43,6 +43,7 @@ def save_run_summary(
     discovered_job_urls: list[str] | None = None,
     rescrape_plan: dict | None = None,
     lifecycle_reconcile: dict | None = None,
+    acquisition: dict | None = None,
     status: str = "success",
     extraction_failures: int = 0,
 ) -> Path:
@@ -59,6 +60,7 @@ def save_run_summary(
         "discovered_job_urls": list(discovered_job_urls or []),
         "rescrape_plan": rescrape_plan or {},
         "lifecycle_reconcile": lifecycle_reconcile or {},
+        "acquisition": acquisition or {},
         "output_path": output_path,
         "log_path": log_path,
         "total_elapsed_seconds": total_elapsed_seconds,

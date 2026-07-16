@@ -17,10 +17,16 @@ from ..extract.model_lane import build_llm_strategy, parse_extracted_jobs
 from ..extract.validator import is_valid_job
 from ..router import get_adapter
 from ..schemas import JobPosting, ResolvedBlueprint, SystemConfig
+from .acquisition import (
+    AcquisitionContext,
+    AcquisitionRegistry,
+    default_acquisition_registry,
+)
 
 
 EventCallback = Callable[[str, dict[str, Any]], None]
 DiscoveryNormalizer = Callable[[list[str]], tuple[list[str], int]]
+AcquiredDiscoveryNormalizer = Callable[[list[str], tuple[str, ...]], tuple[list[str], int]]
 DetailPlanner = Callable[[list[str]], tuple[list[str], dict[str, Any]]]
 UrlValidator = Callable[[str], str]
 RejectedErrorPredicate = Callable[[BaseException], bool]
@@ -62,6 +68,10 @@ class ScrapeExecutionOptions:
     max_jobs: int | None = None
     fail_on_zero_discovery: bool = True
     session_prefix: str = "detail"
+    prefer_platform_api: bool = True
+    max_acquisition_pages: int = 50
+    acquisition_timeout_seconds: float = 20.0
+    require_complete_acquisition: bool = True
 
     def __post_init__(self) -> None:
         if self.detail_concurrency < 1:
@@ -74,6 +84,10 @@ class ScrapeExecutionOptions:
             raise ValueError("max_jobs must be at least 1 when provided")
         if not self.session_prefix.strip():
             raise ValueError("session_prefix cannot be empty")
+        if self.max_acquisition_pages < 1:
+            raise ValueError("max_acquisition_pages must be at least 1")
+        if self.acquisition_timeout_seconds <= 0:
+            raise ValueError("acquisition_timeout_seconds must be positive")
 
 
 @dataclass
@@ -81,6 +95,7 @@ class ScrapeOrchestratorHooks:
     """Caller-owned policy and side effects around the shared scrape engine."""
 
     normalize_discovered_urls: DiscoveryNormalizer = _normalize_discovered_urls
+    normalize_acquired_urls: AcquiredDiscoveryNormalizer | None = None
     plan_detail_urls: DetailPlanner = _plan_all_urls
     validate_detail_url: UrlValidator = _identity_url
     is_rejected_error: RejectedErrorPredicate = _never_rejected
@@ -103,6 +118,7 @@ class OrchestratedScrapeResult:
     rescrape_plan: dict[str, Any]
     elapsed_seconds: float
     raw_discovered_urls: int = 0
+    acquisition: dict[str, Any] = field(default_factory=dict)
 
     @property
     def skipped_existing(self) -> int:
@@ -138,12 +154,18 @@ class ScrapeOrchestrator:
         run_session_id: str,
         instruction: str | None = None,
         adapter: Any = None,
+        source_platform_hint: str | None = None,
+        acquisition_hints: dict[str, str] | None = None,
+        acquisition_registry: AcquisitionRegistry | None = None,
     ) -> None:
         self.blueprint = blueprint
         self.system_config = system_config
         self.run_session_id = run_session_id
         self.instruction = instruction or blueprint.detail.instruction
         self.adapter = adapter or get_adapter(blueprint)
+        self.source_platform_hint = str(source_platform_hint or "").strip() or None
+        self.acquisition_hints = dict(acquisition_hints or {})
+        self.acquisition_registry = acquisition_registry or default_acquisition_registry()
 
     async def run(
         self,
@@ -171,14 +193,77 @@ class ScrapeOrchestrator:
         artifacts: list[dict[str, Any]] = []
         detail_failures: list[dict[str, Any]] = []
         rejected_urls = 0
+        preextracted_jobs: dict[str, JobPosting] = {}
+        trusted_acquisition_hosts: tuple[str, ...] = ()
+        acquisition: dict[str, Any] = {
+            "selected": False,
+            "strategy": "browser_fallback",
+            "reason": "platform_api_disabled" if not options.prefer_platform_api else "no_provider_selected",
+            "attempts": [],
+        }
 
-        raw_urls = await self.adapter.discover_job_urls(
-            crawler,
-            self.blueprint,
-            self.system_config,
-            session_logger=hooks.adapter_session_logger,
-        )
-        discovered_urls, rejected = hooks.normalize_discovered_urls(list(raw_urls or []))
+        selected_acquisition = None
+        if options.prefer_platform_api:
+            try:
+                outcome = await self.acquisition_registry.acquire(
+                    AcquisitionContext(
+                        listing_url=self.blueprint.listing.page_url,
+                        source_platform_hint=self.source_platform_hint,
+                        acquisition_hints=self.acquisition_hints,
+                        max_pages=options.max_acquisition_pages,
+                        timeout_seconds=options.acquisition_timeout_seconds,
+                        require_complete=options.require_complete_acquisition,
+                    )
+                )
+                selected_acquisition = outcome.selected
+                acquisition = outcome.metrics()
+            except Exception as exc:
+                acquisition = {
+                    "selected": False,
+                    "strategy": "browser_fallback",
+                    "reason": "registry_exception",
+                    "attempts": [
+                        {
+                            "status": "failed",
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc)[:500],
+                        }
+                    ],
+                }
+
+        self._emit(hooks, "acquisition_complete", **acquisition)
+        if selected_acquisition is not None:
+            raw_urls = list(selected_acquisition.discovered_urls)
+            preextracted_jobs = dict(selected_acquisition.preextracted_jobs)
+            trusted_acquisition_hosts = tuple(selected_acquisition.trusted_hosts)
+            normalizer = hooks.normalize_acquired_urls
+            if normalizer is not None:
+                discovered_urls, rejected = normalizer(list(raw_urls), trusted_acquisition_hosts)
+            else:
+                discovered_urls, rejected = hooks.normalize_discovered_urls(list(raw_urls))
+            self._emit(
+                hooks,
+                "acquisition_selected",
+                platform=selected_acquisition.platform,
+                strategy=selected_acquisition.strategy,
+                complete=selected_acquisition.complete,
+                discovered_urls=len(discovered_urls),
+                preextracted_jobs=len(preextracted_jobs),
+            )
+        else:
+            self._emit(
+                hooks,
+                "acquisition_browser_fallback",
+                page_url=self.blueprint.listing.page_url,
+                attempts=acquisition.get("attempts") or [],
+            )
+            raw_urls = await self.adapter.discover_job_urls(
+                crawler,
+                self.blueprint,
+                self.system_config,
+                session_logger=hooks.adapter_session_logger,
+            )
+            discovered_urls, rejected = hooks.normalize_discovered_urls(list(raw_urls or []))
         rejected_urls += rejected
         self._emit(
             hooks,
@@ -229,7 +314,16 @@ class ScrapeOrchestrator:
         concurrency = max(1, min(options.detail_concurrency, len(attempted_urls) or 1))
         semaphore = asyncio.Semaphore(concurrency)
         rate_limiter = _RateLimiter(options.requests_per_minute)
-        llm_strategy = build_llm_strategy(self.system_config.llm, self.instruction)
+        llm_strategy: Any = None
+        llm_strategy_lock = asyncio.Lock()
+
+        async def get_llm_strategy() -> Any:
+            nonlocal llm_strategy
+            if llm_strategy is None:
+                async with llm_strategy_lock:
+                    if llm_strategy is None:
+                        llm_strategy = build_llm_strategy(self.system_config.llm, self.instruction)
+            return llm_strategy
 
         self._emit(
             hooks,
@@ -251,6 +345,19 @@ class ScrapeOrchestrator:
                     job_url=original_job_url,
                     item_index=item_index,
                 )
+                acquired_job = preextracted_jobs.get(original_job_url)
+                if acquired_job is not None and is_valid_job(acquired_job):
+                    self._emit(
+                        hooks,
+                        "extract_saved",
+                        job_url=original_job_url,
+                        item_index=item_index,
+                        attempt=0,
+                        elapsed_seconds=0.0,
+                        title=acquired_job.title,
+                        extraction_method="platform_api",
+                    )
+                    return acquired_job
                 last_error = "unknown extraction failure"
                 attempts_used = 0
 
@@ -346,7 +453,7 @@ class ScrapeOrchestrator:
                                 url=job_url,
                                 config=detail_llm_run_config(
                                     self.system_config.browser,
-                                    llm_strategy,
+                                    await get_llm_strategy(),
                                     detail_session_id,
                                 ),
                             )
@@ -507,6 +614,7 @@ class ScrapeOrchestrator:
             rescrape_plan=rescrape_plan,
             elapsed_seconds=elapsed_seconds,
             raw_discovered_urls=len(raw_urls or []),
+            acquisition=acquisition,
         )
 
     @staticmethod
