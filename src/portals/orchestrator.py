@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from ..crawl.browser_lane import (
@@ -23,14 +24,19 @@ from .acquisition import (
     AcquisitionRegistry,
     default_acquisition_registry,
 )
+from .page_quality import assess_page_quality
+from .url_intelligence import promote_trusted_detail_url
 
 
 EventCallback = Callable[[str, dict[str, Any]], None]
 DiscoveryNormalizer = Callable[[list[str]], tuple[list[str], int]]
 AcquiredDiscoveryNormalizer = Callable[[list[str], tuple[str, ...]], tuple[list[str], int]]
+DiscoveryRanker = Callable[[list[str]], tuple[list[str], dict[str, Any]]]
 DetailPlanner = Callable[[list[str]], tuple[list[str], dict[str, Any]]]
 UrlValidator = Callable[[str], str]
 RejectedErrorPredicate = Callable[[BaseException], bool]
+ExtractedJobValidator = Callable[[JobPosting, str], tuple[bool, str]]
+LlmEligibilityCallback = Callable[[Any, str], tuple[bool, str]]
 DiscoveryArtifactCallback = Callable[[list[str]], list[dict[str, Any]] | None]
 FailureArtifactCallback = Callable[[int, str, int, Any], list[dict[str, Any]] | None]
 FailedPayloadCallback = Callable[[str, Any], None]
@@ -51,12 +57,31 @@ def _plan_all_urls(urls: list[str]) -> tuple[list[str], dict[str, Any]]:
     }
 
 
+def _preserve_discovery_order(urls: list[str]) -> tuple[list[str], dict[str, Any]]:
+    return list(urls), {
+        "strategy": "disabled",
+        "input_urls": len(urls),
+        "selected_urls": len(urls),
+        "rejected_urls": 0,
+    }
+
+
 def _identity_url(url: str) -> str:
     return url
 
 
 def _never_rejected(_: BaseException) -> bool:
     return False
+
+
+def _default_job_validator(job: JobPosting, _: str) -> tuple[bool, str]:
+    if is_valid_job(job):
+        return True, "title_and_url_present"
+    return False, "missing title or job URL"
+
+
+def _always_allow_llm(_: Any, __: str) -> tuple[bool, str]:
+    return True, "default"
 
 
 @dataclass(frozen=True)
@@ -73,6 +98,7 @@ class ScrapeExecutionOptions:
     max_acquisition_pages: int = 50
     acquisition_timeout_seconds: float = 20.0
     require_complete_acquisition: bool = True
+    prefer_static_detail_html: bool = False
 
     def __post_init__(self) -> None:
         if self.detail_concurrency < 1:
@@ -97,9 +123,12 @@ class ScrapeOrchestratorHooks:
 
     normalize_discovered_urls: DiscoveryNormalizer = _normalize_discovered_urls
     normalize_acquired_urls: AcquiredDiscoveryNormalizer | None = None
+    rank_discovered_urls: DiscoveryRanker = _preserve_discovery_order
     plan_detail_urls: DetailPlanner = _plan_all_urls
     validate_detail_url: UrlValidator = _identity_url
     is_rejected_error: RejectedErrorPredicate = _never_rejected
+    validate_extracted_job: ExtractedJobValidator = _default_job_validator
+    should_attempt_llm: LlmEligibilityCallback = _always_allow_llm
     on_event: EventCallback | None = None
     on_discovery_artifacts: DiscoveryArtifactCallback | None = None
     on_failure_artifacts: FailureArtifactCallback | None = None
@@ -176,6 +205,7 @@ class ScrapeOrchestrator:
         acquisition_outcome: AcquisitionOutcome | None = None,
     ) -> OrchestratedScrapeResult:
         """Execute one source scrape and avoid launching a browser for full API feeds."""
+        effective_hooks = hooks or ScrapeOrchestratorHooks()
         if acquisition_outcome is None and options.prefer_platform_api:
             try:
                 acquisition_outcome = await self.acquisition_registry.acquire(
@@ -195,13 +225,14 @@ class ScrapeOrchestrator:
 
         selected = acquisition_outcome.selected if acquisition_outcome is not None else None
         if selected is not None and selected.discovered_urls and all(
-            url in selected.preextracted_jobs and is_valid_job(selected.preextracted_jobs[url])
+            url in selected.preextracted_jobs
+            and effective_hooks.validate_extracted_job(selected.preextracted_jobs[url], url)[0]
             for url in selected.discovered_urls
         ):
             return await self.run_with_crawler(
                 _UnavailableCrawler(),
                 options=options,
-                hooks=hooks,
+                hooks=effective_hooks,
                 acquisition_outcome=acquisition_outcome,
             )
 
@@ -212,7 +243,7 @@ class ScrapeOrchestrator:
             return await self.run_with_crawler(
                 crawler,
                 options=options,
-                hooks=hooks,
+                hooks=effective_hooks,
                 acquisition_outcome=acquisition_outcome,
             )
 
@@ -267,13 +298,25 @@ class ScrapeOrchestrator:
         self._emit(hooks, "acquisition_complete", **acquisition)
         if selected_acquisition is not None:
             raw_urls = list(selected_acquisition.discovered_urls)
-            preextracted_jobs = dict(selected_acquisition.preextracted_jobs)
+            raw_preextracted_jobs = dict(selected_acquisition.preextracted_jobs)
             trusted_acquisition_hosts = tuple(selected_acquisition.trusted_hosts)
             normalizer = hooks.normalize_acquired_urls
             if normalizer is not None:
                 discovered_urls, rejected = normalizer(list(raw_urls), trusted_acquisition_hosts)
             else:
                 discovered_urls, rejected = hooks.normalize_discovered_urls(list(raw_urls))
+            discovered_set = set(discovered_urls)
+            for original_url, job in raw_preextracted_jobs.items():
+                if normalizer is not None:
+                    normalized_job_urls, _ = normalizer([original_url], trusted_acquisition_hosts)
+                else:
+                    normalized_job_urls, _ = hooks.normalize_discovered_urls([original_url])
+                for normalized_job_url in normalized_job_urls:
+                    if normalized_job_url not in discovered_set:
+                        continue
+                    if job.job_url == original_url and normalized_job_url != original_url:
+                        job = job.model_copy(update={"job_url": normalized_job_url})
+                    preextracted_jobs[normalized_job_url] = job
             self._emit(
                 hooks,
                 "acquisition_selected",
@@ -298,6 +341,7 @@ class ScrapeOrchestrator:
             )
             discovered_urls, rejected = hooks.normalize_discovered_urls(list(raw_urls or []))
         rejected_urls += rejected
+        discovered_urls, discovery_ranking = hooks.rank_discovered_urls(discovered_urls)
         self._emit(
             hooks,
             "discovery_complete",
@@ -305,6 +349,7 @@ class ScrapeOrchestrator:
             discovered_urls=len(discovered_urls),
             rejected_urls=rejected,
         )
+        self._emit(hooks, "discovery_ranked", **discovery_ranking)
 
         if not discovered_urls and options.fail_on_zero_discovery:
             self._emit(
@@ -332,6 +377,7 @@ class ScrapeOrchestrator:
         rescrape_plan = dict(rescrape_plan or {})
         rescrape_plan.setdefault("discovered_urls", len(discovered_urls))
         rescrape_plan["urls_to_extract_count"] = len(attempted_urls)
+        rescrape_plan["url_ranking"] = dict(discovery_ranking)
         self._emit(hooks, "rescrape_plan_complete", **rescrape_plan)
 
         if options.max_jobs is not None:
@@ -379,18 +425,33 @@ class ScrapeOrchestrator:
                     item_index=item_index,
                 )
                 acquired_job = preextracted_jobs.get(original_job_url)
-                if acquired_job is not None and is_valid_job(acquired_job):
+                if acquired_job is not None:
+                    acquired_valid, acquired_reason = hooks.validate_extracted_job(
+                        acquired_job,
+                        original_job_url,
+                    )
+                    if acquired_valid:
+                        self._emit(
+                            hooks,
+                            "extract_saved",
+                            job_url=original_job_url,
+                            item_index=item_index,
+                            attempt=0,
+                            elapsed_seconds=0.0,
+                            title=acquired_job.title,
+                            extraction_method="platform_api",
+                            validation_reason=acquired_reason,
+                        )
+                        return acquired_job
                     self._emit(
                         hooks,
-                        "extract_saved",
+                        "validation_failed",
                         job_url=original_job_url,
                         item_index=item_index,
                         attempt=0,
-                        elapsed_seconds=0.0,
-                        title=acquired_job.title,
                         extraction_method="platform_api",
+                        validation_reason=acquired_reason,
                     )
-                    return acquired_job
                 last_error = "unknown extraction failure"
                 attempts_used = 0
 
@@ -405,7 +466,129 @@ class ScrapeOrchestrator:
                     attempt_started = time.perf_counter()
 
                     try:
-                        job_url = hooks.validate_detail_url(original_job_url)
+                        promoted_job_url = promote_trusted_detail_url(
+                            original_job_url,
+                            platform_hint=self.source_platform_hint,
+                            acquisition_hints=self.acquisition_hints,
+                        )
+                        try:
+                            job_url = hooks.validate_detail_url(promoted_job_url)
+                        except Exception as promotion_exc:
+                            if promoted_job_url == original_job_url:
+                                raise
+                            self._emit(
+                                hooks,
+                                "detail_url_promotion_rejected",
+                                job_url=original_job_url,
+                                promoted_url=promoted_job_url,
+                                item_index=item_index,
+                                attempt=attempt,
+                                error_message=str(promotion_exc),
+                            )
+                            job_url = hooks.validate_detail_url(original_job_url)
+                        if job_url != original_job_url:
+                            self._emit(
+                                hooks,
+                                "detail_url_promoted",
+                                job_url=original_job_url,
+                                promoted_url=job_url,
+                                item_index=item_index,
+                                attempt=attempt,
+                                evidence_source="acquisition_hints",
+                            )
+
+                        if attempt == 1 and options.prefer_static_detail_html:
+                            request_text = getattr(self.acquisition_registry.client, "request_text", None)
+                            if callable(request_text):
+                                static_started = time.perf_counter()
+                                self._emit(
+                                    hooks,
+                                    "static_detail_start",
+                                    job_url=job_url,
+                                    item_index=item_index,
+                                )
+                                try:
+                                    await rate_limiter.wait()
+                                    static_html = await request_text(
+                                        job_url,
+                                        timeout_seconds=options.acquisition_timeout_seconds,
+                                    )
+                                except Exception as static_exc:
+                                    self._emit(
+                                        hooks,
+                                        "static_detail_failed",
+                                        job_url=job_url,
+                                        item_index=item_index,
+                                        elapsed_seconds=round(
+                                            time.perf_counter() - static_started,
+                                            3,
+                                        ),
+                                        error_type=type(static_exc).__name__,
+                                        error_message=str(static_exc)[:500],
+                                    )
+                                else:
+                                    static_quality = assess_page_quality(html=static_html)
+                                    if static_quality.blocked:
+                                        self._emit(
+                                            hooks,
+                                            "static_detail_rejected",
+                                            job_url=job_url,
+                                            item_index=item_index,
+                                            reason=static_quality.reason,
+                                            page_quality=static_quality.to_dict(),
+                                        )
+                                    else:
+                                        static_result = SimpleNamespace(
+                                            success=True,
+                                            url=job_url,
+                                            html=str(static_html or ""),
+                                            cleaned_html="",
+                                            error_message=None,
+                                        )
+                                        static_job = extract_job_from_result(static_result, job_url)
+                                        if static_job is not None:
+                                            static_valid, static_reason = hooks.validate_extracted_job(
+                                                static_job,
+                                                job_url,
+                                            )
+                                            if static_valid:
+                                                self._emit(
+                                                    hooks,
+                                                    "extract_saved",
+                                                    job_url=job_url,
+                                                    item_index=item_index,
+                                                    attempt=0,
+                                                    elapsed_seconds=round(
+                                                        time.perf_counter() - static_started,
+                                                        3,
+                                                    ),
+                                                    title=static_job.title,
+                                                    extraction_method="static_deterministic",
+                                                    validation_reason=static_reason,
+                                                )
+                                                return static_job
+                                            self._emit(
+                                                hooks,
+                                                "validation_failed",
+                                                job_url=job_url,
+                                                item_index=item_index,
+                                                attempt=0,
+                                                extraction_method="static_deterministic",
+                                                validation_reason=static_reason,
+                                            )
+                                        else:
+                                            self._emit(
+                                                hooks,
+                                                "static_detail_deterministic_miss",
+                                                job_url=job_url,
+                                                item_index=item_index,
+                                                elapsed_seconds=round(
+                                                    time.perf_counter() - static_started,
+                                                    3,
+                                                ),
+                                                page_quality=static_quality.to_dict(),
+                                            )
+
                         await rate_limiter.wait()
                         if hooks.gpu_snapshot is not None:
                             self._emit(
@@ -462,18 +645,134 @@ class ScrapeOrchestrator:
                             final_url = self._result_final_url(result, job_url)
                             final_url = hooks.validate_detail_url(final_url)
                             job = extract_job_from_result(result, final_url)
-                            if job is not None and is_valid_job(job):
+                            if job is not None:
+                                deterministic_valid, deterministic_reason = hooks.validate_extracted_job(
+                                    job,
+                                    final_url,
+                                )
+                                if deterministic_valid:
+                                    self._emit(
+                                        hooks,
+                                        "extract_saved",
+                                        job_url=job_url,
+                                        item_index=item_index,
+                                        attempt=attempt,
+                                        elapsed_seconds=elapsed,
+                                        title=job.title,
+                                        extraction_method="deterministic",
+                                        validation_reason=deterministic_reason,
+                                    )
+                                    return job
                                 self._emit(
                                     hooks,
-                                    "extract_saved",
+                                    "validation_failed",
                                     job_url=job_url,
                                     item_index=item_index,
                                     attempt=attempt,
-                                    elapsed_seconds=elapsed,
-                                    title=job.title,
                                     extraction_method="deterministic",
+                                    validation_reason=deterministic_reason,
                                 )
-                                return job
+
+                            rendered_content = "\n".join(
+                                str(getattr(result, field, "") or "")
+                                for field in ("html", "cleaned_html", "markdown")
+                            )
+                            rendered_promotion = promote_trusted_detail_url(
+                                original_job_url,
+                                platform_hint=self.source_platform_hint,
+                                acquisition_hints=self.acquisition_hints,
+                                page_content=rendered_content,
+                            )
+                            if rendered_promotion != job_url:
+                                try:
+                                    checked_promotion = hooks.validate_detail_url(
+                                        rendered_promotion
+                                    )
+                                except Exception as promotion_exc:
+                                    self._emit(
+                                        hooks,
+                                        "detail_url_promotion_rejected",
+                                        job_url=job_url,
+                                        promoted_url=rendered_promotion,
+                                        item_index=item_index,
+                                        attempt=attempt,
+                                        error_message=str(promotion_exc),
+                                    )
+                                else:
+                                    self._emit(
+                                        hooks,
+                                        "detail_url_promoted",
+                                        job_url=job_url,
+                                        promoted_url=checked_promotion,
+                                        item_index=item_index,
+                                        attempt=attempt,
+                                        evidence_source="rendered_document",
+                                    )
+                                    await rate_limiter.wait()
+                                    promoted_result = await crawler.arun(
+                                        url=checked_promotion,
+                                        config=detail_run_config(
+                                            self.system_config.browser,
+                                            resilient_detail_wait(
+                                                self.blueprint.detail.wait_for
+                                            ),
+                                            None,
+                                            session_id=detail_session_id,
+                                        ),
+                                    )
+                                    if not getattr(promoted_result, "success", False):
+                                        raise RuntimeError(
+                                            "Embedded detail document acquisition failed: "
+                                            f"{getattr(promoted_result, 'error_message', 'unknown error')}"
+                                        )
+                                    result = promoted_result
+                                    job_url = checked_promotion
+                                    final_url = self._result_final_url(result, job_url)
+                                    final_url = hooks.validate_detail_url(final_url)
+                                    job = extract_job_from_result(result, final_url)
+                                    if job is not None:
+                                        promoted_valid, promoted_reason = (
+                                            hooks.validate_extracted_job(job, final_url)
+                                        )
+                                        if promoted_valid:
+                                            self._emit(
+                                                hooks,
+                                                "extract_saved",
+                                                job_url=job_url,
+                                                item_index=item_index,
+                                                attempt=attempt,
+                                                elapsed_seconds=round(
+                                                    time.perf_counter() - attempt_started,
+                                                    3,
+                                                ),
+                                                title=job.title,
+                                                extraction_method="deterministic_embedded_document",
+                                                validation_reason=promoted_reason,
+                                            )
+                                            return job
+                                        self._emit(
+                                            hooks,
+                                            "validation_failed",
+                                            job_url=job_url,
+                                            item_index=item_index,
+                                            attempt=attempt,
+                                            extraction_method="deterministic_embedded_document",
+                                            validation_reason=promoted_reason,
+                                        )
+
+                            llm_allowed, llm_reason = hooks.should_attempt_llm(result, final_url)
+                            if not llm_allowed:
+                                last_error = f"LLM skipped: {llm_reason}"
+                                retryable = False
+                                self._emit(
+                                    hooks,
+                                    "llm_fallback_skipped_non_job",
+                                    job_url=job_url,
+                                    item_index=item_index,
+                                    attempt=attempt,
+                                    reason=llm_reason,
+                                )
+                                break
 
                             self._emit(
                                 hooks,
@@ -510,20 +809,31 @@ class ScrapeOrchestrator:
                             else:
                                 raw_content = getattr(llm_result, "extracted_content", None)
                                 job = parse_extracted_jobs(raw_content, final_url)
-                                if job is not None and is_valid_job(job):
-                                    self._emit(
-                                        hooks,
-                                        "extract_saved",
-                                        job_url=job_url,
-                                        item_index=item_index,
-                                        attempt=attempt,
-                                        elapsed_seconds=elapsed,
-                                        title=job.title,
-                                        extraction_method="llm_fallback",
+                                if job is not None:
+                                    llm_valid, llm_validation_reason = hooks.validate_extracted_job(
+                                        job,
+                                        final_url,
                                     )
-                                    return job
+                                    if llm_valid:
+                                        self._emit(
+                                            hooks,
+                                            "extract_saved",
+                                            job_url=job_url,
+                                            item_index=item_index,
+                                            attempt=attempt,
+                                            elapsed_seconds=elapsed,
+                                            title=job.title,
+                                            extraction_method="llm_fallback",
+                                            validation_reason=llm_validation_reason,
+                                        )
+                                        return job
+                                else:
+                                    llm_validation_reason = "LLM payload could not be parsed"
 
-                                last_error = "Deterministic and LLM extraction returned no valid job"
+                                last_error = (
+                                    "Deterministic and LLM extraction returned no certifiable job: "
+                                    f"{llm_validation_reason}"
+                                )
                                 self._save_failed_payload(hooks, job_url, raw_content)
                                 self._emit(
                                     hooks,
@@ -533,6 +843,7 @@ class ScrapeOrchestrator:
                                     attempt=attempt,
                                     elapsed_seconds=elapsed,
                                     parsed_title=getattr(job, "title", None),
+                                    validation_reason=llm_validation_reason,
                                 )
                     except Exception as exc:
                         last_error = f"{type(exc).__name__}: {exc}"

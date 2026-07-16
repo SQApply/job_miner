@@ -14,6 +14,7 @@ from .portals.orchestrator import (
     ScrapeOrchestrator,
     ScrapeOrchestratorHooks,
 )
+from .portals.url_intelligence import assess_llm_eligibility
 from .schemas import RunResult
 from .warehouse.repositories import WarehouseRepository
 from .store.storefront import (
@@ -137,6 +138,7 @@ async def run_target(
             max_acquisition_pages=max(1, int(blueprint.listing.pagination.max_turns or 50)),
             acquisition_timeout_seconds=20.0,
             require_complete_acquisition=max_jobs is None,
+            prefer_static_detail_html=True,
         ),
         hooks=ScrapeOrchestratorHooks(
             plan_detail_urls=lambda discovered_urls: _plan_incremental_rescrape(
@@ -148,6 +150,7 @@ async def run_target(
                 deep_refresh_days=deep_refresh_days,
             ),
             on_event=lambda event, payload: session_logger.log(event, **payload),
+            should_attempt_llm=assess_llm_eligibility,
             on_failed_payload=lambda job_url, payload: _save_failed_payload(
                 root,
                 target_id,

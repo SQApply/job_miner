@@ -13,6 +13,7 @@ from ..infrastructure.celery_app import PORTAL_SCRAPE_QUEUE, celery_app
 from ..infrastructure.mongo import get_mongo_database
 from ..infrastructure.settings import load_app_settings
 from ..matching.mongo_qdrant_sync import build_embedder, build_vector_store, index_job_towers
+from ..portals.lifecycle import reconciliation_guard
 from ..portals.runner import probe_portal, scrape_portal
 from ..tasks.tracking import mark_task_completed, mark_task_failed
 from ..warehouse.documents import WarehouseRunSessionDocument
@@ -193,16 +194,10 @@ def _reconcile_lifecycle_after_ingestion(
     discovered_urls: list[str] | None,
     acquisition: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    acquisition_metrics = acquisition or {}
-    if bool(acquisition_metrics.get("selected")) and not bool(acquisition_metrics.get("reconciliation_safe")):
-        return {
-            "status": "skipped_incomplete_acquisition",
-            "missing_marked": 0,
-            "deactivated": 0,
-        }
+    guard = reconciliation_guard(acquisition=acquisition, discovered_urls=discovered_urls)
+    if guard is not None:
+        return guard
     urls = list(discovered_urls or [])
-    if not urls:
-        return {"status": "skipped_no_discovered_urls", "missing_marked": 0, "deactivated": 0}
     warehouse = WarehouseRepository(get_mongo_database())
     return warehouse.reconcile_missing_jobs_after_discovery(
         target_id=str(portal["target_id"]),

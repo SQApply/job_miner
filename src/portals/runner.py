@@ -17,13 +17,15 @@ from ..warehouse.repositories import WarehouseRepository
 from .acquisition import AcquisitionContext, default_acquisition_registry
 from .artifacts import result_artifacts, save_portal_artifact
 from .blueprint import build_portal_blueprint
-from .detector import PortalDetection, detect_portal
+from .detector import PortalDetection, detect_portal, known_browser_ats_platform
 from .orchestrator import (
     ScrapeExecutionOptions,
     ScrapeOrchestrator,
     ScrapeOrchestratorHooks,
 )
-from .safety import PortalUrlSafetyError, validate_public_http_url
+from .result_evidence import detection_html, result_page_quality
+from .safety import PortalUrlSafetyError, default_allowed_hosts, validate_public_http_url
+from .url_intelligence import assess_llm_eligibility
 
 
 @dataclass(frozen=True)
@@ -74,11 +76,13 @@ class PortalScrapeResult:
 
 
 def _result_html(result: Any) -> str:
+    primary = ""
     for field in ("cleaned_html", "html", "markdown"):
         value = getattr(result, field, None)
         if value:
-            return str(value)
-    return ""
+            primary = str(value)
+            break
+    return detection_html(result, primary)
 
 
 def _result_text(result: Any) -> str:
@@ -95,6 +99,12 @@ def _result_final_url(result: Any, fallback: str) -> str:
         if value:
             return str(value)
     return fallback
+
+
+def _same_site(first: str, second: str) -> bool:
+    first_parts = str(first or "").lower().rstrip(".").split(".")
+    second_parts = str(second or "").lower().rstrip(".").split(".")
+    return len(first_parts) >= 2 and len(second_parts) >= 2 and first_parts[-2:] == second_parts[-2:]
 
 
 def _safe_discovered_urls(urls: list[str], allowed_hosts: list[str]) -> tuple[list[str], int]:
@@ -125,6 +135,21 @@ def _portal_acquisition_hints(portal: dict[str, Any]) -> dict[str, str]:
         for key, value in hints.items()
         if str(key).strip() and str(value).strip()
     }
+
+
+def _runtime_portal_allowed_hosts(portal: dict[str, Any]) -> list[str]:
+    """Add only a safety-checked canonical host learned during probing."""
+    configured = [str(value) for value in (portal.get("allowed_hosts") or []) if str(value).strip()]
+    canonical_url = str(portal.get("canonical_listing_url") or portal.get("listing_url") or "").strip()
+    provided_url = str(portal.get("listing_url") or canonical_url).strip()
+    if not canonical_url:
+        return configured
+    canonical = validate_public_http_url(canonical_url)
+    provided = validate_public_http_url(provided_url)
+    canonical_is_known_ats = bool(known_browser_ats_platform(canonical.normalized_url))
+    if canonical.hostname == provided.hostname or _same_site(canonical.hostname, provided.hostname) or canonical_is_known_ats:
+        configured.extend(default_allowed_hosts(canonical.hostname))
+    return list(dict.fromkeys(configured))
 
 
 def _plan_portal_detail_rescrape(
@@ -191,6 +216,20 @@ async def probe_portal(*, root: Path, portal: dict[str, Any], run_session_id: st
     )
     if direct_outcome.selected is not None:
         selected = direct_outcome.selected
+        effective_checked = checked_url
+        selected_listing = str(selected.metadata.get("listing_url") or "").strip()
+        if selected_listing:
+            candidate_checked = validate_public_http_url(selected_listing)
+            if candidate_checked.hostname not in selected.trusted_hosts:
+                raise RuntimeError(
+                    "Acquisition returned a listing host outside its trusted-host contract"
+                )
+            effective_checked = candidate_checked
+        effective_detection = detect_portal(
+            listing_url=effective_checked.normalized_url,
+            html="",
+            text_content="",
+        )
         safe_urls, _ = _safe_discovered_urls(
             list(selected.discovered_urls),
             [*checked_url.allowed_hosts, *selected.trusted_hosts],
@@ -210,8 +249,8 @@ async def probe_portal(*, root: Path, portal: dict[str, Any], run_session_id: st
         if artifact:
             artifacts.append(artifact)
         return PortalProbeResult(
-            final_url=checked_url.normalized_url,
-            detected=url_detection,
+            final_url=effective_checked.normalized_url,
+            detected=effective_detection,
             discovered_urls=len(safe_urls),
             sample_job_urls=safe_urls[:5],
             artifacts=artifacts,
@@ -237,8 +276,78 @@ async def probe_portal(*, root: Path, portal: dict[str, Any], run_session_id: st
 
         final_url = _result_final_url(result, checked_url.normalized_url)
         final_checked = validate_public_http_url(final_url, allowed_hosts=checked_url.allowed_hosts)
-        html = _result_html(result)
+        page_quality = result_page_quality(result)
+        html = str(getattr(result, "html", "") or "") if page_quality.blocked else _result_html(result)
         detection = detect_portal(listing_url=final_checked.normalized_url, html=html, text_content=_result_text(result))
+
+        inferred_outcome = None
+        hinted_url = str(detection.acquisition_hints.get("listing_url") or "").strip()
+        if hinted_url:
+            hinted_checked = validate_public_http_url(hinted_url)
+            if (
+                hinted_checked.hostname != final_checked.hostname
+                and not _same_site(hinted_checked.hostname, final_checked.hostname)
+                and not known_browser_ats_platform(hinted_checked.normalized_url)
+            ):
+                raise RuntimeError(
+                    f"Rendered listing linked to unclassified host {hinted_checked.hostname}"
+                )
+            if hinted_checked.normalized_url != final_checked.normalized_url:
+                inferred_outcome = await default_acquisition_registry().acquire(
+                    AcquisitionContext(
+                        listing_url=hinted_checked.normalized_url,
+                        source_platform_hint=detection.source_platform,
+                        acquisition_hints=detection.acquisition_hints,
+                        max_pages=max(1, int(portal.get("max_pages_per_run") or 3)),
+                        timeout_seconds=min(
+                            30.0,
+                            max(5.0, float(portal.get("crawl_timeout_seconds") or 30)),
+                        ),
+                        require_complete=False,
+                    )
+                )
+                if inferred_outcome.selected is not None:
+                    final_checked = hinted_checked
+                else:
+                    hinted_result = await crawler.arun(
+                        url=hinted_checked.normalized_url,
+                        config=listing_run_config(settings, f"{probe_session_id}_listing", None),
+                    )
+                    artifacts.extend(result_artifacts(
+                        root=root,
+                        portal_id=str(portal["id"]),
+                        run_session_id=run_session_id,
+                        prefix="probe_inferred_listing",
+                        result=hinted_result,
+                        metadata={"url": hinted_checked.normalized_url},
+                    ))
+                    if not getattr(hinted_result, "success", False):
+                        raise RuntimeError(
+                            "Inferred jobs-listing route failed: "
+                            f"{getattr(hinted_result, 'error_message', 'unknown error')}"
+                        )
+                    hinted_quality = result_page_quality(hinted_result)
+                    hinted_final = validate_public_http_url(
+                        _result_final_url(hinted_result, hinted_checked.normalized_url)
+                    )
+                    if (
+                        hinted_final.hostname != final_checked.hostname
+                        and not _same_site(hinted_final.hostname, final_checked.hostname)
+                        and not known_browser_ats_platform(hinted_final.normalized_url)
+                    ):
+                        raise RuntimeError(
+                            f"Inferred listing redirected to unclassified host {hinted_final.hostname}"
+                        )
+                    final_checked = hinted_final
+                    detection = detect_portal(
+                        listing_url=final_checked.normalized_url,
+                        html=(
+                            str(getattr(hinted_result, "html", "") or "")
+                            if hinted_quality.blocked
+                            else _result_html(hinted_result)
+                        ),
+                        text_content=_result_text(hinted_result),
+                    )
 
         discovered_urls = 0
         samples: list[str] = []
@@ -252,17 +361,28 @@ async def probe_portal(*, root: Path, portal: dict[str, Any], run_session_id: st
             portal_for_profile = dict(portal)
             portal_for_profile["canonical_listing_url"] = final_checked.normalized_url
             portal_for_profile["profile_name"] = detection.profile_name
-            blueprint = build_portal_blueprint(root=root, portal=portal_for_profile, run_session_id=run_session_id)
-            outcome = await default_acquisition_registry().acquire(
-                AcquisitionContext(
-                    listing_url=blueprint.listing.page_url,
-                    source_platform_hint=detection.source_platform,
-                    acquisition_hints=detection.acquisition_hints,
-                    max_pages=max(1, int(portal.get("max_pages_per_run") or 3)),
-                    timeout_seconds=min(30.0, max(5.0, float(portal.get("crawl_timeout_seconds") or 30))),
-                    require_complete=False,
+            portal_for_profile["allowed_hosts"] = list(
+                dict.fromkeys(
+                    [
+                        *(portal.get("allowed_hosts") or []),
+                        *checked_url.allowed_hosts,
+                        *default_allowed_hosts(final_checked.hostname),
+                    ]
                 )
             )
+            blueprint = build_portal_blueprint(root=root, portal=portal_for_profile, run_session_id=run_session_id)
+            outcome = inferred_outcome
+            if outcome is None or outcome.selected is None:
+                outcome = await default_acquisition_registry().acquire(
+                    AcquisitionContext(
+                        listing_url=blueprint.listing.page_url,
+                        source_platform_hint=detection.source_platform,
+                        acquisition_hints=detection.acquisition_hints,
+                        max_pages=max(1, int(portal.get("max_pages_per_run") or 3)),
+                        timeout_seconds=min(30.0, max(5.0, float(portal.get("crawl_timeout_seconds") or 30))),
+                        require_complete=False,
+                    )
+                )
             acquisition = outcome.metrics()
             if outcome.selected is not None:
                 urls = list(outcome.selected.discovered_urls)
@@ -320,7 +440,9 @@ async def scrape_portal(
     """
     hub = BlueprintHub(root)
     settings = hub.system.browser
-    blueprint = build_portal_blueprint(root=root, portal=portal, run_session_id=run_session_id)
+    portal_for_scrape = dict(portal)
+    portal_for_scrape["allowed_hosts"] = _runtime_portal_allowed_hosts(portal)
+    blueprint = build_portal_blueprint(root=root, portal=portal_for_scrape, run_session_id=run_session_id)
 
     def discovery_artifacts(safe_urls: list[str]) -> list[dict[str, Any]]:
         discovered_artifact = save_portal_artifact(
@@ -370,6 +492,7 @@ async def scrape_portal(
                 max(5.0, float(portal.get("crawl_timeout_seconds") or 30)),
             ),
             require_complete_acquisition=bool(reconcile_lifecycle),
+            prefer_static_detail_html=True,
         ),
         hooks=ScrapeOrchestratorHooks(
             normalize_discovered_urls=lambda urls: _safe_discovered_urls(
@@ -393,6 +516,7 @@ async def scrape_portal(
                 allowed_hosts=blueprint.allowed_hosts,
             ).normalized_url,
             is_rejected_error=lambda exc: isinstance(exc, PortalUrlSafetyError),
+            should_attempt_llm=assess_llm_eligibility,
             on_discovery_artifacts=discovery_artifacts,
             on_failure_artifacts=failure_artifacts,
         )

@@ -40,14 +40,21 @@ from .orchestrator import (
     ScrapeOrchestrator,
     ScrapeOrchestratorHooks,
 )
+from .result_evidence import detection_html, result_page_quality
 from .safety import (
     PortalUrlSafetyError,
     default_allowed_hosts,
     validate_public_http_url,
 )
+from .url_intelligence import (
+    assess_certification_job,
+    assess_llm_eligibility,
+    canonicalize_candidate_url,
+    rank_job_candidate_urls,
+)
 
 
-CERTIFICATION_CONTRACT_VERSION = "1.0"
+CERTIFICATION_CONTRACT_VERSION = "1.1"
 _HTTP_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", flags=re.IGNORECASE)
 _XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _XLSX_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -295,6 +302,10 @@ class PortalCertificationRecord:
     elapsed_seconds: float
     error_type: str | None = None
     error_message: str | None = None
+    ranked_candidates: int = 0
+    ranking_rejected_urls: int = 0
+    llm_skipped_non_job_pages: int = 0
+    discovery_quality: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -317,11 +328,13 @@ class PortalCertificationRedirectReview(RuntimeError):
 
 
 def _result_html(result: Any) -> str:
+    primary = ""
     for name in ("cleaned_html", "html", "markdown"):
         value = getattr(result, name, None)
         if value:
-            return str(value)
-    return ""
+            primary = str(value)
+            break
+    return detection_html(result, primary)
 
 
 def _result_text(result: Any) -> str:
@@ -369,8 +382,9 @@ def _safe_discovered_urls(urls: list[str], approved_hosts: Iterable[str]) -> tup
         except PortalUrlSafetyError:
             rejected += 1
             continue
-        if checked.normalized_url not in valid:
-            valid.append(checked.normalized_url)
+        canonical = canonicalize_candidate_url(checked.normalized_url)
+        if canonical and canonical not in valid:
+            valid.append(canonical)
     return valid, rejected
 
 
@@ -433,11 +447,26 @@ class PortalFleetCertifier:
             detection=direct_detection,
         )
         if direct_outcome.selected is not None:
+            selected = direct_outcome.selected
+            selected_listing = str(selected.metadata.get("listing_url") or "").strip()
+            effective_checked = checked
+            if selected_listing:
+                candidate_checked = validate_public_http_url(selected_listing)
+                if candidate_checked.hostname not in selected.trusted_hosts:
+                    raise PortalCertificationRedirectReview(
+                        "Acquisition returned a listing host outside its trusted-host contract"
+                    )
+                effective_checked = candidate_checked
+            effective_detection = detect_portal(
+                listing_url=effective_checked.normalized_url,
+                html="",
+                text_content="",
+            )
             return _ProbeResult(
-                effective_listing_url=checked.normalized_url,
-                detection=direct_detection,
+                effective_listing_url=effective_checked.normalized_url,
+                detection=effective_detection,
                 allowed_hosts=tuple(
-                    dict.fromkeys([*checked.allowed_hosts, *direct_outcome.selected.trusted_hosts])
+                    dict.fromkeys([*checked.allowed_hosts, *selected.trusted_hosts])
                 ),
                 acquisition_outcome=direct_outcome,
             )
@@ -454,6 +483,12 @@ class PortalFleetCertifier:
         if not getattr(result, "success", False):
             raise RuntimeError(
                 f"Listing probe failed: {getattr(result, 'error_message', 'unknown browser error')}"
+            )
+
+        page_quality = result_page_quality(result)
+        if page_quality.blocked:
+            raise PortalCertificationBlocked(
+                f"The listing document was suppressed by access control: {page_quality.reason}"
             )
 
         final_checked = validate_public_http_url(_result_url(result, checked.normalized_url))
@@ -481,7 +516,75 @@ class PortalFleetCertifier:
         effective_url = final_checked.normalized_url
         hinted_url = str(detection.acquisition_hints.get("listing_url") or "").strip()
         if hinted_url:
-            effective_url = validate_public_http_url(hinted_url).normalized_url
+            hinted_checked = validate_public_http_url(hinted_url)
+            hinted_known = bool(known_browser_ats_platform(hinted_checked.normalized_url))
+            if (
+                hinted_checked.hostname != final_checked.hostname
+                and not _same_site(hinted_checked.hostname, final_checked.hostname)
+                and not hinted_known
+                and not self.options.allow_unknown_cross_domain_redirects
+            ):
+                raise PortalCertificationRedirectReview(
+                    f"Rendered listing linked to unclassified host {hinted_checked.hostname}"
+                )
+            effective_url = hinted_checked.normalized_url
+
+        # A branded careers shell can expose the real results route without
+        # rendering any jobs itself. Follow that rendered, safety-checked route
+        # once and redetect the page so pagination/ATS behavior is learned
+        # automatically rather than encoded as a site-specific selector.
+        if effective_url != final_checked.normalized_url:
+            inferred_outcome = await self._acquire(listing_url=effective_url, detection=detection)
+            if inferred_outcome.selected is not None:
+                approved_hosts = [
+                    *checked.allowed_hosts,
+                    *_approved_hosts_for_url(final_checked.normalized_url),
+                    *_approved_hosts_for_url(effective_url),
+                    *inferred_outcome.selected.trusted_hosts,
+                ]
+                return _ProbeResult(
+                    effective_listing_url=effective_url,
+                    detection=detection,
+                    allowed_hosts=tuple(dict.fromkeys(approved_hosts)),
+                    acquisition_outcome=inferred_outcome,
+                )
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                hinted_result = await crawler.arun(
+                    url=effective_url,
+                    config=listing_run_config(self.hub.system.browser, f"{session_id}_listing", None),
+                )
+            if not getattr(hinted_result, "success", False):
+                raise RuntimeError(
+                    "Inferred jobs-listing route failed: "
+                    f"{getattr(hinted_result, 'error_message', 'unknown browser error')}"
+                )
+            hinted_quality = result_page_quality(hinted_result)
+            if hinted_quality.blocked:
+                raise PortalCertificationBlocked(
+                    "The inferred listing document was suppressed by access control: "
+                    f"{hinted_quality.reason}"
+                )
+            hinted_final = validate_public_http_url(_result_url(hinted_result, effective_url))
+            if (
+                hinted_final.hostname != final_checked.hostname
+                and not _same_site(hinted_final.hostname, final_checked.hostname)
+                and not known_browser_ats_platform(hinted_final.normalized_url)
+                and not self.options.allow_unknown_cross_domain_redirects
+            ):
+                raise PortalCertificationRedirectReview(
+                    f"Inferred listing redirected to unclassified host {hinted_final.hostname}"
+                )
+            final_checked = hinted_final
+            effective_url = hinted_final.normalized_url
+            detection = detect_portal(
+                listing_url=effective_url,
+                html=_result_html(hinted_result),
+                text_content=_result_text(hinted_result),
+            )
+            if detection.blocked:
+                raise PortalCertificationBlocked(
+                    "The inferred jobs-listing page contains an access-control indicator"
+                )
 
         acquisition_outcome = await self._acquire(listing_url=effective_url, detection=detection)
         approved_hosts = [
@@ -554,6 +657,17 @@ class PortalFleetCertifier:
                 acquisition_registry=self.acquisition_registry,
             )
             approved_hosts = list(probe.allowed_hosts)
+
+            def validate_certification_job(job: JobPosting, source_url: str) -> tuple[bool, str]:
+                try:
+                    validate_public_http_url(
+                        str(job.job_url or source_url),
+                        allowed_hosts=approved_hosts,
+                    )
+                except PortalUrlSafetyError as exc:
+                    return False, f"unsafe extracted job URL: {exc}"
+                return assess_certification_job(job, source_url)
+
             remaining_timeout = max(
                 1.0,
                 self.options.source_timeout_seconds - (time.perf_counter() - started),
@@ -571,6 +685,7 @@ class PortalFleetCertifier:
                         max_acquisition_pages=self.options.max_pages,
                         acquisition_timeout_seconds=self.options.acquisition_timeout_seconds,
                         require_complete_acquisition=False,
+                        prefer_static_detail_html=True,
                     ),
                     hooks=ScrapeOrchestratorHooks(
                         normalize_discovered_urls=lambda urls: _safe_discovered_urls(urls, approved_hosts),
@@ -578,11 +693,18 @@ class PortalFleetCertifier:
                             urls,
                             [*approved_hosts, *trusted],
                         ),
+                        rank_discovered_urls=lambda urls: rank_job_candidate_urls(
+                            urls,
+                            listing_url=probe.effective_listing_url,
+                            platform_hint=probe.detection.source_platform,
+                        ),
                         validate_detail_url=lambda url: validate_public_http_url(
                             url,
                             allowed_hosts=approved_hosts,
                         ).normalized_url,
                         is_rejected_error=lambda exc: isinstance(exc, PortalUrlSafetyError),
+                        validate_extracted_job=validate_certification_job,
+                        should_attempt_llm=assess_llm_eligibility,
                         on_event=lambda event, payload: event_counts.update([event]),
                         on_failed_payload=self._failed_payload_writer(entry.source_id),
                     ),
@@ -593,12 +715,21 @@ class PortalFleetCertifier:
 
             extracted = len(orchestration.jobs)
             failures = len(orchestration.detail_failures)
+            error_type: str | None = None
+            error_message: str | None = None
             if extracted == 0:
                 status = "failed"
                 certification_status = "needs_repair"
+                error_type = "zero_valid_jobs"
+                error_message = (
+                    f"Discovery selected {len(orchestration.discovered_job_urls)} candidate URLs, "
+                    "but deterministic and eligible LLM extraction produced no certifiable jobs"
+                )
             elif failures:
                 status = "partial"
                 certification_status = "needs_repair"
+                error_type = "detail_extraction_shortfall"
+                error_message = f"{failures} of {len(orchestration.attempted_job_urls)} attempted details failed"
             elif len(orchestration.discovered_job_urls) < self.options.max_jobs:
                 status = "success"
                 certification_status = "source_exhausted"
@@ -607,6 +738,7 @@ class PortalFleetCertifier:
                 certification_status = "passed"
 
             completed_at = _utc_now()
+            discovery_quality = dict(orchestration.rescrape_plan.get("url_ranking") or {})
             return PortalCertificationRecord(
                 contract_version=CERTIFICATION_CONTRACT_VERSION,
                 run_id=run_id,
@@ -633,6 +765,12 @@ class PortalFleetCertifier:
                 started_at=started_at,
                 completed_at=completed_at,
                 elapsed_seconds=round(time.perf_counter() - started, 3),
+                error_type=error_type,
+                error_message=error_message,
+                ranked_candidates=int(discovery_quality.get("selected_urls") or 0),
+                ranking_rejected_urls=int(discovery_quality.get("rejected_urls") or 0),
+                llm_skipped_non_job_pages=int(event_counts.get("llm_fallback_skipped_non_job") or 0),
+                discovery_quality=discovery_quality,
             )
         except Exception as exc:
             error_type, certification_status = _classify_error(exc)
@@ -752,6 +890,9 @@ class CertificationReportStore:
             "discovered_urls",
             "attempted_urls",
             "extracted_jobs",
+            "ranked_candidates",
+            "ranking_rejected_urls",
+            "llm_skipped_non_job_pages",
             "elapsed_seconds",
             "error_type",
             "error_message",

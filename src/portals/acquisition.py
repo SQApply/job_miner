@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from ..schemas import JobPosting
@@ -38,6 +38,20 @@ class _TextParser(HTMLParser):
         value = " ".join(data.split())
         if value:
             self.parts.append(value)
+
+
+class _AnchorParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        attributes = {key.lower(): (value or "") for key, value in attrs}
+        href = attributes.get("href", "").strip()
+        if href:
+            self.hrefs.append(href)
 
 
 def _plain_text(value: Any) -> str | None:
@@ -112,9 +126,16 @@ class AsyncJsonClient(Protocol):
         timeout_seconds: float = 20.0,
     ) -> Any: ...
 
+    async def request_text(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float = 20.0,
+    ) -> str: ...
+
 
 class UrlLibJsonClient:
-    """Small dependency-free JSON client for fixed, public ATS endpoints."""
+    """Small dependency-free client for fixed, public ATS JSON and HTML endpoints."""
 
     def __init__(self, *, max_response_bytes: int = 20 * 1024 * 1024, max_attempts: int = 3) -> None:
         self.max_response_bytes = max(1024, int(max_response_bytes))
@@ -150,6 +171,32 @@ class UrlLibJsonClient:
             await asyncio.sleep(min(2 ** (attempt - 1), 4))
         raise AcquisitionHttpError(f"ATS endpoint request failed: {last_error}") from last_error
 
+    async def request_text(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float = 20.0,
+    ) -> str:
+        last_error: BaseException | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                return await asyncio.to_thread(
+                    self._request_text_once,
+                    url,
+                    max(1.0, float(timeout_seconds)),
+                )
+            except AcquisitionHttpError as exc:
+                last_error = exc
+                retryable = exc.status_code in {408, 425, 429, 500, 502, 503, 504}
+                if not retryable or attempt >= self.max_attempts:
+                    raise
+            except (TimeoutError, URLError) as exc:
+                last_error = exc
+                if attempt >= self.max_attempts:
+                    break
+            await asyncio.sleep(min(2 ** (attempt - 1), 4))
+        raise AcquisitionHttpError(f"ATS endpoint request failed: {last_error}") from last_error
+
     def _request_once(
         self,
         url: str,
@@ -170,6 +217,10 @@ class UrlLibJsonClient:
         )
         try:
             with urlopen(request, timeout=timeout_seconds) as response:
+                requested_host = str(urlsplit(url).hostname or "").lower()
+                final_host = str(urlsplit(response.geturl()).hostname or "").lower()
+                if final_host != requested_host:
+                    raise AcquisitionHttpError("ATS endpoint redirected to a different host")
                 raw = response.read(self.max_response_bytes + 1)
         except HTTPError as exc:
             raise AcquisitionHttpError(
@@ -182,6 +233,35 @@ class UrlLibJsonClient:
             return json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise AcquisitionHttpError("ATS endpoint did not return valid JSON") from exc
+
+    def _request_text_once(self, url: str, timeout_seconds: float) -> str:
+        request = Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "text/html,application/xhtml+xml",
+                "User-Agent": "JobMiner/1.0 (+public-job-feed-client)",
+            },
+        )
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                requested_host = str(urlsplit(url).hostname or "").lower()
+                final_host = str(urlsplit(response.geturl()).hostname or "").lower()
+                if final_host != requested_host:
+                    raise AcquisitionHttpError("ATS endpoint redirected to a different host")
+                raw = response.read(self.max_response_bytes + 1)
+                charset = response.headers.get_content_charset() or "utf-8"
+        except HTTPError as exc:
+            raise AcquisitionHttpError(
+                f"ATS endpoint returned HTTP {exc.code}",
+                status_code=int(exc.code),
+            ) from exc
+        if len(raw) > self.max_response_bytes:
+            raise AcquisitionHttpError("ATS endpoint response exceeded the configured size limit")
+        try:
+            return raw.decode(charset, errors="replace")
+        except LookupError:
+            return raw.decode("utf-8", errors="replace")
 
 
 @dataclass(frozen=True)
@@ -625,6 +705,473 @@ class WorkdayProvider:
         )
 
 
+def _icims_match(url: str) -> ProviderMatch | None:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    hostname = str(parsed.hostname or "").lower().rstrip(".")
+    if hostname != "icims.com" and not hostname.endswith(".icims.com"):
+        return None
+    path = re.sub(r"/{2,}", "/", parsed.path or "/jobs").rstrip("/") or "/jobs"
+    detail_match = re.match(r"^(?P<listing_path>/.+?/jobs|/jobs)/\d+(?:/|$)", path, flags=re.IGNORECASE)
+    if detail_match:
+        path = detail_match.group("listing_path")
+    if not re.search(r"(?:^|/)jobs$", path, flags=re.IGNORECASE):
+        path = "/jobs"
+    listing_url = urlunsplit((parsed.scheme.lower() or "https", hostname, path, parsed.query, ""))
+    return ProviderMatch(
+        platform="icims",
+        token=hostname,
+        listing_url=listing_url,
+        metadata={
+            "hostname": hostname,
+            "scheme": parsed.scheme.lower() or "https",
+            "listing_path": path,
+        },
+    )
+
+
+def _icims_job_urls(
+    document: str,
+    *,
+    base_url: str,
+    hostname: str,
+    listing_path: str = "/jobs",
+) -> list[str]:
+    parser = _AnchorParser()
+    try:
+        parser.feed(html_module.unescape(str(document or "")))
+    except Exception:
+        pass
+
+    hrefs = list(parser.hrefs)
+    hrefs.extend(
+        match.group("href")
+        for match in re.finditer(
+            r'''["'](?P<href>(?:https?://[^"']+)?(?:/[A-Za-z0-9_.~-]+)*/jobs/\d+(?:/[^"'?#]*)?)["']''',
+            html_module.unescape(str(document or "")),
+            flags=re.IGNORECASE,
+        )
+    )
+
+    normalized_listing_path = re.sub(r"/{2,}", "/", listing_path or "/jobs").rstrip("/")
+    detail_pattern = re.compile(
+        rf"^{re.escape(normalized_listing_path)}/\d+(?:/|$)",
+        flags=re.IGNORECASE,
+    )
+    discovered: list[str] = []
+    for href in hrefs:
+        candidate = urljoin(base_url, str(href or "").strip())
+        try:
+            parsed = urlsplit(candidate)
+        except ValueError:
+            continue
+        if str(parsed.hostname or "").lower() != hostname:
+            continue
+        if not detail_pattern.match(parsed.path or ""):
+            continue
+        normalized = urlunsplit((parsed.scheme.lower(), hostname, parsed.path.rstrip("/"), "", ""))
+        if normalized not in discovered:
+            discovered.append(normalized)
+    return discovered
+
+
+def _icims_reported_total(document: str) -> int | None:
+    plain = _plain_text(document)
+    normalized = " ".join(plain.split()) if plain else ""
+    patterns = (
+        r"showing\s+\d+\s*(?:-|to)\s*\d+\s+of\s+([\d,]+)",
+        r"\d+\s*(?:-|–|to)\s*\d+\s+of\s+([\d,]+)\s+total\s+jobs?",
+        r"([\d,]+)\s+results?",
+        r"([\d,]+)\s+jobs?\s+found",
+        r"of\s+([\d,]+)\s+jobs?",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            total = int(match.group(1).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        if total >= 0:
+            return total
+    return None
+
+
+def _icims_embedded_listing_url(document: str, *, expected_listing_path: str) -> str | None:
+    """Find an iCIMS tenant document explicitly embedded by a public wrapper."""
+    normalized = html_module.unescape(str(document or "")).replace(r"\/", "/")
+    expected = re.sub(r"/{2,}", "/", expected_listing_path or "/jobs").rstrip("/")
+    candidates = re.findall(
+        r"(?:https?:)?//[^\s\"'<>\\]+",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    for raw in candidates:
+        candidate = raw.rstrip("),.;]}")
+        if candidate.startswith("//"):
+            candidate = f"https:{candidate}"
+        try:
+            parsed = urlsplit(candidate)
+        except ValueError:
+            continue
+        hostname = str(parsed.hostname or "").lower().rstrip(".")
+        if not hostname.endswith(".i.icims.com"):
+            continue
+        if parsed.username is not None or parsed.password is not None:
+            continue
+        try:
+            if parsed.port not in {None, 80, 443}:
+                continue
+        except ValueError:
+            continue
+        path = re.sub(r"/{2,}", "/", parsed.path or "/jobs").rstrip("/")
+        detail = re.match(r"^(?P<listing>/.+?/jobs|/jobs)/\d+(?:/|$)", path, re.IGNORECASE)
+        if detail:
+            path = detail.group("listing").rstrip("/")
+        if not re.search(r"(?:^|/)jobs$", path, flags=re.IGNORECASE):
+            continue
+        if path != expected and expected != "/jobs":
+            continue
+        return urlunsplit(("https", hostname, path, parsed.query, ""))
+    return None
+
+
+class ICIMSProvider:
+    """Discover public iCIMS job-detail URLs without rendering each listing page."""
+
+    platform = "icims"
+
+    def match(self, context: AcquisitionContext) -> ProviderMatch | None:
+        for candidate in _candidate_urls(context):
+            matched = _icims_match(candidate)
+            if matched:
+                return matched
+        return None
+
+    async def acquire(
+        self,
+        match: ProviderMatch,
+        context: AcquisitionContext,
+        client: AsyncJsonClient,
+    ) -> AcquisitionResult:
+        request_text = getattr(client, "request_text", None)
+        if not callable(request_text):
+            raise AcquisitionError("The configured ATS client does not support HTML acquisition")
+
+        original_hostname = match.metadata["hostname"]
+        hostname = original_hostname
+        scheme = match.metadata.get("scheme") or "https"
+        listing_path = match.metadata.get("listing_path") or "/jobs"
+        listing_url = urlunsplit((scheme, hostname, listing_path, urlsplit(match.listing_url).query, ""))
+        base_url = f"{scheme}://{hostname}/"
+        discovered: list[str] = []
+        seen: set[str] = set()
+        requests = 0
+        complete = False
+        reported_total: int | None = None
+        first_page_size: int | None = None
+        page_index = 0
+        promoted_from: str | None = None
+
+        while requests < context.max_pages:
+            if listing_path.rstrip("/").lower() == "/jobs":
+                endpoint_path = "/jobs/search"
+                endpoint_query = urlencode(
+                    {
+                        "ss": "1",
+                        "searchRelation": "keyword_all",
+                        "pr": page_index,
+                    }
+                )
+            else:
+                endpoint_path = listing_path
+                existing_query = parse_qs(urlsplit(listing_url).query, keep_blank_values=True)
+                existing_query["page"] = [str(page_index + 1)]
+                endpoint_query = urlencode(existing_query, doseq=True)
+            endpoint = urlunsplit((scheme, hostname, endpoint_path, endpoint_query, ""))
+            document = await request_text(endpoint, timeout_seconds=context.timeout_seconds)
+            requests += 1
+
+            if page_index == 0:
+                embedded_listing = _icims_embedded_listing_url(
+                    document,
+                    expected_listing_path=listing_path,
+                )
+                if embedded_listing:
+                    embedded = urlsplit(embedded_listing)
+                    embedded_host = str(embedded.hostname or "").lower()
+                    if embedded_host and embedded_host != hostname:
+                        promoted_from = listing_url
+                        hostname = embedded_host
+                        scheme = embedded.scheme.lower() or "https"
+                        listing_path = re.sub(r"/{2,}", "/", embedded.path).rstrip("/")
+                        listing_url = urlunsplit(
+                            (scheme, hostname, listing_path, embedded.query, "")
+                        )
+                        base_url = f"{scheme}://{hostname}/"
+                        # The wrapper request consumed part of the bounded
+                        # request budget. Fetch page one from the explicitly
+                        # embedded tenant host on the next iteration.
+                        continue
+
+            page_urls = _icims_job_urls(
+                document,
+                base_url=base_url,
+                hostname=hostname,
+                listing_path=listing_path,
+            )
+            page_total = _icims_reported_total(document)
+            if page_total is not None and page_total > 0:
+                reported_total = max(reported_total or 0, page_total)
+
+            new_urls = [url for url in page_urls if url not in seen]
+            for url in new_urls:
+                seen.add(url)
+                discovered.append(url)
+
+            if page_index == 0:
+                first_page_size = len(page_urls) or None
+            reached_total = reported_total is not None and len(discovered) >= reported_total
+            exhausted_page = not page_urls or not new_urls
+            short_page = (
+                page_index > 0
+                and first_page_size is not None
+                and 0 < len(page_urls) < first_page_size
+            )
+            if reached_total or short_page:
+                complete = True
+                break
+            if exhausted_page:
+                # A tenant may ignore an unsupported pagination parameter and
+                # repeat page one. Never let a stalled page prove completeness
+                # while its rendered total says more jobs exist.
+                complete = reported_total is None or len(discovered) >= reported_total
+                break
+            page_index += 1
+
+        return AcquisitionResult(
+            platform=self.platform,
+            strategy="platform_html_discovery",
+            discovered_urls=discovered,
+            preextracted_jobs={},
+            trusted_hosts=tuple(dict.fromkeys((original_hostname, hostname))),
+            complete=complete,
+            pages_visited=requests,
+            endpoint_requests=requests,
+            metadata={
+                "hostname": hostname,
+                "listing_url": listing_url,
+                "listing_path": listing_path,
+                "reported_total": reported_total,
+                "observed_page_size": first_page_size,
+                "promoted_from": promoted_from,
+            },
+        )
+
+
+_PUBLIC_PAGINATION_KEYS = {
+    "currentpage",
+    "offset",
+    "p",
+    "page",
+    "pageno",
+    "pagenumber",
+    "pg",
+    "start",
+}
+
+
+def _public_pagination_url(value: str, *, listing_url: str) -> str | None:
+    """Accept only rendered, same-host numeric pagination links."""
+    try:
+        parsed = urlsplit(urljoin(listing_url, str(value or "").strip()))
+        listing = urlsplit(listing_url)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return None
+    if str(parsed.hostname).lower() != str(listing.hostname or "").lower():
+        return None
+    if re.sub(r"/{2,}", "/", parsed.path or "/").rstrip("/") != re.sub(
+        r"/{2,}", "/", listing.path or "/"
+    ).rstrip("/"):
+        return None
+    pagination_values = [
+        item
+        for key, item in parse_qs(parsed.query, keep_blank_values=False).items()
+        if key.lower() in _PUBLIC_PAGINATION_KEYS
+    ]
+    if not pagination_values or not all(
+        str(value).isdigit() for values in pagination_values for value in values
+    ):
+        return None
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path or "/",
+            parsed.query,
+            "",
+        )
+    )
+
+
+class PublicHtmlProvider:
+    """Bounded server-rendered HTML discovery before the browser lane.
+
+    This provider is intentionally selector-free. It follows only listing routes
+    and numeric pagination links present in the returned document, accepts only
+    strong same-host job-detail URLs, and never claims a complete inventory
+    without explicit pagination or result-count evidence.
+    """
+
+    platform = "public_html"
+
+    def match(self, context: AcquisitionContext) -> ProviderMatch | None:
+        explicitly_enabled = str(
+            context.acquisition_hints.get("allow_public_html") or ""
+        ).strip().lower() in {"1", "true", "yes"}
+        if not str(context.source_platform_hint or "").strip() and not explicitly_enabled:
+            # Avoid turning a registry miss into an unsolicited network request
+            # for legacy/test callers that supplied no portal detection context.
+            return None
+        try:
+            parsed = urlsplit(context.listing_url)
+        except ValueError:
+            return None
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return None
+        if parsed.username is not None or parsed.password is not None:
+            return None
+        try:
+            if parsed.port not in {None, 80, 443}:
+                return None
+        except ValueError:
+            return None
+        return ProviderMatch(
+            platform=self.platform,
+            token=str(parsed.hostname).lower(),
+            listing_url=context.listing_url,
+            metadata={"hostname": str(parsed.hostname).lower()},
+        )
+
+    async def acquire(
+        self,
+        match: ProviderMatch,
+        context: AcquisitionContext,
+        client: AsyncJsonClient,
+    ) -> AcquisitionResult:
+        request_text = getattr(client, "request_text", None)
+        if not callable(request_text):
+            raise AcquisitionError("The configured acquisition client does not support HTML")
+
+        # Lazy imports keep acquisition providers independent of browser modules
+        # and avoid a detector/acquisition import cycle.
+        from .detector import infer_listing_url
+        from .page_quality import assess_page_quality
+        from .url_intelligence import assess_job_candidate_url
+
+        queue = [match.listing_url]
+        queued = {match.listing_url}
+        visited: set[str] = set()
+        discovered: list[str] = []
+        discovered_set: set[str] = set()
+        requests = 0
+        active_listing_url = match.listing_url
+        pagination_evidence = False
+        reported_total: int | None = None
+        blocked_reason: str | None = None
+
+        while queue and requests < context.max_pages:
+            page_url = queue.pop(0)
+            if page_url in visited:
+                continue
+            visited.add(page_url)
+            document = await request_text(page_url, timeout_seconds=context.timeout_seconds)
+            requests += 1
+
+            quality = assess_page_quality(html=document)
+            if quality.blocked:
+                blocked_reason = quality.reason
+                continue
+
+            inferred = infer_listing_url(page_url, document)
+            if inferred and _public_pagination_url(inferred, listing_url=page_url):
+                # A numbered page is pagination evidence, not a new canonical
+                # listing route.
+                inferred = None
+            if inferred and inferred not in queued and inferred not in visited:
+                queued.add(inferred)
+                queue.insert(0, inferred)
+                active_listing_url = inferred
+
+            parser = _AnchorParser()
+            try:
+                parser.feed(html_module.unescape(document))
+            except Exception:
+                pass
+
+            page_host = str(urlsplit(page_url).hostname or "").lower()
+            for href in parser.hrefs:
+                candidate = urljoin(page_url, href)
+                try:
+                    candidate_host = str(urlsplit(candidate).hostname or "").lower()
+                except ValueError:
+                    continue
+                if candidate_host != page_host:
+                    continue
+                assessment = assess_job_candidate_url(
+                    candidate,
+                    listing_url=page_url,
+                    platform_hint=context.source_platform_hint,
+                )
+                if assessment.hard_reject or assessment.score < 8:
+                    continue
+                if assessment.url not in discovered_set:
+                    discovered_set.add(assessment.url)
+                    discovered.append(assessment.url)
+
+            for href in parser.hrefs:
+                pagination_url = _public_pagination_url(
+                    href,
+                    listing_url=page_url,
+                )
+                if not pagination_url:
+                    continue
+                pagination_evidence = True
+                if pagination_url not in queued and pagination_url not in visited:
+                    queued.add(pagination_url)
+                    queue.append(pagination_url)
+
+            page_total = _icims_reported_total(document)
+            if page_total is not None and page_total > 0:
+                reported_total = max(reported_total or 0, page_total)
+
+        reached_total = reported_total is not None and len(discovered) >= reported_total
+        exhausted_rendered_pagination = pagination_evidence and not queue
+        complete = bool(discovered) and (reached_total or exhausted_rendered_pagination)
+        return AcquisitionResult(
+            platform=self.platform,
+            strategy="public_html_discovery",
+            discovered_urls=discovered,
+            preextracted_jobs={},
+            trusted_hosts=(match.metadata["hostname"],),
+            complete=complete,
+            pages_visited=requests,
+            endpoint_requests=requests,
+            metadata={
+                "listing_url": active_listing_url,
+                "reported_total": reported_total,
+                "pagination_evidence": pagination_evidence,
+                "request_budget_exhausted": bool(queue),
+                "blocked_reason": blocked_reason,
+            },
+        )
+
+
 class AcquisitionRegistry:
     """Try stable public ATS feeds, then let the caller retain browser fallback."""
 
@@ -640,6 +1187,8 @@ class AcquisitionRegistry:
             LeverProvider(),
             AshbyProvider(),
             WorkdayProvider(),
+            ICIMSProvider(),
+            PublicHtmlProvider(),
         )
 
     async def acquire(self, context: AcquisitionContext) -> AcquisitionOutcome:
@@ -662,7 +1211,16 @@ class AcquisitionRegistry:
                 continue
 
             if not result.discovered_urls:
-                attempts.append({"platform": provider.platform, "status": "empty"})
+                attempts.append(
+                    {
+                        "platform": provider.platform,
+                        "status": "empty",
+                        "complete": result.complete,
+                        "pages_visited": result.pages_visited,
+                        "endpoint_requests": result.endpoint_requests,
+                        "metadata": dict(result.metadata),
+                    }
+                )
                 continue
             if context.require_complete and not result.complete:
                 attempts.append(
@@ -671,6 +1229,8 @@ class AcquisitionRegistry:
                         "status": "incomplete",
                         "discovered_urls": len(result.discovered_urls),
                         "pages_visited": result.pages_visited,
+                        "endpoint_requests": result.endpoint_requests,
+                        "metadata": dict(result.metadata),
                     }
                 )
                 continue

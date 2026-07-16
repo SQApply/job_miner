@@ -2,6 +2,7 @@ from pathlib import Path
 
 from src.control.portal_repository import _schedule_to_interval_minutes
 from src.portals.artifacts import save_portal_artifact
+from src.portals.lifecycle import reconciliation_guard
 
 
 def test_schedule_expression_to_minutes():
@@ -27,3 +28,21 @@ def test_portal_artifact_written(tmp_path: Path):
     assert artifact["storage_mode"] == "temporary_local"
     assert (tmp_path / artifact["relative_path"]).exists()
     assert artifact["size_bytes"] > 0
+
+
+def test_unknown_or_partial_discovery_cannot_deactivate_catalog_jobs():
+    browser_fallback = reconciliation_guard(
+        discovered_urls=["https://example.com/jobs/1"],
+        acquisition={"selected": False, "strategy": "browser_fallback"},
+    )
+    bounded_provider = reconciliation_guard(
+        discovered_urls=["https://example.com/jobs/1"],
+        acquisition={"selected": True, "reconciliation_safe": False},
+    )
+
+    assert browser_fallback is not None
+    assert bounded_provider is not None
+    assert browser_fallback["status"] == "skipped_incomplete_acquisition"
+    assert bounded_provider["status"] == "skipped_incomplete_acquisition"
+    assert browser_fallback["missing_marked"] == 0
+    assert bounded_provider["deactivated"] == 0

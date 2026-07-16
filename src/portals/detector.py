@@ -4,8 +4,11 @@ import hashlib
 import html as html_module
 import re
 from dataclasses import asdict, dataclass, field
+from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
+
+from .page_quality import assess_page_quality
 
 
 KNOWN_BROWSER_ATS_HOSTS: dict[str, tuple[str, ...]] = {
@@ -21,6 +24,53 @@ KNOWN_BROWSER_ATS_HOSTS: dict[str, tuple[str, ...]] = {
     "bamboohr": ("bamboohr.com",),
     "paylocity": ("recruiting.paylocity.com",),
 }
+
+
+_STRONG_LISTING_LABELS = (
+    "browse jobs",
+    "current openings",
+    "find a job",
+    "find jobs",
+    "job openings",
+    "open positions",
+    "search jobs",
+    "see jobs",
+    "view jobs",
+)
+
+
+class _ListingLinkParser(HTMLParser):
+    """Collect bounded, rendered navigation evidence without CSS/XPath rules."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[tuple[str, str]] = []
+        self._href: str | None = None
+        self._text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = {key.lower(): (value or "") for key, value in attrs}
+        lowered = tag.lower()
+        if lowered == "a":
+            self._href = attributes.get("href", "").strip() or None
+            self._text = []
+        elif lowered == "iframe":
+            src = attributes.get("src", "").strip()
+            if src:
+                self.links.append((src, "iframe"))
+
+    def handle_data(self, data: str) -> None:
+        if self._href:
+            value = " ".join(data.split())
+            if value:
+                self._text.append(value)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or not self._href:
+            return
+        self.links.append((self._href, " ".join(self._text)))
+        self._href = None
+        self._text = []
 
 
 @dataclass(frozen=True)
@@ -70,6 +120,116 @@ def known_browser_ats_platform(value: str) -> str | None:
     return None
 
 
+def _same_site(first: str, second: str) -> bool:
+    first_parts = str(first or "").lower().rstrip(".").split(".")
+    second_parts = str(second or "").lower().rstrip(".").split(".")
+    return len(first_parts) >= 2 and len(second_parts) >= 2 and first_parts[-2:] == second_parts[-2:]
+
+
+def _listing_candidate_score(
+    candidate: str,
+    *,
+    label: str,
+    source_url: str,
+) -> int | None:
+    try:
+        parsed = urlsplit(candidate)
+        source = urlsplit(source_url)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname or not source.hostname:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    try:
+        if parsed.port not in {None, 80, 443}:
+            return None
+    except ValueError:
+        return None
+
+    hostname = parsed.hostname.lower().rstrip(".")
+    source_host = source.hostname.lower().rstrip(".")
+    if hostname != source_host and not _same_site(hostname, source_host):
+        # Cross-site ATS links are handled by the existing provider-signature
+        # detector. Generic route repair remains same-site only.
+        return None
+
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    lowered_path = path.lower().rstrip("/") or "/"
+    normalized_label = " ".join(str(label or "").lower().split())
+    numeric_detail = bool(re.search(r"/jobs?/\d+(?:/|$)", lowered_path))
+    if numeric_detail:
+        return None
+
+    score = 2 if hostname == source_host else 1
+    if any(phrase == normalized_label or phrase in normalized_label for phrase in _STRONG_LISTING_LABELS):
+        score += 12
+    if re.search(r"(?:^|/)(?:job-search|search-jobs|search-results[^/]*|job-openings|open-positions)(?:/|$)", lowered_path):
+        score += 10
+    elif re.search(r"(?:^|/)(?:jobs|openings|opportunities)(?:/|$)", lowered_path):
+        score += 5
+
+    if hostname == "icims.com" or hostname.endswith(".icims.com"):
+        if re.search(r"/jobs$", lowered_path):
+            score += 10
+        if hostname.endswith(".i.icims.com"):
+            score += 7
+        if len([part for part in lowered_path.split("/") if part]) > 1:
+            score += 4
+
+    current = urlunsplit((source.scheme.lower(), source.netloc.lower(), source.path.rstrip("/") or "/", source.query, ""))
+    normalized = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path.rstrip("/") or "/", parsed.query, ""))
+    if normalized == current:
+        score -= 2
+    return score
+
+
+def infer_listing_url(listing_url: str, page_content: str) -> str | None:
+    """Infer a stronger same-site listing route from rendered links and iframes.
+
+    This is deliberately evidence-based: the route must be present in the page
+    and strongly resemble a jobs result page. It never invents an endpoint.
+    """
+    parser = _ListingLinkParser()
+    try:
+        parser.feed(html_module.unescape(str(page_content or "")))
+    except Exception:
+        pass
+
+    candidates: list[tuple[str, str]] = [(listing_url, "")]
+    candidates.extend(parser.links[:1000])
+    candidates.extend((value, "embedded") for value in _embedded_urls(page_content)[:1000])
+
+    ranked: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+    for index, (raw, label) in enumerate(candidates):
+        candidate = urljoin(listing_url, str(raw or "").strip())
+        try:
+            parsed = urlsplit(candidate)
+        except ValueError:
+            continue
+        normalized = urlunsplit(
+            (
+                parsed.scheme.lower(),
+                parsed.netloc.lower(),
+                re.sub(r"/{2,}", "/", parsed.path or "/").rstrip("/") or "/",
+                parsed.query,
+                "",
+            )
+        )
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        score = _listing_candidate_score(normalized, label=label, source_url=listing_url)
+        if score is not None:
+            ranked.append((score, -index, normalized))
+
+    if not ranked:
+        return None
+    score, _, selected = max(ranked)
+    return selected if score >= 12 else None
+
+
 def _embedded_urls(value: str) -> list[str]:
     normalized = html_module.unescape(str(value or "")).replace(r"\/", "/")
     candidates = re.findall(r"https?://[^\s\"'<>\\]+", normalized, flags=re.IGNORECASE)
@@ -91,8 +251,11 @@ def _embedded_urls(value: str) -> list[str]:
 
 
 def _acquisition_signature(listing_url: str, page_content: str) -> tuple[str, dict[str, str]] | None:
-    candidates = [listing_url, *_embedded_urls(page_content)]
+    inferred_listing = infer_listing_url(listing_url, page_content)
+    candidates = [inferred_listing, listing_url, *_embedded_urls(page_content)]
     for candidate in candidates:
+        if not candidate:
+            continue
         try:
             parsed = urlsplit(candidate)
         except ValueError:
@@ -144,20 +307,23 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
     combined = f"{listing_url}\n{html_value}\n{text_content or ''}".lower()
     hostname = (urlsplit(listing_url).hostname or "").lower()
     fingerprint = hashlib.sha256(html_value.encode("utf-8", errors="ignore")).hexdigest()
-    acquisition = _acquisition_signature(listing_url, f"{html_value}\n{text_content or ''}")
+    page_content = f"{html_value}\n{text_content or ''}"
+    inferred_listing = infer_listing_url(listing_url, page_content)
+    listing_hints = {"listing_url": inferred_listing} if inferred_listing else {}
+    acquisition = _acquisition_signature(listing_url, page_content)
 
-    blocked_markers = (
-        "captcha", "verify you are human", "access denied", "cf-chl-", "cloudflare ray id",
-        "unusual traffic", "robot check",
-    )
-    if _contains_any(combined, blocked_markers):
+    page_quality = assess_page_quality(html=html_value, text_content=text_content)
+    if page_quality.blocked:
         return PortalDetection(
             source_platform="blocked_or_protected",
             profile_name="generic_listing",
             crawl_strategy="generic_listing",
             confidence=0.99,
             requires_review=True,
-            reasons=["The listing page contains an access-control, CAPTCHA, or bot-protection indicator."],
+            reasons=[
+                "The listing page is an access-control or bot-protection surface.",
+                str(page_quality.reason or "Access-control evidence was detected."),
+            ],
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
             blocked=True,
@@ -238,7 +404,7 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             reasons=[f"A known {platform} job-board URL was detected and will be tested automatically."],
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
-            acquisition_hints=acquisition[1],
+            acquisition_hints={**listing_hints, **acquisition[1]},
         )
 
     if "#" in listing_url or "hash-router" in combined or "hash route" in combined:
@@ -251,6 +417,7 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             reasons=["Hash-route or SPA navigation signature detected."],
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
+            acquisition_hints=listing_hints,
         )
 
     if _contains_any(combined, ("load more jobs", "load more", "show more jobs", "view more jobs")):
@@ -263,6 +430,7 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             reasons=["A load-more style control was detected."],
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
+            acquisition_hints=listing_hints,
         )
 
     if "?page=" in listing_url.lower() or re.search(r"(?:rel=[\"']next[\"']|aria-label=[\"'][^\"']*next)", combined):
@@ -275,6 +443,7 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             reasons=["Pagination signal detected in the listing URL or page markup."],
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
+            acquisition_hints=listing_hints,
         )
 
     return PortalDetection(
@@ -283,7 +452,11 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
         crawl_strategy="generic_listing",
         confidence=0.50,
         requires_review=True,
-        reasons=["No known ATS signature was found; the generic listing profile will be tested."],
+        reasons=[
+            "No known ATS signature was found; the generic listing profile will be tested.",
+            *(["A stronger same-site jobs-listing route was found in rendered navigation."] if inferred_listing else []),
+        ],
         page_title=_page_title(html_value),
         content_fingerprint=fingerprint,
+        acquisition_hints=listing_hints,
     )
