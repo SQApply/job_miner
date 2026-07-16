@@ -43,6 +43,24 @@ _CHALLENGE_MARKERS = (
     "recaptcha/api2/bframe",
 )
 
+_JAVASCRIPT_SHELL_MARKERS = (
+    "no <body> tag",
+    "minimal_text",
+    "no_content_elements",
+    "script_heavy_shell",
+    "execution context was destroyed",
+)
+
+_CONFIRMED_ACCESS_FAILURE_MARKERS = (
+    "access denied",
+    "captcha",
+    "cloudflare js challenge",
+    "cloudflare ray id",
+    "http 403",
+    "robot check",
+    "verify you are human",
+)
+
 
 class _VisibleTextParser(HTMLParser):
     def __init__(self) -> None:
@@ -95,6 +113,7 @@ class PageQualityAssessment:
     job_evidence: int
     has_jobposting_schema: bool
     challenge_markers: tuple[str, ...]
+    surface_kind: str = "content"
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -127,6 +146,7 @@ def assess_page_quality(
             job_evidence=evidence,
             has_jobposting_schema=True,
             challenge_markers=challenge_markers,
+            surface_kind="job_document",
         )
 
     strong = next((marker for marker in _STRONG_ACCESS_MARKERS if marker in lowered), None)
@@ -138,6 +158,7 @@ def assess_page_quality(
             job_evidence=evidence,
             has_jobposting_schema=False,
             challenge_markers=challenge_markers,
+            surface_kind="confirmed_access_control",
         )
 
     # Cloudflare/reCAPTCHA scripts are common on legitimate pages. They prove
@@ -151,6 +172,7 @@ def assess_page_quality(
             job_evidence=evidence,
             has_jobposting_schema=False,
             challenge_markers=challenge_markers,
+            surface_kind="confirmed_access_control",
         )
 
     generic_captcha = bool(re.search(r"\b(?:captcha|recaptcha|hcaptcha)\b", lowered))
@@ -162,6 +184,35 @@ def assess_page_quality(
             job_evidence=evidence,
             has_jobposting_schema=False,
             challenge_markers=challenge_markers,
+            surface_kind="confirmed_access_control",
+        )
+
+    # A sparse application shell is not proof of bot protection. Many ATS and
+    # white-label portals intentionally ship an empty root element and load all
+    # listing data through JavaScript. Keep it repairable so the API/route
+    # discovery lane can inspect scripts and embedded configuration next.
+    has_body = bool(re.search(r"<body(?:\s|>)", raw, flags=re.IGNORECASE))
+    script_count = len(re.findall(r"<script(?:\s|>)", raw, flags=re.IGNORECASE))
+    root_mount = bool(
+        re.search(
+            r"<(?:div|main)[^>]+(?:id|class)=[\"'][^\"']*(?:app|root|career|job)[^\"']*[\"']",
+            raw,
+            flags=re.IGNORECASE,
+        )
+    )
+    if evidence == 0 and not challenge_markers and (
+        (len(rendered) < 120 and script_count >= 2)
+        or (len(rendered) < 300 and root_mount and script_count >= 1)
+        or (raw and not has_body and script_count >= 2)
+    ):
+        return PageQualityAssessment(
+            blocked=False,
+            reason="sparse JavaScript application shell without explicit access-control evidence",
+            visible_characters=len(rendered),
+            job_evidence=evidence,
+            has_jobposting_schema=False,
+            challenge_markers=challenge_markers,
+            surface_kind="javascript_shell",
         )
 
     return PageQualityAssessment(
@@ -171,7 +222,18 @@ def assess_page_quality(
         job_evidence=evidence,
         has_jobposting_schema=False,
         challenge_markers=challenge_markers,
+        surface_kind="content",
     )
+
+
+def classify_crawler_failure(error_message: Any) -> str:
+    """Classify a failed browser acquisition without conflating SPA shells and blocks."""
+    lowered = " ".join(str(error_message or "").lower().split())
+    if any(marker in lowered for marker in _CONFIRMED_ACCESS_FAILURE_MARKERS):
+        return "confirmed_access_control"
+    if any(marker in lowered for marker in _JAVASCRIPT_SHELL_MARKERS):
+        return "javascript_shell"
+    return "acquisition_failure"
 
 
 def assess_crawl_result(result: Any) -> PageQualityAssessment:

@@ -8,7 +8,7 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from ..schemas import JobPosting
 from ..warehouse.url_utils import canonical_job_url
-from .page_quality import assess_crawl_result
+from .page_quality import assess_crawl_result, visible_text
 
 
 _ASSET_SUFFIXES = {
@@ -167,6 +167,14 @@ _NON_JOB_PAGE_SIGNALS = (
     "captcha",
 )
 
+_PLACEHOLDER_JOB_SIGNALS = (
+    "abc corporation",
+    "example corporation",
+    "example company",
+    "lorem ipsum",
+    "1234567890",
+)
+
 
 def _tokens(value: str) -> set[str]:
     return {
@@ -285,10 +293,14 @@ def assess_job_candidate_url(
             reasons=("same_as_listing",),
         )
 
+    job_board_detail = bool(
+        re.search(r"/(?:jb|job-board)/[^/]+/\d+(?:/|$)", path)
+    )
     strong_path_signature = bool(
         re.search(r"/jobs?/details?(?:/|$)", path)
         or re.search(r"/jobs?/\d+(?:/|$)", path)
         or re.search(r"/(?:job|position|requisition|posting)/[^/]+", path)
+        or job_board_detail
     )
     if (
         str(platform_hint or "").strip().lower() == "icims"
@@ -337,6 +349,9 @@ def assess_job_candidate_url(
     elif re.search(r"/jobs?/\d+(?:/|$)", path):
         score += 10
         reasons.append("numeric_job_path")
+    elif job_board_detail:
+        score += 10
+        reasons.append("job_board_detail_path")
     elif re.search(r"/(?:job|position|requisition|posting)/[^/]+", path):
         score += 8
         reasons.append("job_entity_path")
@@ -406,12 +421,14 @@ def rank_job_candidate_urls(
     *,
     listing_url: str,
     platform_hint: str | None = None,
+    preserve_low_confidence: bool = False,
 ) -> tuple[list[str], dict[str, Any]]:
     """Rank and conservatively filter browser-discovered URLs for bounded certification.
 
     If at least one high-confidence detail URL exists, only medium/high-confidence
-    candidates are retained. If no strong signature exists, non-navigation URLs are
-    preserved so unfamiliar portals still reach the normal extraction fallback.
+    candidates are retained. When no detail signature exists, fail discovery rather
+    than sending marketing/navigation pages to the browser and local GPU. The legacy
+    fallback can be explicitly enabled for diagnostics, but certification never uses it.
     """
     raw = [str(value or "").strip() for value in urls if str(value or "").strip()]
     assessments: list[CandidateAssessment] = []
@@ -434,21 +451,22 @@ def rank_job_candidate_urls(
     viable = [item for item in assessments if not item.hard_reject]
     confident = [item for item in viable if item.score >= 8]
     strict_platform = str(platform_hint or "").strip().lower() in {"icims"}
-    fallback_preserved = not bool(confident) and not strict_platform
+    fallback_preserved = not bool(confident) and bool(preserve_low_confidence) and not strict_platform
     if confident:
         selected = [item for item in viable if item.score >= 3]
-    elif strict_platform:
-        # Known ATS routes have a stable detail signature. Sending listing-like
-        # fallbacks to the browser/LLM only burns time and GPU while producing
-        # false jobs, so fail discovery loudly when that signature is absent.
-        selected = [item for item in viable if item.score >= 3]
+    elif strict_platform or not preserve_low_confidence:
+        # A medium score can come from phrases such as "job alerts" or a
+        # listing root. Without at least one high-confidence detail signature,
+        # sending these fallbacks to the browser/LLM only burns time and GPU and
+        # can create false jobs. Fail discovery loudly instead.
+        selected = []
     else:
         selected = viable
     selected.sort(key=lambda item: (-item.score, item.url))
 
     rejected = [item for item in assessments if item not in selected]
     metrics = {
-        "strategy": "adaptive_url_ranking_v1",
+        "strategy": "evidence_bound_url_ranking_v2",
         "input_urls": len(raw),
         "canonical_urls": len(assessments),
         "duplicate_urls": duplicates,
@@ -456,6 +474,7 @@ def rank_job_candidate_urls(
         "selected_urls": len(selected),
         "rejected_urls": len(rejected),
         "fallback_preserved": fallback_preserved,
+        "low_confidence_fallback_enabled": bool(preserve_low_confidence),
         "strict_platform_filter": strict_platform,
         "top_candidates": [item.to_dict() for item in selected[:10]],
         "rejected_candidates": [item.to_dict() for item in rejected[:10]],
@@ -498,6 +517,65 @@ def assess_llm_eligibility(result: Any, job_url: str) -> tuple[bool, str]:
     if url_assessment.score >= 3 and signals:
         return True, "candidate URL and page content both contain job evidence"
     return False, "page lacks sufficient job-detail evidence"
+
+
+def _normalized_grounding_text(value: Any) -> str:
+    decoded = html_module.unescape(str(value or "")).lower()
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", decoded).split())
+
+
+def assess_llm_job_grounding(
+    job: JobPosting,
+    source_url: str,
+    source_result: Any,
+) -> tuple[bool, str]:
+    """Require an LLM payload to be traceable to the acquired detail document."""
+    expected_url = canonicalize_candidate_url(source_url)
+    extracted_url = canonicalize_candidate_url(str(job.job_url or source_url))
+    if not expected_url or extracted_url != expected_url:
+        return False, "LLM job URL does not match the acquired detail URL"
+
+    raw_content = _result_content(source_result)
+    rendered_content = visible_text(raw_content)
+    evidence_text = _normalized_grounding_text(f"{raw_content}\n{rendered_content}")
+    if not evidence_text:
+        return False, "acquired detail document contains no grounding text"
+
+    if any(marker in evidence_text for marker in _PLACEHOLDER_JOB_SIGNALS):
+        return False, "detail document contains placeholder job data"
+
+    title = _normalized_grounding_text(job.title)
+    if len(title) < 3 or title not in evidence_text:
+        return False, "LLM title is not present in the acquired detail document"
+
+    grounded_fields: list[str] = []
+    ungrounded_fields: list[str] = []
+    for field_name in (
+        "job_reference",
+        "company",
+        "location_text",
+        "posted_date",
+        "compensation_text",
+    ):
+        normalized = _normalized_grounding_text(getattr(job, field_name, None))
+        if len(normalized) < 3:
+            continue
+        if normalized in evidence_text:
+            grounded_fields.append(field_name)
+        else:
+            ungrounded_fields.append(field_name)
+
+    if ungrounded_fields:
+        return False, f"LLM fields are not grounded: {','.join(ungrounded_fields)}"
+
+    page_signals = [signal for signal in _CONTENT_JOB_SIGNALS if signal in raw_content]
+    if not grounded_fields and len(page_signals) < 2:
+        return False, "LLM payload lacks a second independent page-grounded job signal"
+
+    evidence = ["url", "title", *grounded_fields]
+    if page_signals:
+        evidence.append(f"page_signals:{len(page_signals)}")
+    return True, f"grounded_evidence={','.join(evidence)}"
 
 
 def promote_trusted_detail_url(

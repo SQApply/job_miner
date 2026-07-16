@@ -51,6 +51,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow a public redirect to an unclassified external domain during controlled testing",
     )
     parser.add_argument(
+        "--allow-llm-fallback",
+        action="store_true",
+        help=(
+            "Allow GPU/LLM extraction after deterministic extraction fails. "
+            "Disabled by default; enabled results must pass source grounding."
+        ),
+    )
+    parser.add_argument(
         "--inventory-only",
         action="store_true",
         help="Parse and display the inventory without making network or browser requests",
@@ -64,6 +72,7 @@ def _progress(record: PortalCertificationRecord, position: int, total: int) -> N
         record.status.upper(),
         record.source_id,
         f"platform={record.detected_platform or 'unknown'}",
+        f"surface={record.surface_kind or 'unknown'}",
         f"discovered={record.discovered_urls}",
         f"attempted={record.attempted_urls}",
         f"extracted={record.extracted_jobs}",
@@ -96,6 +105,7 @@ def main() -> None:
         source_timeout_seconds=args.source_timeout_seconds,
         acquisition_timeout_seconds=args.acquisition_timeout_seconds,
         allow_unknown_cross_domain_redirects=bool(args.allow_unknown_cross_domain_redirects),
+        allow_llm_fallback=bool(args.allow_llm_fallback),
     )
     records = asyncio.run(
         certify_portal_inventory(

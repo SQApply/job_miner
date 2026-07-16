@@ -37,6 +37,7 @@ UrlValidator = Callable[[str], str]
 RejectedErrorPredicate = Callable[[BaseException], bool]
 ExtractedJobValidator = Callable[[JobPosting, str], tuple[bool, str]]
 LlmEligibilityCallback = Callable[[Any, str], tuple[bool, str]]
+LlmGroundingCallback = Callable[[JobPosting, str, Any], tuple[bool, str]]
 DiscoveryArtifactCallback = Callable[[list[str]], list[dict[str, Any]] | None]
 FailureArtifactCallback = Callable[[int, str, int, Any], list[dict[str, Any]] | None]
 FailedPayloadCallback = Callable[[str, Any], None]
@@ -84,6 +85,10 @@ def _always_allow_llm(_: Any, __: str) -> tuple[bool, str]:
     return True, "default"
 
 
+def _accept_llm_payload(_: JobPosting, __: str, ___: Any) -> tuple[bool, str]:
+    return True, "grounding_not_configured"
+
+
 @dataclass(frozen=True)
 class ScrapeExecutionOptions:
     """Runtime limits shared by static fleet and database-backed portal runs."""
@@ -129,6 +134,7 @@ class ScrapeOrchestratorHooks:
     is_rejected_error: RejectedErrorPredicate = _never_rejected
     validate_extracted_job: ExtractedJobValidator = _default_job_validator
     should_attempt_llm: LlmEligibilityCallback = _always_allow_llm
+    validate_llm_extracted_job: LlmGroundingCallback = _accept_llm_payload
     on_event: EventCallback | None = None
     on_discovery_artifacts: DiscoveryArtifactCallback | None = None
     on_failure_artifacts: FailureArtifactCallback | None = None
@@ -810,10 +816,29 @@ class ScrapeOrchestrator:
                                 raw_content = getattr(llm_result, "extracted_content", None)
                                 job = parse_extracted_jobs(raw_content, final_url)
                                 if job is not None:
-                                    llm_valid, llm_validation_reason = hooks.validate_extracted_job(
-                                        job,
-                                        final_url,
+                                    llm_grounded, llm_grounding_reason = (
+                                        hooks.validate_llm_extracted_job(job, final_url, result)
                                     )
+                                    if not llm_grounded:
+                                        llm_valid = False
+                                        llm_validation_reason = llm_grounding_reason
+                                        self._emit(
+                                            hooks,
+                                            "llm_grounding_failed",
+                                            job_url=job_url,
+                                            item_index=item_index,
+                                            attempt=attempt,
+                                            parsed_title=job.title,
+                                            validation_reason=llm_grounding_reason,
+                                        )
+                                    else:
+                                        llm_valid, schema_reason = hooks.validate_extracted_job(
+                                            job,
+                                            final_url,
+                                        )
+                                        llm_validation_reason = (
+                                            f"{llm_grounding_reason};{schema_reason}"
+                                        )
                                     if llm_valid:
                                         self._emit(
                                             hooks,

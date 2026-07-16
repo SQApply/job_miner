@@ -14,7 +14,7 @@ from .portals.orchestrator import (
     ScrapeOrchestrator,
     ScrapeOrchestratorHooks,
 )
-from .portals.url_intelligence import assess_llm_eligibility
+from .portals.url_intelligence import assess_llm_eligibility, assess_llm_job_grounding
 from .schemas import RunResult
 from .warehouse.repositories import WarehouseRepository
 from .store.storefront import (
@@ -151,6 +151,7 @@ async def run_target(
             ),
             on_event=lambda event, payload: session_logger.log(event, **payload),
             should_attempt_llm=assess_llm_eligibility,
+            validate_llm_extracted_job=assess_llm_job_grounding,
             on_failed_payload=lambda job_url, payload: _save_failed_payload(
                 root,
                 target_id,

@@ -25,7 +25,7 @@ from .orchestrator import (
 )
 from .result_evidence import detection_html, result_page_quality
 from .safety import PortalUrlSafetyError, default_allowed_hosts, validate_public_http_url
-from .url_intelligence import assess_llm_eligibility
+from .url_intelligence import assess_llm_eligibility, assess_llm_job_grounding
 
 
 @dataclass(frozen=True)
@@ -517,6 +517,7 @@ async def scrape_portal(
             ).normalized_url,
             is_rejected_error=lambda exc: isinstance(exc, PortalUrlSafetyError),
             should_attempt_llm=assess_llm_eligibility,
+            validate_llm_extracted_job=assess_llm_job_grounding,
             on_discovery_artifacts=discovery_artifacts,
             on_failure_artifacts=failure_artifacts,
         )

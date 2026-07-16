@@ -40,6 +40,7 @@ from .orchestrator import (
     ScrapeOrchestrator,
     ScrapeOrchestratorHooks,
 )
+from .page_quality import classify_crawler_failure
 from .result_evidence import detection_html, result_page_quality
 from .safety import (
     PortalUrlSafetyError,
@@ -49,12 +50,13 @@ from .safety import (
 from .url_intelligence import (
     assess_certification_job,
     assess_llm_eligibility,
+    assess_llm_job_grounding,
     canonicalize_candidate_url,
     rank_job_candidate_urls,
 )
 
 
-CERTIFICATION_CONTRACT_VERSION = "1.1"
+CERTIFICATION_CONTRACT_VERSION = "1.2"
 _HTTP_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", flags=re.IGNORECASE)
 _XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _XLSX_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -257,6 +259,7 @@ class CertificationOptions:
     source_timeout_seconds: int = 600
     acquisition_timeout_seconds: float = 20.0
     allow_unknown_cross_domain_redirects: bool = False
+    allow_llm_fallback: bool = False
 
     def __post_init__(self) -> None:
         if not 1 <= self.max_jobs <= 10:
@@ -305,6 +308,8 @@ class PortalCertificationRecord:
     ranked_candidates: int = 0
     ranking_rejected_urls: int = 0
     llm_skipped_non_job_pages: int = 0
+    llm_grounding_rejections: int = 0
+    surface_kind: str | None = None
     discovery_quality: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -324,6 +329,10 @@ class PortalCertificationBlocked(RuntimeError):
 
 
 class PortalCertificationRedirectReview(RuntimeError):
+    pass
+
+
+class PortalCertificationJavaScriptShell(RuntimeError):
     pass
 
 
@@ -392,8 +401,18 @@ def _classify_error(exc: BaseException) -> tuple[str, str]:
     message = str(exc).lower()
     if isinstance(exc, asyncio.TimeoutError):
         return "source_timeout", "failed"
+    if isinstance(exc, PortalCertificationJavaScriptShell):
+        return "javascript_shell", "needs_repair"
     if isinstance(exc, PortalCertificationBlocked) or any(
-        marker in message for marker in ("captcha", "access denied", "verify you are human", "robot check")
+        marker in message
+        for marker in (
+            "captcha",
+            "access denied",
+            "cloudflare js challenge",
+            "http 403",
+            "verify you are human",
+            "robot check",
+        )
     ):
         return "access_blocked", "access_blocked"
     if isinstance(exc, PortalCertificationRedirectReview):
@@ -481,8 +500,17 @@ class PortalFleetCertifier:
                 config=listing_run_config(self.hub.system.browser, session_id, None),
             )
         if not getattr(result, "success", False):
+            failure_message = str(getattr(result, "error_message", "unknown browser error"))
+            failure_kind = classify_crawler_failure(failure_message)
+            if failure_kind == "confirmed_access_control":
+                raise PortalCertificationBlocked(f"Listing probe blocked: {failure_message}")
+            if failure_kind == "javascript_shell":
+                raise PortalCertificationJavaScriptShell(
+                    "Listing probe returned a JavaScript shell that requires API/route discovery: "
+                    f"{failure_message}"
+                )
             raise RuntimeError(
-                f"Listing probe failed: {getattr(result, 'error_message', 'unknown browser error')}"
+                f"Listing probe failed: {failure_message}"
             )
 
         page_quality = result_page_quality(result)
@@ -499,6 +527,23 @@ class PortalFleetCertifier:
         )
         if detection.blocked:
             raise PortalCertificationBlocked("The rendered listing page contains an access-control indicator")
+        if detection.surface_kind == "javascript_shell" and not detection.acquisition_hints:
+            shell_outcome = await self._acquire(
+                listing_url=final_checked.normalized_url,
+                detection=detection,
+            )
+            if shell_outcome.selected is None:
+                raise PortalCertificationJavaScriptShell(
+                    "Rendered listing is a JavaScript shell with no evidence-bound ATS or listing route"
+                )
+            return _ProbeResult(
+                effective_listing_url=final_checked.normalized_url,
+                detection=detection,
+                allowed_hosts=tuple(
+                    dict.fromkeys([*checked.allowed_hosts, *shell_outcome.selected.trusted_hosts])
+                ),
+                acquisition_outcome=shell_outcome,
+            )
 
         original_host = checked.hostname
         final_host = final_checked.hostname
@@ -554,9 +599,21 @@ class PortalFleetCertifier:
                     config=listing_run_config(self.hub.system.browser, f"{session_id}_listing", None),
                 )
             if not getattr(hinted_result, "success", False):
+                failure_message = str(
+                    getattr(hinted_result, "error_message", "unknown browser error")
+                )
+                failure_kind = classify_crawler_failure(failure_message)
+                if failure_kind == "confirmed_access_control":
+                    raise PortalCertificationBlocked(
+                        f"Inferred listing route blocked: {failure_message}"
+                    )
+                if failure_kind == "javascript_shell":
+                    raise PortalCertificationJavaScriptShell(
+                        "Inferred listing route is a JavaScript shell requiring API discovery: "
+                        f"{failure_message}"
+                    )
                 raise RuntimeError(
-                    "Inferred jobs-listing route failed: "
-                    f"{getattr(hinted_result, 'error_message', 'unknown browser error')}"
+                    f"Inferred jobs-listing route failed: {failure_message}"
                 )
             hinted_quality = result_page_quality(hinted_result)
             if hinted_quality.blocked:
@@ -668,6 +725,11 @@ class PortalFleetCertifier:
                     return False, f"unsafe extracted job URL: {exc}"
                 return assess_certification_job(job, source_url)
 
+            def should_attempt_certification_llm(result: Any, source_url: str) -> tuple[bool, str]:
+                if not self.options.allow_llm_fallback:
+                    return False, "LLM fallback disabled for deterministic fleet certification"
+                return assess_llm_eligibility(result, source_url)
+
             remaining_timeout = max(
                 1.0,
                 self.options.source_timeout_seconds - (time.perf_counter() - started),
@@ -704,7 +766,8 @@ class PortalFleetCertifier:
                         ).normalized_url,
                         is_rejected_error=lambda exc: isinstance(exc, PortalUrlSafetyError),
                         validate_extracted_job=validate_certification_job,
-                        should_attempt_llm=assess_llm_eligibility,
+                        should_attempt_llm=should_attempt_certification_llm,
+                        validate_llm_extracted_job=assess_llm_job_grounding,
                         on_event=lambda event, payload: event_counts.update([event]),
                         on_failed_payload=self._failed_payload_writer(entry.source_id),
                     ),
@@ -723,7 +786,11 @@ class PortalFleetCertifier:
                 error_type = "zero_valid_jobs"
                 error_message = (
                     f"Discovery selected {len(orchestration.discovered_job_urls)} candidate URLs, "
-                    "but deterministic and eligible LLM extraction produced no certifiable jobs"
+                    + (
+                        "but grounded deterministic/LLM extraction produced no certifiable jobs"
+                        if self.options.allow_llm_fallback
+                        else "but deterministic extraction produced no certifiable jobs; LLM fallback was disabled"
+                    )
                 )
             elif failures:
                 status = "partial"
@@ -770,6 +837,8 @@ class PortalFleetCertifier:
                 ranked_candidates=int(discovery_quality.get("selected_urls") or 0),
                 ranking_rejected_urls=int(discovery_quality.get("rejected_urls") or 0),
                 llm_skipped_non_job_pages=int(event_counts.get("llm_fallback_skipped_non_job") or 0),
+                llm_grounding_rejections=int(event_counts.get("llm_grounding_failed") or 0),
+                surface_kind=probe.detection.surface_kind,
                 discovery_quality=discovery_quality,
             )
         except Exception as exc:
@@ -802,6 +871,15 @@ class PortalFleetCertifier:
                 elapsed_seconds=round(time.perf_counter() - started, 3),
                 error_type=error_type,
                 error_message=str(exc)[:2000],
+                surface_kind=(
+                    probe.detection.surface_kind
+                    if probe
+                    else "javascript_shell"
+                    if error_type == "javascript_shell"
+                    else "confirmed_access_control"
+                    if error_type == "access_blocked"
+                    else None
+                ),
             )
 
 
@@ -893,6 +971,8 @@ class CertificationReportStore:
             "ranked_candidates",
             "ranking_rejected_urls",
             "llm_skipped_non_job_pages",
+            "llm_grounding_rejections",
+            "surface_kind",
             "elapsed_seconds",
             "error_type",
             "error_message",

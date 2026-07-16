@@ -23,6 +23,7 @@ KNOWN_BROWSER_ATS_HOSTS: dict[str, tuple[str, ...]] = {
     "adp": ("workforcenow.adp.com", "jobs.adp.com"),
     "bamboohr": ("bamboohr.com",),
     "paylocity": ("recruiting.paylocity.com",),
+    "jobdiva": ("jobdiva.com",),
 }
 
 
@@ -85,6 +86,7 @@ class PortalDetection:
     content_fingerprint: str
     blocked: bool = False
     acquisition_hints: dict[str, str] = field(default_factory=dict)
+    surface_kind: str = "content"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -327,9 +329,15 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
             blocked=True,
+            surface_kind=page_quality.surface_kind,
         )
 
-    if (acquisition and acquisition[0] == "workday") or "myworkdayjobs.com" in hostname or "workday" in hostname or "workday" in combined:
+    # Platform classification must be tied to a hostname or an embedded URL
+    # that is actually present in the page. Plain words such as "Workday" or
+    # "Greenhouse" frequently occur in articles and job descriptions and must
+    # never select an ATS adapter on their own.
+    workday_host = hostname == "myworkdayjobs.com" or hostname.endswith(".myworkdayjobs.com")
+    if (acquisition and acquisition[0] == "workday") or workday_host:
         return PortalDetection(
             source_platform="workday",
             profile_name="workday",
@@ -340,9 +348,11 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
             acquisition_hints=acquisition[1] if acquisition and acquisition[0] == "workday" else {},
+            surface_kind=page_quality.surface_kind,
         )
 
-    if "jobdiva" in hostname or "jobdiva" in combined:
+    jobdiva_host = hostname == "jobdiva.com" or hostname.endswith(".jobdiva.com")
+    if (acquisition and acquisition[0] == "jobdiva") or jobdiva_host:
         return PortalDetection(
             source_platform="jobdiva",
             profile_name="jobdiva",
@@ -352,9 +362,12 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             reasons=["JobDiva signature detected.", "A test scrape is required because detail navigation can vary."],
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
+            acquisition_hints=acquisition[1] if acquisition and acquisition[0] == "jobdiva" else {},
+            surface_kind=page_quality.surface_kind,
         )
 
-    if (acquisition and acquisition[0] == "greenhouse") or "greenhouse.io" in hostname or "greenhouse" in combined:
+    greenhouse_host = hostname == "greenhouse.io" or hostname.endswith(".greenhouse.io")
+    if (acquisition and acquisition[0] == "greenhouse") or greenhouse_host:
         return PortalDetection(
             source_platform="greenhouse",
             profile_name="generic_listing",
@@ -365,9 +378,11 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
             acquisition_hints=acquisition[1] if acquisition and acquisition[0] == "greenhouse" else {},
+            surface_kind=page_quality.surface_kind,
         )
 
-    if (acquisition and acquisition[0] == "lever") or "jobs.lever.co" in hostname or "lever.co" in hostname:
+    lever_host = hostname in {"jobs.lever.co", "jobs.eu.lever.co"}
+    if (acquisition and acquisition[0] == "lever") or lever_host:
         return PortalDetection(
             source_platform="lever",
             profile_name="generic_listing",
@@ -378,9 +393,11 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
             acquisition_hints=acquisition[1] if acquisition and acquisition[0] == "lever" else {},
+            surface_kind=page_quality.surface_kind,
         )
 
-    if (acquisition and acquisition[0] == "ashby") or "ashbyhq.com" in hostname or "ashby" in combined:
+    ashby_host = hostname == "jobs.ashbyhq.com"
+    if (acquisition and acquisition[0] == "ashby") or ashby_host:
         return PortalDetection(
             source_platform="ashby",
             profile_name="generic_listing",
@@ -391,6 +408,7 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
             acquisition_hints=acquisition[1] if acquisition and acquisition[0] == "ashby" else {},
+            surface_kind=page_quality.surface_kind,
         )
 
     if acquisition and acquisition[0] in KNOWN_BROWSER_ATS_HOSTS:
@@ -405,6 +423,24 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
             acquisition_hints={**listing_hints, **acquisition[1]},
+            surface_kind=page_quality.surface_kind,
+        )
+
+    if page_quality.surface_kind == "javascript_shell":
+        return PortalDetection(
+            source_platform="custom_spa",
+            profile_name="generic_listing",
+            crawl_strategy="generic_listing",
+            confidence=0.76,
+            requires_review=True,
+            reasons=[
+                "A sparse JavaScript application shell was detected without explicit access-control evidence.",
+                "API and embedded route discovery must run before browser detail extraction.",
+            ],
+            page_title=_page_title(html_value),
+            content_fingerprint=fingerprint,
+            acquisition_hints=listing_hints,
+            surface_kind=page_quality.surface_kind,
         )
 
     if "#" in listing_url or "hash-router" in combined or "hash route" in combined:
@@ -418,6 +454,7 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
             acquisition_hints=listing_hints,
+            surface_kind=page_quality.surface_kind,
         )
 
     if _contains_any(combined, ("load more jobs", "load more", "show more jobs", "view more jobs")):
@@ -431,6 +468,7 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
             acquisition_hints=listing_hints,
+            surface_kind=page_quality.surface_kind,
         )
 
     if "?page=" in listing_url.lower() or re.search(r"(?:rel=[\"']next[\"']|aria-label=[\"'][^\"']*next)", combined):
@@ -444,6 +482,7 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
             page_title=_page_title(html_value),
             content_fingerprint=fingerprint,
             acquisition_hints=listing_hints,
+            surface_kind=page_quality.surface_kind,
         )
 
     return PortalDetection(
@@ -459,4 +498,5 @@ def detect_portal(*, listing_url: str, html: str | None, text_content: str | Non
         page_title=_page_title(html_value),
         content_fingerprint=fingerprint,
         acquisition_hints=listing_hints,
+        surface_kind=page_quality.surface_kind,
     )
