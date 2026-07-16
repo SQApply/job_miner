@@ -7,8 +7,10 @@ from unittest.mock import AsyncMock, patch
 
 from src.blueprint_hub import BlueprintHub
 from src.portals.acquisition import (
+    AcquisitionHttpError,
     AcquisitionContext,
     AcquisitionRegistry,
+    _validated_same_host_redirect,
 )
 from src.portals.detector import detect_portal
 from src.portals.orchestrator import ScrapeExecutionOptions, ScrapeOrchestrator
@@ -16,6 +18,39 @@ from src.schemas import JobPosting
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class AcquisitionRedirectSafetyTests(unittest.TestCase):
+    def test_cross_host_redirect_is_rejected_before_following(self) -> None:
+        def validated(url: str):
+            hostname = str(url).split("/", 3)[2]
+            return SimpleNamespace(normalized_url=str(url), hostname=hostname)
+
+        with patch(
+            "src.portals.acquisition.validate_public_http_url",
+            side_effect=validated,
+        ):
+            with self.assertRaisesRegex(AcquisitionHttpError, "cross-host redirect"):
+                _validated_same_host_redirect(
+                    "https://jobs.example.com/feed",
+                    "http://169.254.169.254/latest/meta-data",
+                )
+
+    def test_same_host_redirect_remains_supported(self) -> None:
+        def validated(url: str):
+            hostname = str(url).split("/", 3)[2]
+            return SimpleNamespace(normalized_url=str(url), hostname=hostname)
+
+        with patch(
+            "src.portals.acquisition.validate_public_http_url",
+            side_effect=validated,
+        ):
+            redirected = _validated_same_host_redirect(
+                "http://jobs.example.com/feed",
+                "https://jobs.example.com/feed?page=1",
+            )
+
+        self.assertEqual(redirected, "https://jobs.example.com/feed?page=1")
 
 
 class FakeJsonClient:

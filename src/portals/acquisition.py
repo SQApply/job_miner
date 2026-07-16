@@ -10,9 +10,11 @@ from html.parser import HTMLParser
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from ..schemas import JobPosting
+from .route_resolver import resolve_listing_route
+from .safety import PortalUrlSafetyError, validate_public_http_url
 
 
 ACQUISITION_CONTRACT_VERSION = "1.0"
@@ -134,6 +136,32 @@ class AsyncJsonClient(Protocol):
     ) -> str: ...
 
 
+def _validated_same_host_redirect(source_url: str, destination_url: str) -> str:
+    source = validate_public_http_url(source_url)
+    destination = validate_public_http_url(urljoin(source.normalized_url, destination_url))
+    if destination.hostname != source.hostname:
+        raise AcquisitionHttpError(
+            "ATS endpoint attempted an unapproved cross-host redirect"
+        )
+    return destination.normalized_url
+
+
+class _PublicSameHostRedirectHandler(HTTPRedirectHandler):
+    """Validate every redirect before urllib can make the next request."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        safe_url = _validated_same_host_redirect(req.full_url, newurl)
+        return super().redirect_request(req, fp, code, msg, headers, safe_url)
+
+
+def _open_public_request(request: Request, *, timeout_seconds: float):
+    validate_public_http_url(request.full_url)
+    return build_opener(_PublicSameHostRedirectHandler()).open(
+        request,
+        timeout=timeout_seconds,
+    )
+
+
 class UrlLibJsonClient:
     """Small dependency-free client for fixed, public ATS JSON and HTML endpoints."""
 
@@ -216,7 +244,7 @@ class UrlLibJsonClient:
             },
         )
         try:
-            with urlopen(request, timeout=timeout_seconds) as response:
+            with _open_public_request(request, timeout_seconds=timeout_seconds) as response:
                 requested_host = str(urlsplit(url).hostname or "").lower()
                 final_host = str(urlsplit(response.geturl()).hostname or "").lower()
                 if final_host != requested_host:
@@ -244,7 +272,7 @@ class UrlLibJsonClient:
             },
         )
         try:
-            with urlopen(request, timeout=timeout_seconds) as response:
+            with _open_public_request(request, timeout_seconds=timeout_seconds) as response:
                 requested_host = str(urlsplit(url).hostname or "").lower()
                 final_host = str(urlsplit(response.geturl()).hostname or "").lower()
                 if final_host != requested_host:
@@ -1084,6 +1112,8 @@ class PublicHtmlProvider:
         pagination_evidence = False
         reported_total: int | None = None
         blocked_reason: str | None = None
+        trusted_hosts: set[str] = {str(match.metadata["hostname"]).lower()}
+        route_resolution_chain: list[dict[str, Any]] = []
 
         while queue and requests < context.max_pages:
             page_url = queue.pop(0)
@@ -1098,7 +1128,34 @@ class PublicHtmlProvider:
                 blocked_reason = quality.reason
                 continue
 
-            inferred = infer_listing_url(page_url, document)
+            resolution = resolve_listing_route(
+                source_url=page_url,
+                html=document,
+            )
+            resolved_route = resolution.selected
+            if resolved_route is not None:
+                resolved_host = str(urlsplit(resolved_route.url).hostname or "").lower()
+                page_host = str(urlsplit(page_url).hostname or "").lower()
+                if resolved_host != page_host:
+                    try:
+                        validate_public_http_url(resolved_route.url)
+                    except PortalUrlSafetyError:
+                        resolved_route = None
+                    else:
+                        trusted_hosts.add(resolved_host)
+                if resolved_route is not None:
+                    route_resolution_chain.append(
+                        {
+                            "source_url": page_url,
+                            "selected_url": resolved_route.url,
+                            "route_kind": resolved_route.route_kind,
+                            "platform": resolved_route.platform,
+                            "score": resolved_route.score,
+                            "trusted_hosts": list(resolved_route.trusted_hosts),
+                        }
+                    )
+
+            inferred = resolved_route.url if resolved_route is not None else infer_listing_url(page_url, document)
             if inferred and _public_pagination_url(inferred, listing_url=page_url):
                 # A numbered page is pagination evidence, not a new canonical
                 # listing route.
@@ -1114,14 +1171,13 @@ class PublicHtmlProvider:
             except Exception:
                 pass
 
-            page_host = str(urlsplit(page_url).hostname or "").lower()
             for href in parser.hrefs:
                 candidate = urljoin(page_url, href)
                 try:
                     candidate_host = str(urlsplit(candidate).hostname or "").lower()
                 except ValueError:
                     continue
-                if candidate_host != page_host:
+                if candidate_host not in trusted_hosts:
                     continue
                 assessment = assess_job_candidate_url(
                     candidate,
@@ -1158,7 +1214,7 @@ class PublicHtmlProvider:
             strategy="public_html_discovery",
             discovered_urls=discovered,
             preextracted_jobs={},
-            trusted_hosts=(match.metadata["hostname"],),
+            trusted_hosts=tuple(sorted(trusted_hosts)),
             complete=complete,
             pages_visited=requests,
             endpoint_requests=requests,
@@ -1168,6 +1224,7 @@ class PublicHtmlProvider:
                 "pagination_evidence": pagination_evidence,
                 "request_budget_exhausted": bool(queue),
                 "blocked_reason": blocked_reason,
+                "route_resolution_chain": route_resolution_chain[:25],
             },
         )
 

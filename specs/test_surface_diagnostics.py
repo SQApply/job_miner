@@ -46,6 +46,36 @@ class SurfaceDiagnosticsTests(unittest.TestCase):
             report["inferred_listing_url"],
             "https://www.apexsystems.com/search-results-usa",
         )
+        self.assertEqual(
+            report["resolved_listing_url"],
+            "https://www.apexsystems.com/search-results-usa",
+        )
+        self.assertTrue(report["route_resolution"]["selected"]["trusted"])
+
+    def test_listing_report_records_external_ats_handoff(self) -> None:
+        route = "https://acme.wd5.myworkdayjobs.com/en-US/External"
+        result = SimpleNamespace(
+            success=True,
+            status_code=200,
+            url="https://company.example/careers",
+            html=f'<script>window.careersUrl = "{route}";</script>',
+            cleaned_html="",
+            markdown="Search jobs",
+            links={"internal": [], "external": []},
+        )
+
+        report = build_surface_report(
+            result,
+            requested_url="https://company.example/careers",
+            mode="listing",
+        )
+
+        self.assertEqual(report["resolved_listing_url"], route)
+        self.assertEqual(
+            report["route_resolution"]["selected"]["platform"],
+            "workday",
+        )
+        self.assertEqual(report["failure_stage"], "listing_route_transition_detected")
 
     def test_report_exposes_pipeline_link_container_gap(self) -> None:
         result = SimpleNamespace(

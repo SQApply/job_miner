@@ -11,7 +11,7 @@ import time
 import uuid
 import zipfile
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -42,6 +42,13 @@ from .orchestrator import (
 )
 from .page_quality import classify_crawler_failure
 from .result_evidence import detection_html, result_page_quality
+from .route_resolver import (
+    ListingRouteResolution,
+    hosts_are_related,
+    resolve_listing_route,
+    route_acquisition_hints,
+    route_host_is_trusted,
+)
 from .safety import (
     PortalUrlSafetyError,
     default_allowed_hosts,
@@ -56,7 +63,7 @@ from .url_intelligence import (
 )
 
 
-CERTIFICATION_CONTRACT_VERSION = "1.2"
+CERTIFICATION_CONTRACT_VERSION = "1.3"
 _HTTP_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", flags=re.IGNORECASE)
 _XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _XLSX_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -310,6 +317,8 @@ class PortalCertificationRecord:
     llm_skipped_non_job_pages: int = 0
     llm_grounding_rejections: int = 0
     surface_kind: str | None = None
+    resolved_route_url: str | None = None
+    route_resolution: dict[str, Any] = field(default_factory=dict)
     discovery_quality: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -322,6 +331,7 @@ class _ProbeResult:
     detection: PortalDetection
     allowed_hosts: tuple[str, ...]
     acquisition_outcome: AcquisitionOutcome
+    route_resolution: dict[str, Any] = field(default_factory=dict)
 
 
 class PortalCertificationBlocked(RuntimeError):
@@ -363,13 +373,26 @@ def _result_url(result: Any, fallback: str) -> str:
 
 
 def _same_site(first: str, second: str) -> bool:
-    first_parts = str(first or "").lower().split(".")
-    second_parts = str(second or "").lower().split(".")
-    return len(first_parts) >= 2 and len(second_parts) >= 2 and first_parts[-2:] == second_parts[-2:]
+    return hosts_are_related(first, second)
 
 
-def _known_api_platform(detection: PortalDetection) -> bool:
-    return detection.source_platform in {"greenhouse", "lever", "ashby", "workday", "jobdiva"}
+def _with_route_hints(
+    detection: PortalDetection,
+    resolution: ListingRouteResolution,
+) -> PortalDetection:
+    if resolution.selected is None:
+        return detection
+    hints = {**detection.acquisition_hints, **route_acquisition_hints(resolution)}
+    reason = (
+        f"Evidence-bound route resolver selected {resolution.selected.url} "
+        f"with score {resolution.selected.score}."
+    )
+    return replace(
+        detection,
+        confidence=max(detection.confidence, min(0.98, resolution.selected.score / 30.0)),
+        reasons=[*detection.reasons, reason],
+        acquisition_hints=hints,
+    )
 
 
 def _approved_hosts_for_url(url: str) -> list[str]:
@@ -520,11 +543,39 @@ class PortalFleetCertifier:
             )
 
         final_checked = validate_public_http_url(_result_url(result, checked.normalized_url))
-        detection = detect_portal(
-            listing_url=final_checked.normalized_url,
-            html=_result_html(result),
-            text_content=_result_text(result),
+        page_html = _result_html(result)
+        page_text = _result_text(result)
+        route_resolution = resolve_listing_route(
+            source_url=checked.normalized_url,
+            final_url=final_checked.normalized_url,
+            html=page_html,
+            structured_links=getattr(result, "links", None),
         )
+
+        original_host = checked.hostname
+        final_host = final_checked.hostname
+        redirect_known = bool(known_browser_ats_platform(final_checked.normalized_url))
+        redirect_trusted = route_host_is_trusted(route_resolution, final_host)
+        if (
+            final_host != original_host
+            and not _same_site(original_host, final_host)
+            and not redirect_known
+            and not redirect_trusted
+            and not self.options.allow_unknown_cross_domain_redirects
+        ):
+            raise PortalCertificationRedirectReview(
+                f"Listing redirected from {original_host} to unclassified host {final_host}"
+            )
+
+        resolved_checked = final_checked
+        if route_resolution.selected is not None:
+            resolved_checked = validate_public_http_url(route_resolution.selected.url)
+        detection = detect_portal(
+            listing_url=resolved_checked.normalized_url,
+            html=page_html,
+            text_content=page_text,
+        )
+        detection = _with_route_hints(detection, route_resolution)
         if detection.blocked:
             raise PortalCertificationBlocked("The rendered listing page contains an access-control indicator")
         if detection.surface_kind == "javascript_shell" and not detection.acquisition_hints:
@@ -540,33 +591,29 @@ class PortalFleetCertifier:
                 effective_listing_url=final_checked.normalized_url,
                 detection=detection,
                 allowed_hosts=tuple(
-                    dict.fromkeys([*checked.allowed_hosts, *shell_outcome.selected.trusted_hosts])
+                    dict.fromkeys(
+                        [
+                            *checked.allowed_hosts,
+                            *route_resolution.trusted_hosts,
+                            *shell_outcome.selected.trusted_hosts,
+                        ]
+                    )
                 ),
                 acquisition_outcome=shell_outcome,
+                route_resolution=route_resolution.to_dict(),
             )
 
-        original_host = checked.hostname
-        final_host = final_checked.hostname
-        redirect_known = _known_api_platform(detection) or bool(known_browser_ats_platform(final_checked.normalized_url))
-        if (
-            final_host != original_host
-            and not _same_site(original_host, final_host)
-            and not redirect_known
-            and not self.options.allow_unknown_cross_domain_redirects
-        ):
-            raise PortalCertificationRedirectReview(
-                f"Listing redirected from {original_host} to unclassified host {final_host}"
-            )
-
-        effective_url = final_checked.normalized_url
+        effective_url = resolved_checked.normalized_url
         hinted_url = str(detection.acquisition_hints.get("listing_url") or "").strip()
         if hinted_url:
             hinted_checked = validate_public_http_url(hinted_url)
             hinted_known = bool(known_browser_ats_platform(hinted_checked.normalized_url))
+            hinted_trusted = route_host_is_trusted(route_resolution, hinted_checked.hostname)
             if (
                 hinted_checked.hostname != final_checked.hostname
                 and not _same_site(hinted_checked.hostname, final_checked.hostname)
                 and not hinted_known
+                and not hinted_trusted
                 and not self.options.allow_unknown_cross_domain_redirects
             ):
                 raise PortalCertificationRedirectReview(
@@ -583,6 +630,7 @@ class PortalFleetCertifier:
             if inferred_outcome.selected is not None:
                 approved_hosts = [
                     *checked.allowed_hosts,
+                    *route_resolution.trusted_hosts,
                     *_approved_hosts_for_url(final_checked.normalized_url),
                     *_approved_hosts_for_url(effective_url),
                     *inferred_outcome.selected.trusted_hosts,
@@ -592,6 +640,7 @@ class PortalFleetCertifier:
                     detection=detection,
                     allowed_hosts=tuple(dict.fromkeys(approved_hosts)),
                     acquisition_outcome=inferred_outcome,
+                    route_resolution=route_resolution.to_dict(),
                 )
             async with AsyncWebCrawler(config=browser_config) as crawler:
                 hinted_result = await crawler.arun(
@@ -646,6 +695,7 @@ class PortalFleetCertifier:
         acquisition_outcome = await self._acquire(listing_url=effective_url, detection=detection)
         approved_hosts = [
             *checked.allowed_hosts,
+            *route_resolution.trusted_hosts,
             *_approved_hosts_for_url(final_checked.normalized_url),
             *_approved_hosts_for_url(effective_url),
         ]
@@ -656,6 +706,7 @@ class PortalFleetCertifier:
             detection=detection,
             allowed_hosts=tuple(dict.fromkeys(approved_hosts)),
             acquisition_outcome=acquisition_outcome,
+            route_resolution=route_resolution.to_dict(),
         )
 
     def _failed_payload_writer(self, source_id: str) -> Callable[[str, Any], None]:
@@ -839,6 +890,11 @@ class PortalFleetCertifier:
                 llm_skipped_non_job_pages=int(event_counts.get("llm_fallback_skipped_non_job") or 0),
                 llm_grounding_rejections=int(event_counts.get("llm_grounding_failed") or 0),
                 surface_kind=probe.detection.surface_kind,
+                resolved_route_url=(
+                    str((probe.route_resolution.get("selected") or {}).get("url") or "")
+                    or None
+                ),
+                route_resolution=probe.route_resolution,
                 discovery_quality=discovery_quality,
             )
         except Exception as exc:
@@ -880,6 +936,11 @@ class PortalFleetCertifier:
                     if error_type == "access_blocked"
                     else None
                 ),
+                resolved_route_url=(
+                    str(((probe.route_resolution if probe else {}).get("selected") or {}).get("url") or "")
+                    or None
+                ),
+                route_resolution=(probe.route_resolution if probe else {}),
             )
 
 
@@ -973,6 +1034,7 @@ class CertificationReportStore:
             "llm_skipped_non_job_pages",
             "llm_grounding_rejections",
             "surface_kind",
+            "resolved_route_url",
             "elapsed_seconds",
             "error_type",
             "error_message",

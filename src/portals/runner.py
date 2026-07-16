@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,13 @@ from .orchestrator import (
     ScrapeOrchestratorHooks,
 )
 from .result_evidence import detection_html, result_page_quality
+from .route_resolver import (
+    ListingRouteResolution,
+    hosts_are_related,
+    resolve_listing_route,
+    route_acquisition_hints,
+    route_host_is_trusted,
+)
 from .safety import PortalUrlSafetyError, default_allowed_hosts, validate_public_http_url
 from .url_intelligence import assess_llm_eligibility, assess_llm_job_grounding
 
@@ -36,6 +43,7 @@ class PortalProbeResult:
     sample_job_urls: list[str]
     artifacts: list[dict[str, Any]] | None = None
     acquisition: dict[str, Any] | None = None
+    route_resolution: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -102,9 +110,28 @@ def _result_final_url(result: Any, fallback: str) -> str:
 
 
 def _same_site(first: str, second: str) -> bool:
-    first_parts = str(first or "").lower().rstrip(".").split(".")
-    second_parts = str(second or "").lower().rstrip(".").split(".")
-    return len(first_parts) >= 2 and len(second_parts) >= 2 and first_parts[-2:] == second_parts[-2:]
+    return hosts_are_related(first, second)
+
+
+def _with_route_hints(
+    detection: PortalDetection,
+    resolution: ListingRouteResolution,
+) -> PortalDetection:
+    selected = resolution.selected
+    if selected is None:
+        return detection
+    return replace(
+        detection,
+        confidence=max(detection.confidence, min(0.98, selected.score / 30.0)),
+        reasons=[
+            *detection.reasons,
+            f"Evidence-bound route resolver selected {selected.url} with score {selected.score}.",
+        ],
+        acquisition_hints={
+            **detection.acquisition_hints,
+            **route_acquisition_hints(resolution),
+        },
+    )
 
 
 def _safe_discovered_urls(urls: list[str], allowed_hosts: list[str]) -> tuple[list[str], int]:
@@ -147,7 +174,28 @@ def _runtime_portal_allowed_hosts(portal: dict[str, Any]) -> list[str]:
     canonical = validate_public_http_url(canonical_url)
     provided = validate_public_http_url(provided_url)
     canonical_is_known_ats = bool(known_browser_ats_platform(canonical.normalized_url))
-    if canonical.hostname == provided.hostname or _same_site(canonical.hostname, provided.hostname) or canonical_is_known_ats:
+    metadata = portal.get("metadata") or {}
+    last_probe = metadata.get("last_probe") if isinstance(metadata, dict) else {}
+    route_resolution = (
+        last_probe.get("route_resolution") if isinstance(last_probe, dict) else {}
+    )
+    trusted_route_hosts = {
+        str(host).lower().rstrip(".")
+        for host in (
+            ((route_resolution or {}).get("trusted_hosts") or [])
+            if isinstance(route_resolution, dict)
+            else []
+        )
+        if str(host).strip()
+    }
+    canonical_is_resolved_route = canonical.hostname in trusted_route_hosts
+    if canonical_is_resolved_route:
+        configured.append(canonical.hostname)
+    elif (
+        canonical.hostname == provided.hostname
+        or _same_site(canonical.hostname, provided.hostname)
+        or canonical_is_known_ats
+    ):
         configured.extend(default_allowed_hosts(canonical.hostname))
     return list(dict.fromkeys(configured))
 
@@ -275,19 +323,48 @@ async def probe_portal(*, root: Path, portal: dict[str, Any], run_session_id: st
             raise RuntimeError(f"Portal listing probe failed: {getattr(result, 'error_message', 'unknown error')}")
 
         final_url = _result_final_url(result, checked_url.normalized_url)
-        final_checked = validate_public_http_url(final_url, allowed_hosts=checked_url.allowed_hosts)
+        final_checked = validate_public_http_url(final_url)
         page_quality = result_page_quality(result)
         html = str(getattr(result, "html", "") or "") if page_quality.blocked else _result_html(result)
-        detection = detect_portal(listing_url=final_checked.normalized_url, html=html, text_content=_result_text(result))
+        page_text = _result_text(result)
+        route_resolution = resolve_listing_route(
+            source_url=checked_url.normalized_url,
+            final_url=final_checked.normalized_url,
+            html=html,
+            structured_links=getattr(result, "links", None),
+        )
+        redirect_known = bool(known_browser_ats_platform(final_checked.normalized_url))
+        redirect_trusted = route_host_is_trusted(route_resolution, final_checked.hostname)
+        if (
+            final_checked.hostname != checked_url.hostname
+            and not _same_site(final_checked.hostname, checked_url.hostname)
+            and not redirect_known
+            and not redirect_trusted
+        ):
+            raise RuntimeError(
+                f"Portal listing redirected to unclassified host {final_checked.hostname}"
+            )
+
+        resolved_checked = final_checked
+        if route_resolution.selected is not None:
+            resolved_checked = validate_public_http_url(route_resolution.selected.url)
+        detection = detect_portal(
+            listing_url=resolved_checked.normalized_url,
+            html=html,
+            text_content=page_text,
+        )
+        detection = _with_route_hints(detection, route_resolution)
 
         inferred_outcome = None
         hinted_url = str(detection.acquisition_hints.get("listing_url") or "").strip()
         if hinted_url:
             hinted_checked = validate_public_http_url(hinted_url)
+            hinted_trusted = route_host_is_trusted(route_resolution, hinted_checked.hostname)
             if (
                 hinted_checked.hostname != final_checked.hostname
                 and not _same_site(hinted_checked.hostname, final_checked.hostname)
                 and not known_browser_ats_platform(hinted_checked.normalized_url)
+                and not hinted_trusted
             ):
                 raise RuntimeError(
                     f"Rendered listing linked to unclassified host {hinted_checked.hostname}"
@@ -348,6 +425,7 @@ async def probe_portal(*, root: Path, portal: dict[str, Any], run_session_id: st
                         ),
                         text_content=_result_text(hinted_result),
                     )
+                    detection = _with_route_hints(detection, route_resolution)
 
         discovered_urls = 0
         samples: list[str] = []
@@ -366,6 +444,7 @@ async def probe_portal(*, root: Path, portal: dict[str, Any], run_session_id: st
                     [
                         *(portal.get("allowed_hosts") or []),
                         *checked_url.allowed_hosts,
+                        *route_resolution.trusted_hosts,
                         *default_allowed_hosts(final_checked.hostname),
                     ]
                 )
@@ -418,6 +497,7 @@ async def probe_portal(*, root: Path, portal: dict[str, Any], run_session_id: st
         sample_job_urls=samples,
         artifacts=artifacts,
         acquisition=acquisition,
+        route_resolution=route_resolution.to_dict(),
     )
 
 

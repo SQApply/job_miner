@@ -73,6 +73,7 @@ def _progress(record: PortalCertificationRecord, position: int, total: int) -> N
         record.source_id,
         f"platform={record.detected_platform or 'unknown'}",
         f"surface={record.surface_kind or 'unknown'}",
+        f"route={record.resolved_route_url or '-'}",
         f"discovered={record.discovered_urls}",
         f"attempted={record.attempted_urls}",
         f"extracted={record.extracted_jobs}",

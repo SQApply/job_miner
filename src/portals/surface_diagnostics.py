@@ -4,12 +4,13 @@ import json
 from dataclasses import asdict, is_dataclass
 from html.parser import HTMLParser
 from types import SimpleNamespace
-from typing import Any, Iterable
+from typing import Any
 from urllib.parse import urljoin
 
 from ..extract.deterministic_lane import extract_job_from_result
 from .detector import detect_portal, infer_listing_url
 from .result_evidence import detection_html, result_page_quality
+from .route_resolver import resolve_listing_route
 from .url_intelligence import (
     assess_llm_eligibility,
     promote_trusted_detail_url,
@@ -234,6 +235,8 @@ def _failure_stage(
     html_length: int,
     pipeline_inferred_listing: str | None,
     promoted_detail_url: str | None,
+    route_resolved: bool = False,
+    evidence_gap: bool = False,
 ) -> str:
     if not success:
         return "acquisition_failed"
@@ -244,6 +247,14 @@ def _failure_stage(
     if blocked:
         return "access_control_detected"
     if mode == "listing":
+        if evidence_gap:
+            return "pipeline_evidence_gap"
+        if (
+            route_resolved
+            and inferred_listing
+            and inferred_listing.rstrip("/") != requested_url.rstrip("/")
+        ):
+            return "listing_route_transition_detected"
         if (
             inferred_listing
             and inferred_listing.rstrip("/") != requested_url.rstrip("/")
@@ -291,6 +302,20 @@ def build_surface_report(result: Any, *, requested_url: str, mode: str) -> dict[
     )
     pipeline_inferred_listing = infer_listing_url(requested_url, pipeline_detection_html)
     inferred_listing = infer_listing_url(requested_url, normalized_detection_html)
+    final_url = str(
+        getattr(result, "url", "")
+        or getattr(result, "redirected_url", "")
+        or requested_url
+    )
+    route_resolution = resolve_listing_route(
+        source_url=requested_url,
+        final_url=final_url,
+        html=normalized_detection_html,
+        structured_links=normalized_links,
+    )
+    resolved_listing = (
+        route_resolution.selected.url if route_resolution.selected is not None else None
+    )
     candidates, ranking = rank_job_candidate_urls(
         link_urls,
         listing_url=requested_url,
@@ -321,7 +346,7 @@ def build_surface_report(result: Any, *, requested_url: str, mode: str) -> dict[
     page_quality = result_page_quality(result)
 
     return {
-        "contract_version": "1.0",
+        "contract_version": "1.1",
         "requested_url": requested_url,
         "mode": mode,
         "result": {
@@ -345,6 +370,8 @@ def build_surface_report(result: Any, *, requested_url: str, mode: str) -> dict[
         "page_quality": page_quality.to_dict(),
         "pipeline_inferred_listing_url": pipeline_inferred_listing,
         "inferred_listing_url": inferred_listing,
+        "resolved_listing_url": resolved_listing,
+        "route_resolution": route_resolution.to_dict(),
         "evidence_gap": {
             "present": bool(inferred_listing and not pipeline_inferred_listing),
             "reason": (
@@ -363,7 +390,7 @@ def build_surface_report(result: Any, *, requested_url: str, mode: str) -> dict[
             success=success,
             blocked=bool(detection.blocked or page_quality.blocked),
             candidates=candidates,
-            inferred_listing=inferred_listing,
+            inferred_listing=resolved_listing or inferred_listing,
             requested_url=requested_url,
             job=job,
             llm_eligible=llm_eligible,
@@ -371,6 +398,8 @@ def build_surface_report(result: Any, *, requested_url: str, mode: str) -> dict[
             html_length=len(html),
             pipeline_inferred_listing=pipeline_inferred_listing,
             promoted_detail_url=promoted_detail_url,
+            route_resolved=route_resolution.selected is not None,
+            evidence_gap=bool(inferred_listing and not pipeline_inferred_listing),
         ),
     }
 
@@ -387,6 +416,7 @@ def report_summary(report: dict[str, Any]) -> str:
             f"structured_links={sum((result.get('link_counts') or {}).values())}",
             f"candidates={ranking.get('selected_urls', 0)}",
             f"platform={(report.get('detection') or {}).get('source_platform')}",
+            f"route={'resolved' if report.get('resolved_listing_url') else 'none'}",
             f"quality={'blocked' if page_quality.get('blocked') else 'usable'}",
             f"detail_transition={'true' if report.get('promoted_detail_url') else 'false'}",
         )
