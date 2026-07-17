@@ -81,11 +81,24 @@ _LISTING_PATH_PATTERN = re.compile(
 
 _DETAIL_PATH_PATTERN = re.compile(
     r"/jobs?/details?(?:/|$)|"
-    r"/jobs?/\d+(?:/|$)|"
+    r"/jobs?/\d+(?:[-_/]|$)|"
     r"/(?:job|position|posting|requisition)/[^/]+|"
-    r"/(?:jb|job-board)/[^/]+/\d+(?:/|$)",
+    r"/(?:jb|job-board)/[^/]+/\d+(?:/|$)|"
+    r"/(?:view|show)[-_]?job(?:[_.-]|/|$)",
     flags=re.IGNORECASE,
 )
+
+_DETAIL_QUERY_KEYS = {
+    "gh_jid",
+    "job",
+    "job_id",
+    "jobid",
+    "jid",
+    "posting_id",
+    "postingid",
+    "reqid",
+    "requisitionid",
+}
 
 _JOB_QUERY_KEYS = {
     "careerid",
@@ -401,6 +414,47 @@ def _is_pagination_only(source_url: str, candidate_url: str) -> bool:
     return bool(changed_keys) and changed_keys <= (_PAGINATION_QUERY_KEYS | source_keys)
 
 
+def _listing_path_strength(path: str) -> int:
+    normalized = re.sub(r"/{2,}", "/", str(path or "/").lower()).rstrip("/") or "/"
+    if re.search(
+        r"(?:^|/)(?:job-search|search-jobs|search-results[^/]*|job-openings|open-positions)(?:/|$)",
+        normalized,
+    ):
+        return 3
+    if re.search(r"(?:^|/)(?:jobs|openings|vacancies)(?:/|$)", normalized):
+        return 2
+    if _LISTING_PATH_PATTERN.search(normalized):
+        return 1
+    return 0
+
+
+def _looks_like_detail_route(path: str, query_keys: set[str], fragment: str) -> bool:
+    normalized_path = re.sub(r"/{2,}", "/", str(path or "/"))
+    if _DETAIL_PATH_PATTERN.search(normalized_path) or query_keys & _DETAIL_QUERY_KEYS:
+        return True
+
+    # Common custom boards use /jobs/<slug>-12345, /jobs/12345-title, or a
+    # numeric hash route. These are detail pages even though the segment is not
+    # purely numeric, and must never become the fleet's canonical listing URL.
+    parts = [part for part in normalized_path.split("/") if part]
+    lowered_parts = [part.lower() for part in parts]
+    for index, part in enumerate(parts[:-1]):
+        if part.lower() not in {"job", "jobs", "position", "positions"}:
+            continue
+        identifier = parts[index + 1]
+        if re.search(r"(?:^\d{4,}(?:[-_]|$)|[-_]\d{4,}(?:[-_]|$))", identifier):
+            return True
+        if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", identifier, re.I):
+            return True
+    if any(part.startswith("viewjob") for part in lowered_parts):
+        return True
+
+    fragment_value = str(fragment or "").lower().lstrip("!/")
+    if re.search(r"(?:^|/)jobs?/\d{4,}(?:/|$)", fragment_value):
+        return True
+    return False
+
+
 def _score_candidate(
     accumulator: _EvidenceAccumulator,
     *,
@@ -426,8 +480,8 @@ def _score_candidate(
     related = hosts_are_related(source_host, hostname)
     cross_domain = hostname != source_host
     listing_path = bool(_LISTING_PATH_PATTERN.search(path))
-    detail_path = bool(_DETAIL_PATH_PATTERN.search(path))
     query_keys = {key.lower() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    detail_path = _looks_like_detail_route(path, query_keys, parsed.fragment)
     hash_listing = bool(_tokens(parsed.fragment) & {"career", "careers", "job", "jobs", "openings"})
     strong_label = any(label in label_text for label in _STRONG_LISTING_LABELS)
     weak_label = any(label in label_text for label in _WEAK_LISTING_LABELS)
@@ -451,6 +505,20 @@ def _score_candidate(
         )
     )
     if detail_path or provider_detail_path:
+        return None
+
+    source_strength = _listing_path_strength(source.path)
+    candidate_strength = _listing_path_strength(path)
+    if (
+        hostname == source_host
+        and source_strength >= 2
+        and candidate_strength <= source_strength
+        and not platform
+        and not ({"iframe", "config", "redirect"} & sources)
+    ):
+        # Once already on a strong listing/results route, do not bounce to a
+        # peer locale or navigation route. The current document should be
+        # harvested; equal-strength routes caused the observed fleet loops.
         return None
     negative = route_tokens & _NEGATIVE_ROUTE_TOKENS
     if negative and not strong_label and not platform and not ({"iframe", "redirect"} & sources):

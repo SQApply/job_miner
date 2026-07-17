@@ -111,6 +111,19 @@ def _safe_token(value: Any) -> str | None:
     return None
 
 
+def _workday_site_from_path(parts: list[str]) -> str | None:
+    """Parse both /en-US/Site and modern one-segment /Site Workday boards."""
+
+    if not parts:
+        return None
+    first = str(parts[0] or "").strip()
+    if first.lower() in {"job", "wday"}:
+        return None
+    locale_prefixed = bool(re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", first, re.I))
+    candidate = parts[1] if locale_prefixed and len(parts) >= 2 else first
+    return _safe_token(candidate)
+
+
 def known_browser_ats_platform(value: str) -> str | None:
     try:
         hostname = (urlsplit(value).hostname or value).lower().rstrip(".")
@@ -284,8 +297,8 @@ def _acquisition_signature(listing_url: str, page_content: str) -> tuple[str, di
                 return "ashby", {"listing_url": candidate, "board_token": safe}
 
         workday = re.fullmatch(r"(?P<tenant>[a-z0-9-]+)(?:\.wd\d+)?\.myworkdayjobs\.com", hostname)
-        if workday and len(parts) >= 2:
-            site = _safe_token(parts[1])
+        if workday:
+            site = _workday_site_from_path(parts)
             if site:
                 return "workday", {
                     "listing_url": candidate,

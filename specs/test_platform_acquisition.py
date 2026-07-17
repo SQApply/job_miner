@@ -10,6 +10,7 @@ from src.portals.acquisition import (
     AcquisitionHttpError,
     AcquisitionContext,
     AcquisitionRegistry,
+    _ValidatedPublicRedirectHandler,
     _validated_same_host_redirect,
 )
 from src.portals.detector import detect_portal
@@ -51,6 +52,36 @@ class AcquisitionRedirectSafetyTests(unittest.TestCase):
             )
 
         self.assertEqual(redirected, "https://jobs.example.com/feed?page=1")
+
+    def test_generic_html_redirect_validates_destination_before_following(self) -> None:
+        handler = _ValidatedPublicRedirectHandler()
+        destination = SimpleNamespace(
+            normalized_url="https://jobs.vendor.example/openings",
+            hostname="jobs.vendor.example",
+        )
+        with patch(
+            "src.portals.acquisition.validate_public_http_url",
+            return_value=destination,
+        ) as validate, patch(
+            "src.portals.acquisition.HTTPRedirectHandler.redirect_request",
+            return_value="request",
+        ) as parent:
+            request = handler.redirect_request(
+                SimpleNamespace(full_url="https://old.example/careers"),
+                None,
+                302,
+                "Found",
+                {},
+                "https://jobs.vendor.example/openings",
+            )
+
+        self.assertEqual(request, "request")
+        validate.assert_called_once_with("https://jobs.vendor.example/openings")
+        self.assertEqual(
+            handler.redirect_chain,
+            ["https://jobs.vendor.example/openings"],
+        )
+        self.assertEqual(parent.call_args.args[-1], "https://jobs.vendor.example/openings")
 
 
 class FakeJsonClient:
@@ -251,6 +282,43 @@ class PlatformAcquisitionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(production.selected)
         self.assertEqual(production.attempts[0]["status"], "incomplete")
+
+    async def test_workday_one_segment_site_does_not_mistake_jobs_for_site_token(self) -> None:
+        client = FakeJsonClient(
+            [
+                {
+                    "total": 1,
+                    "jobPostings": [{"externalPath": "/job/Chicago/platform-engineer_JR1"}],
+                }
+            ]
+        )
+        outcome = await AcquisitionRegistry(client=client).acquire(
+            AcquisitionContext(
+                listing_url=(
+                    "https://chghealthcare.wd1.myworkdayjobs.com/External/jobs"
+                    "?q=Weatherby"
+                ),
+                max_pages=1,
+                require_complete=False,
+            )
+        )
+
+        selected = outcome.selected
+        assert selected is not None
+        self.assertEqual(selected.platform, "workday")
+        self.assertEqual(selected.metadata["site"], "External")
+        self.assertIn("/wday/cxs/chghealthcare/External/jobs", client.calls[0]["url"])
+
+    def test_detector_finds_one_segment_workday_board_without_yaml(self) -> None:
+        route = "https://chghealthcare.wd1.myworkdayjobs.com/External?q=Weatherby"
+        detected = detect_portal(
+            listing_url="https://weatherby.example/careers",
+            html=f'<a href="{route}">Search Jobs</a>',
+        )
+
+        self.assertEqual(detected.source_platform, "workday")
+        self.assertEqual(detected.acquisition_hints["site_token"], "External")
+        self.assertEqual(detected.acquisition_hints["listing_url"], route)
 
     async def test_orchestrator_skips_browser_and_llm_for_preextracted_feed_jobs(self) -> None:
         hub = BlueprintHub(ROOT)

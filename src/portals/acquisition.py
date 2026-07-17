@@ -135,6 +135,22 @@ class AsyncJsonClient(Protocol):
         timeout_seconds: float = 20.0,
     ) -> str: ...
 
+    async def request_public_text(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float = 20.0,
+    ) -> "PublicTextResponse": ...
+
+
+@dataclass(frozen=True)
+class PublicTextResponse:
+    """A public HTML response with a fully validated redirect evidence chain."""
+
+    document: str
+    final_url: str
+    redirect_chain: tuple[str, ...] = ()
+
 
 def _validated_same_host_redirect(source_url: str, destination_url: str) -> str:
     source = validate_public_http_url(source_url)
@@ -154,12 +170,50 @@ class _PublicSameHostRedirectHandler(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, safe_url)
 
 
+class _ValidatedPublicRedirectHandler(HTTPRedirectHandler):
+    """Follow only public HTTP(S) redirects and retain their exact evidence."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.redirect_chain: list[str] = []
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        destination = validate_public_http_url(urljoin(req.full_url, newurl))
+        self.redirect_chain.append(destination.normalized_url)
+        return super().redirect_request(
+            req,
+            fp,
+            code,
+            msg,
+            headers,
+            destination.normalized_url,
+        )
+
+
 def _open_public_request(request: Request, *, timeout_seconds: float):
     validate_public_http_url(request.full_url)
     return build_opener(_PublicSameHostRedirectHandler()).open(
         request,
         timeout=timeout_seconds,
     )
+
+
+def _open_public_html_request(request: Request, *, timeout_seconds: float):
+    """Open generic HTML while validating every redirect destination.
+
+    Fixed ATS/API clients continue to use ``_open_public_request`` and therefore
+    retain their strict same-host redirect contract. Generic public HTML may
+    legitimately move to a new corporate or hosted-jobs domain; each hop is DNS
+    checked before urllib is allowed to send the next request.
+    """
+
+    validate_public_http_url(request.full_url)
+    redirect_handler = _ValidatedPublicRedirectHandler()
+    response = build_opener(redirect_handler).open(
+        request,
+        timeout=timeout_seconds,
+    )
+    return response, tuple(redirect_handler.redirect_chain)
 
 
 class UrlLibJsonClient:
@@ -224,6 +278,34 @@ class UrlLibJsonClient:
                     break
             await asyncio.sleep(min(2 ** (attempt - 1), 4))
         raise AcquisitionHttpError(f"ATS endpoint request failed: {last_error}") from last_error
+
+    async def request_public_text(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float = 20.0,
+    ) -> PublicTextResponse:
+        """Fetch generic public HTML and return its validated redirect chain."""
+
+        last_error: BaseException | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                return await asyncio.to_thread(
+                    self._request_public_text_once,
+                    url,
+                    max(1.0, float(timeout_seconds)),
+                )
+            except AcquisitionHttpError as exc:
+                last_error = exc
+                retryable = exc.status_code in {408, 425, 429, 500, 502, 503, 504}
+                if not retryable or attempt >= self.max_attempts:
+                    raise
+            except (TimeoutError, URLError) as exc:
+                last_error = exc
+                if attempt >= self.max_attempts:
+                    break
+            await asyncio.sleep(min(2 ** (attempt - 1), 4))
+        raise AcquisitionHttpError(f"Public HTML request failed: {last_error}") from last_error
 
     def _request_once(
         self,
@@ -290,6 +372,47 @@ class UrlLibJsonClient:
             return raw.decode(charset, errors="replace")
         except LookupError:
             return raw.decode("utf-8", errors="replace")
+
+    def _request_public_text_once(
+        self,
+        url: str,
+        timeout_seconds: float,
+    ) -> PublicTextResponse:
+        request = Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "text/html,application/xhtml+xml",
+                "User-Agent": "JobMiner/1.0 (+public-job-feed-client)",
+            },
+        )
+        try:
+            response, redirect_chain = _open_public_html_request(
+                request,
+                timeout_seconds=timeout_seconds,
+            )
+            with response:
+                final = validate_public_http_url(response.geturl())
+                raw = response.read(self.max_response_bytes + 1)
+                charset = response.headers.get_content_charset() or "utf-8"
+        except HTTPError as exc:
+            raise AcquisitionHttpError(
+                f"Public HTML endpoint returned HTTP {exc.code}",
+                status_code=int(exc.code),
+            ) from exc
+        if len(raw) > self.max_response_bytes:
+            raise AcquisitionHttpError(
+                "Public HTML endpoint response exceeded the configured size limit"
+            )
+        try:
+            document = raw.decode(charset, errors="replace")
+        except LookupError:
+            document = raw.decode("utf-8", errors="replace")
+        return PublicTextResponse(
+            document=document,
+            final_url=final.normalized_url,
+            redirect_chain=redirect_chain,
+        )
 
 
 @dataclass(frozen=True)
@@ -620,6 +743,23 @@ _WORKDAY_HOST_PATTERN = re.compile(
     r"^(?P<tenant>[a-z0-9-]+)(?:\.wd\d+)?\.myworkdayjobs\.com$",
     re.IGNORECASE,
 )
+_WORKDAY_LOCALE_PATTERN = re.compile(r"^[a-z]{2}(?:-[a-z]{2})?$", re.IGNORECASE)
+
+
+def _workday_site_from_path(parts: list[str]) -> str | None:
+    """Return the tenant site for locale-prefixed and one-segment Workday URLs."""
+
+    if not parts:
+        return None
+    first = str(parts[0] or "").strip()
+    if first.lower() in {"job", "wday"}:
+        return None
+    candidate = (
+        parts[1]
+        if _WORKDAY_LOCALE_PATTERN.fullmatch(first) and len(parts) >= 2
+        else first
+    )
+    return _safe_token(candidate)
 
 
 def _workday_match(url: str) -> ProviderMatch | None:
@@ -630,9 +770,9 @@ def _workday_match(url: str) -> ProviderMatch | None:
     hostname = str(parsed.hostname or "").lower()
     host_match = _WORKDAY_HOST_PATTERN.fullmatch(hostname)
     parts = [part for part in parsed.path.split("/") if part]
-    if not host_match or len(parts) < 2:
+    if not host_match:
         return None
-    site = _safe_token(parts[1])
+    site = _workday_site_from_path(parts)
     if not site:
         return None
     return ProviderMatch(
@@ -1093,7 +1233,8 @@ class PublicHtmlProvider:
         client: AsyncJsonClient,
     ) -> AcquisitionResult:
         request_text = getattr(client, "request_text", None)
-        if not callable(request_text):
+        request_public_text = getattr(client, "request_public_text", None)
+        if not callable(request_text) and not callable(request_public_text):
             raise AcquisitionError("The configured acquisition client does not support HTML")
 
         # Lazy imports keep acquisition providers independent of browser modules
@@ -1114,14 +1255,91 @@ class PublicHtmlProvider:
         blocked_reason: str | None = None
         trusted_hosts: set[str] = {str(match.metadata["hostname"]).lower()}
         route_resolution_chain: list[dict[str, Any]] = []
+        redirect_evidence: list[dict[str, Any]] = []
 
         while queue and requests < context.max_pages:
             page_url = queue.pop(0)
             if page_url in visited:
                 continue
             visited.add(page_url)
-            document = await request_text(page_url, timeout_seconds=context.timeout_seconds)
+            if callable(request_public_text):
+                public_response = await request_public_text(
+                    page_url,
+                    timeout_seconds=context.timeout_seconds,
+                )
+                if not isinstance(public_response, PublicTextResponse):
+                    raise AcquisitionError(
+                        "The public HTML client returned an invalid response contract"
+                    )
+            else:
+                public_response = PublicTextResponse(
+                    document=await request_text(
+                        page_url,
+                        timeout_seconds=context.timeout_seconds,
+                    ),
+                    final_url=page_url,
+                )
             requests += 1
+            document = public_response.document
+            if callable(request_public_text):
+                effective_checked = validate_public_http_url(
+                    public_response.final_url or page_url
+                )
+                effective_page_url = effective_checked.normalized_url
+                effective_host = effective_checked.hostname
+            else:
+                # Legacy/test text clients do not expose redirect evidence.
+                # Keep their historical behavior without performing a second
+                # DNS lookup, and never infer or trust a hidden redirect host.
+                try:
+                    parsed_page = urlsplit(page_url)
+                    page_port = parsed_page.port
+                except ValueError as exc:
+                    raise AcquisitionError("The HTML client received an invalid public URL") from exc
+                if (
+                    parsed_page.scheme.lower() not in {"http", "https"}
+                    or not parsed_page.hostname
+                    or parsed_page.username is not None
+                    or parsed_page.password is not None
+                    or page_port not in {None, 80, 443}
+                ):
+                    raise AcquisitionError("The HTML client received an invalid public URL")
+                effective_host = str(parsed_page.hostname).lower()
+                effective_netloc = (
+                    effective_host
+                    if page_port is None
+                    else f"{effective_host}:{page_port}"
+                )
+                effective_page_url = urlunsplit(
+                    (
+                        parsed_page.scheme.lower(),
+                        effective_netloc,
+                        parsed_page.path or "/",
+                        parsed_page.query,
+                        "",
+                    )
+                )
+            trusted_hosts.add(effective_host)
+            visited.add(effective_page_url)
+            if not _public_pagination_url(
+                effective_page_url,
+                listing_url=active_listing_url,
+            ):
+                active_listing_url = effective_page_url
+            if public_response.redirect_chain:
+                redirect_hosts: list[str] = []
+                for redirect_url in public_response.redirect_chain:
+                    redirect_checked = validate_public_http_url(redirect_url)
+                    trusted_hosts.add(redirect_checked.hostname)
+                    redirect_hosts.append(redirect_checked.hostname)
+                redirect_evidence.append(
+                    {
+                        "source_url": page_url,
+                        "final_url": effective_page_url,
+                        "redirect_chain": list(public_response.redirect_chain),
+                        "trusted_hosts": list(dict.fromkeys(redirect_hosts)),
+                    }
+                )
 
             quality = assess_page_quality(html=document)
             if quality.blocked:
@@ -1130,12 +1348,13 @@ class PublicHtmlProvider:
 
             resolution = resolve_listing_route(
                 source_url=page_url,
+                final_url=effective_page_url,
                 html=document,
             )
             resolved_route = resolution.selected
             if resolved_route is not None:
                 resolved_host = str(urlsplit(resolved_route.url).hostname or "").lower()
-                page_host = str(urlsplit(page_url).hostname or "").lower()
+                page_host = effective_host
                 if resolved_host != page_host:
                     try:
                         validate_public_http_url(resolved_route.url)
@@ -1155,8 +1374,12 @@ class PublicHtmlProvider:
                         }
                     )
 
-            inferred = resolved_route.url if resolved_route is not None else infer_listing_url(page_url, document)
-            if inferred and _public_pagination_url(inferred, listing_url=page_url):
+            inferred = (
+                resolved_route.url
+                if resolved_route is not None
+                else infer_listing_url(effective_page_url, document)
+            )
+            if inferred and _public_pagination_url(inferred, listing_url=effective_page_url):
                 # A numbered page is pagination evidence, not a new canonical
                 # listing route.
                 inferred = None
@@ -1172,7 +1395,7 @@ class PublicHtmlProvider:
                 pass
 
             for href in parser.hrefs:
-                candidate = urljoin(page_url, href)
+                candidate = urljoin(effective_page_url, href)
                 try:
                     candidate_host = str(urlsplit(candidate).hostname or "").lower()
                 except ValueError:
@@ -1181,7 +1404,7 @@ class PublicHtmlProvider:
                     continue
                 assessment = assess_job_candidate_url(
                     candidate,
-                    listing_url=page_url,
+                    listing_url=effective_page_url,
                     platform_hint=context.source_platform_hint,
                 )
                 if assessment.hard_reject or assessment.score < 8:
@@ -1193,7 +1416,7 @@ class PublicHtmlProvider:
             for href in parser.hrefs:
                 pagination_url = _public_pagination_url(
                     href,
-                    listing_url=page_url,
+                    listing_url=effective_page_url,
                 )
                 if not pagination_url:
                     continue
@@ -1225,6 +1448,7 @@ class PublicHtmlProvider:
                 "request_budget_exhausted": bool(queue),
                 "blocked_reason": blocked_reason,
                 "route_resolution_chain": route_resolution_chain[:25],
+                "redirect_evidence": redirect_evidence[:25],
             },
         )
 

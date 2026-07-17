@@ -4,7 +4,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from src.portals.acquisition import AcquisitionContext, AcquisitionRegistry, PublicHtmlProvider
+from src.portals.acquisition import (
+    AcquisitionContext,
+    AcquisitionRegistry,
+    PublicHtmlProvider,
+    PublicTextResponse,
+)
 from src.portals.route_resolver import (
     hosts_are_related,
     resolve_listing_route,
@@ -80,6 +85,31 @@ class ListingRouteResolverTests(unittest.TestCase):
 
         self.assertIsNone(resolution.selected)
         self.assertEqual(resolution.candidates, ())
+
+    def test_slugged_and_hash_detail_urls_are_not_promoted_to_listings(self) -> None:
+        resolution = resolve_listing_route(
+            source_url="https://careers.example.com/jobs",
+            html=(
+                '<a href="/jobs/ac-dc-power-solutions-engineer-247271/">Engineer</a>'
+                '<a href="/jobs/72187-field-service-engineer/">Field Engineer</a>'
+                '<a href="/#/jobs/26240">SPA Job</a>'
+                '<a href="/search/details/?job_id=13803">Search Result</a>'
+            ),
+        )
+
+        self.assertIsNone(resolution.selected)
+        self.assertEqual(resolution.candidates, ())
+
+    def test_existing_results_route_does_not_bounce_to_peer_locale(self) -> None:
+        resolution = resolve_listing_route(
+            source_url="https://jobs.example.com/us/en/search-results",
+            html=(
+                '<a href="/ca/search-results">Search Jobs Canada</a>'
+                '<a href="/ca/fr">Careers Canada French</a>'
+            ),
+        )
+
+        self.assertIsNone(resolution.selected)
 
     def test_careers_benefits_page_is_not_promoted_as_a_listing(self) -> None:
         resolution = resolve_listing_route(
@@ -203,7 +233,10 @@ class PublicHtmlRouteHandoffTests(unittest.IsolatedAsyncioTestCase):
         client = FakeClient()
         with patch(
             "src.portals.acquisition.validate_public_http_url",
-            return_value=SimpleNamespace(),
+            side_effect=lambda url: SimpleNamespace(
+                normalized_url=url,
+                hostname=str(url).split("/", 3)[2],
+            ),
         ):
             outcome = await AcquisitionRegistry(
                 client=client,
@@ -239,6 +272,65 @@ class PublicHtmlRouteHandoffTests(unittest.IsolatedAsyncioTestCase):
             "https://www.company.example/careers",
             "https://jobs.company.example/search-results",
         ])
+
+    async def test_static_lane_harvests_jobs_after_validated_cross_host_redirect(self) -> None:
+        class RedirectClient:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            async def request_public_text(self, url, *, timeout_seconds=20.0):
+                self.calls.append(url)
+                return PublicTextResponse(
+                    document=(
+                        '<h1>Job Openings</h1>'
+                        '<a href="/job/10001/platform-engineer">Platform Engineer</a>'
+                        '<a href="/job/10002/data-engineer">Data Engineer</a>'
+                    ),
+                    final_url="https://jobs.company.example/openings",
+                    redirect_chain=("https://jobs.company.example/openings",),
+                )
+
+            async def request_json(self, *args, **kwargs):
+                raise AssertionError("JSON acquisition was not expected")
+
+        client = RedirectClient()
+        with patch(
+            "src.portals.acquisition.validate_public_http_url",
+            side_effect=lambda url: SimpleNamespace(
+                normalized_url=url,
+                hostname=str(url).split("/", 3)[2],
+            ),
+        ):
+            outcome = await AcquisitionRegistry(
+                client=client,
+                providers=(PublicHtmlProvider(),),
+            ).acquire(
+                AcquisitionContext(
+                    listing_url="http://legacy.company.example/careers",
+                    source_platform_hint="custom_listing",
+                    max_pages=1,
+                    require_complete=False,
+                )
+            )
+
+        selected = outcome.selected
+        assert selected is not None
+        self.assertEqual(
+            selected.discovered_urls,
+            [
+                "https://jobs.company.example/job/10001/platform-engineer",
+                "https://jobs.company.example/job/10002/data-engineer",
+            ],
+        )
+        self.assertEqual(
+            selected.trusted_hosts,
+            ("jobs.company.example", "legacy.company.example"),
+        )
+        self.assertEqual(
+            selected.metadata["redirect_evidence"][0]["final_url"],
+            "https://jobs.company.example/openings",
+        )
+        self.assertEqual(client.calls, ["http://legacy.company.example/careers"])
 
 
 class PersistedRouteTrustTests(unittest.TestCase):
