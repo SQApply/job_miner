@@ -158,6 +158,13 @@ INDEXES: dict[str, list[IndexModel]] = {
         IndexModel([("source_id", ASCENDING), ("canonical_url", ASCENDING)], sparse=True),
         IndexModel([("extracted_at", DESCENDING)]),
     ],
+    "production_job_quarantine": [
+        IndexModel([("quarantine_id", ASCENDING)], unique=True),
+        IndexModel([("source_run_id", ASCENDING), ("raw_evidence_id", ASCENDING), ("candidate_identity", ASCENDING)], unique=True),
+        IndexModel([("fleet_run_id", ASCENDING), ("source_id", ASCENDING)]),
+        IndexModel([("review_status", ASCENDING), ("created_at", DESCENDING)]),
+        IndexModel([("reason_codes", ASCENDING)]),
+    ],
     "job_raw_extractions": [IndexModel([("raw_id", ASCENDING)], unique=True), IndexModel([("target_id", ASCENDING), ("source_url", ASCENDING)])],
     "jobs_current": [
         IndexModel([("job_id", ASCENDING)], unique=True),

@@ -140,6 +140,27 @@ class ProductionRawJobEvidenceDocument(MongoDocument):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProductionJobQuarantineDocument(MongoDocument):
+    """Immutable Phase 6D quality failure linked to raw extraction evidence."""
+
+    collection_name = "production_job_quarantine"
+    quarantine_id: str
+    fleet_run_id: str
+    source_run_id: str
+    source_id: str
+    raw_evidence_id: str
+    candidate_identity: str
+    reason_codes: list[str] = Field(default_factory=list)
+    reason_messages: list[str] = Field(default_factory=list)
+    field_errors: dict[str, list[str]] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+    quality_scores: dict[str, int] = Field(default_factory=dict)
+    normalized_candidate: dict[str, Any] = Field(default_factory=dict)
+    review_status: Literal["pending", "approved", "rejected"] = "pending"
+    reviewed_at: datetime | None = None
+    reviewed_by: str | None = None
+
+
 class JobCurrentDocument(MongoDocument):
     collection_name = "jobs_current"
     job_id: str
