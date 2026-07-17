@@ -161,6 +161,19 @@ INDEXES: dict[str, list[IndexModel]] = {
     "job_raw_extractions": [IndexModel([("raw_id", ASCENDING)], unique=True), IndexModel([("target_id", ASCENDING), ("source_url", ASCENDING)])],
     "jobs_current": [
         IndexModel([("job_id", ASCENDING)], unique=True),
+        IndexModel(
+            [("identity_hash", ASCENDING)],
+            unique=True,
+            partialFilterExpression={"identity_hash": {"$type": "string"}},
+        ),
+        IndexModel(
+            [("source_id", ASCENDING), ("external_job_id", ASCENDING)],
+            unique=True,
+            partialFilterExpression={
+                "source_id": {"$type": "string"},
+                "external_job_id": {"$type": "string"},
+            },
+        ),
         IndexModel([("target_id", ASCENDING), ("job_url", ASCENDING)], unique=True, sparse=True),
         IndexModel([("is_active", ASCENDING)]),
         IndexModel([("target_id", ASCENDING), ("is_active", ASCENDING), ("missing_count", ASCENDING)]),

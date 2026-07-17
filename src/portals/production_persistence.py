@@ -237,6 +237,7 @@ class ProductionIngestionPersistenceRepository:
         selected_source_ids: Sequence[str] | None = None,
         fleet_run_id: str | None = None,
         started_at: datetime | None = None,
+        normalized_job_writes_enabled: bool = False,
     ) -> ProductionIngestionFleetRunDocument:
         started = _require_aware_utc(
             started_at or datetime.now(timezone.utc),
@@ -250,7 +251,7 @@ class ProductionIngestionPersistenceRepository:
             raise ProductionPersistenceError("fleet_run_id cannot be empty")
         controls = {
             "persistence_writes_enabled": True,
-            "normalized_job_writes_enabled": False,
+            "normalized_job_writes_enabled": bool(normalized_job_writes_enabled),
             "lifecycle_reconciliation_enabled": False,
             "deactivation_enabled": False,
         }
@@ -519,9 +520,10 @@ class ProductionIngestionPersistenceRepository:
             "blocked_source_count": blocked_count,
             "cancelled_source_count": cancelled_count,
             "raw_evidence_count": int(raw_count),
-            "inserted_job_count": 0,
-            "updated_job_count": 0,
-            "unchanged_job_count": 0,
+            "inserted_job_count": sum(int(row.get("inserted_job_count") or 0) for row in source_rows),
+            "updated_job_count": sum(int(row.get("updated_job_count") or 0) for row in source_rows),
+            "unchanged_job_count": sum(int(row.get("unchanged_job_count") or 0) for row in source_rows),
+            "reactivated_job_count": sum(int(row.get("reactivated_job_count") or 0) for row in source_rows),
             "quarantined_job_count": sum(int(row.get("quarantined_count") or 0) for row in source_rows),
             "error_summary": errors,
             "updated_at": utc_now(),

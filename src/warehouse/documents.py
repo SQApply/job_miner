@@ -82,6 +82,7 @@ class ProductionIngestionFleetRunDocument(MongoDocument):
     inserted_job_count: int = Field(default=0, ge=0)
     updated_job_count: int = Field(default=0, ge=0)
     unchanged_job_count: int = Field(default=0, ge=0)
+    reactivated_job_count: int = Field(default=0, ge=0)
     quarantined_job_count: int = Field(default=0, ge=0)
     controls: dict[str, Any] = Field(default_factory=dict)
     error_summary: list[dict[str, Any]] = Field(default_factory=list)
@@ -107,6 +108,10 @@ class ProductionIngestionSourceRunDocument(MongoDocument):
     valid_count: int = Field(default=0, ge=0)
     quarantined_count: int = Field(default=0, ge=0)
     rejected_count: int = Field(default=0, ge=0)
+    inserted_job_count: int = Field(default=0, ge=0)
+    updated_job_count: int = Field(default=0, ge=0)
+    unchanged_job_count: int = Field(default=0, ge=0)
+    reactivated_job_count: int = Field(default=0, ge=0)
     elapsed_seconds: float | None = Field(default=None, ge=0)
     acquisition_strategy: str | None = None
     extractor_version: str | None = None
@@ -139,6 +144,10 @@ class JobCurrentDocument(MongoDocument):
     collection_name = "jobs_current"
     job_id: str
     target_id: str
+    source_id: str | None = None
+    external_job_id: str | None = None
+    identity_hash: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    identity_strategy: str | None = None
     source_url: str | None = None
     job_url: str | None = None
     canonical_job_url: str | None = None
@@ -162,6 +171,9 @@ class JobCurrentDocument(MongoDocument):
     last_deep_scraped_at: datetime | None = None
     last_missing_at: datetime | None = None
     last_run_session_id: str | None = None
+    last_fleet_run_id: str | None = None
+    last_source_run_id: str | None = None
+    raw_evidence_id: str | None = None
     missing_count: int = 0
     freshness_status: str = "active"
     inactive_reason: str | None = None
