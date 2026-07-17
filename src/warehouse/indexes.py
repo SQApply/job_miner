@@ -140,6 +140,24 @@ from pymongo.database import Database
 
 INDEXES: dict[str, list[IndexModel]] = {
     "warehouse_run_sessions": [IndexModel([("run_session_id", ASCENDING)], unique=True)],
+    "production_ingestion_fleet_runs": [
+        IndexModel([("fleet_run_id", ASCENDING)], unique=True),
+        IndexModel([("status", ASCENDING), ("started_at", DESCENDING)]),
+        IndexModel([("cohort_sha256", ASCENDING), ("started_at", DESCENDING)]),
+    ],
+    "production_ingestion_source_runs": [
+        IndexModel([("source_run_id", ASCENDING)], unique=True),
+        IndexModel([("fleet_run_id", ASCENDING), ("source_id", ASCENDING), ("attempt_number", ASCENDING)], unique=True),
+        IndexModel([("fleet_run_id", ASCENDING), ("status", ASCENDING)]),
+        IndexModel([("source_id", ASCENDING), ("started_at", DESCENDING)]),
+    ],
+    "production_raw_job_evidence": [
+        IndexModel([("evidence_id", ASCENDING)], unique=True),
+        IndexModel([("source_run_id", ASCENDING), ("payload_sha256", ASCENDING)], unique=True),
+        IndexModel([("fleet_run_id", ASCENDING), ("source_id", ASCENDING)]),
+        IndexModel([("source_id", ASCENDING), ("canonical_url", ASCENDING)], sparse=True),
+        IndexModel([("extracted_at", DESCENDING)]),
+    ],
     "job_raw_extractions": [IndexModel([("raw_id", ASCENDING)], unique=True), IndexModel([("target_id", ASCENDING), ("source_url", ASCENDING)])],
     "jobs_current": [
         IndexModel([("job_id", ASCENDING)], unique=True),

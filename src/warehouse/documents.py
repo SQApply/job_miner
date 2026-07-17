@@ -34,6 +34,107 @@ class JobRawExtractionDocument(MongoDocument):
     content_hash: str
 
 
+ProductionFleetRunStatus = Literal[
+    "running",
+    "completed",
+    "completed_with_failures",
+    "failed",
+    "cancelled",
+]
+ProductionSourceRunStatus = Literal[
+    "pending",
+    "running",
+    "success",
+    "failed",
+    "blocked",
+    "cancelled",
+]
+ProductionRawPayloadFormat = Literal[
+    "json",
+    "html",
+    "json_ld",
+    "api_response",
+    "rendered_state",
+    "normalized_scraper_output",
+    "text",
+]
+
+
+class ProductionIngestionFleetRunDocument(MongoDocument):
+    """Durable audit record for one Phase 6 production-ingestion fleet run."""
+
+    collection_name = "production_ingestion_fleet_runs"
+    fleet_run_id: str
+    phase: Literal["6B"] = "6B"
+    plan_id: str
+    cohort_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    status: ProductionFleetRunStatus = "running"
+    started_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+    selected_source_ids: list[str] = Field(default_factory=list)
+    requested_source_count: int = Field(default=0, ge=0)
+    completed_source_count: int = Field(default=0, ge=0)
+    successful_source_count: int = Field(default=0, ge=0)
+    failed_source_count: int = Field(default=0, ge=0)
+    blocked_source_count: int = Field(default=0, ge=0)
+    cancelled_source_count: int = Field(default=0, ge=0)
+    raw_evidence_count: int = Field(default=0, ge=0)
+    inserted_job_count: int = Field(default=0, ge=0)
+    updated_job_count: int = Field(default=0, ge=0)
+    unchanged_job_count: int = Field(default=0, ge=0)
+    quarantined_job_count: int = Field(default=0, ge=0)
+    controls: dict[str, Any] = Field(default_factory=dict)
+    error_summary: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ProductionIngestionSourceRunDocument(MongoDocument):
+    """Durable per-source execution record nested under a fleet run."""
+
+    collection_name = "production_ingestion_source_runs"
+    source_run_id: str
+    fleet_run_id: str
+    source_id: str
+    source_url: str
+    resolved_route_url: str | None = None
+    status: ProductionSourceRunStatus = "pending"
+    attempt_number: int = Field(default=1, ge=1)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    discovered_count: int = Field(default=0, ge=0)
+    attempted_count: int = Field(default=0, ge=0)
+    extracted_count: int = Field(default=0, ge=0)
+    raw_evidence_count: int = Field(default=0, ge=0)
+    valid_count: int = Field(default=0, ge=0)
+    quarantined_count: int = Field(default=0, ge=0)
+    rejected_count: int = Field(default=0, ge=0)
+    elapsed_seconds: float | None = Field(default=None, ge=0)
+    acquisition_strategy: str | None = None
+    extractor_version: str | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProductionRawJobEvidenceDocument(MongoDocument):
+    """Immutable raw evidence captured before normalization or job upsert."""
+
+    collection_name = "production_raw_job_evidence"
+    evidence_id: str
+    fleet_run_id: str
+    source_run_id: str
+    source_id: str
+    source_url: str | None = None
+    canonical_url: str | None = None
+    external_job_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    payload_format: ProductionRawPayloadFormat = "normalized_scraper_output"
+    payload_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    extracted_at: datetime = Field(default_factory=utc_now)
+    extractor_name: str
+    extractor_version: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class JobCurrentDocument(MongoDocument):
     collection_name = "jobs_current"
     job_id: str
