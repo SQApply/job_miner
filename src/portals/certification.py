@@ -829,6 +829,11 @@ class PortalFleetCertifier:
 
             extracted = len(orchestration.jobs)
             failures = len(orchestration.detail_failures)
+            discovered_candidate_count = (
+                len(orchestration.discovered_candidates)
+                or len(orchestration.discovered_job_urls)
+            )
+            linkless_candidate_count = orchestration.linkless_candidate_count
             error_type: str | None = None
             error_message: str | None = None
             if extracted == 0:
@@ -836,7 +841,9 @@ class PortalFleetCertifier:
                 certification_status = "needs_repair"
                 error_type = "zero_valid_jobs"
                 error_message = (
-                    f"Discovery selected {len(orchestration.discovered_job_urls)} candidate URLs, "
+                    f"Discovery selected {discovered_candidate_count} candidates "
+                    f"({len(orchestration.discovered_job_urls)} URL-backed, "
+                    f"{linkless_candidate_count} linkless), "
                     + (
                         "but grounded deterministic/LLM extraction produced no certifiable jobs"
                         if self.options.allow_llm_fallback
@@ -857,6 +864,13 @@ class PortalFleetCertifier:
 
             completed_at = _utc_now()
             discovery_quality = dict(orchestration.rescrape_plan.get("url_ranking") or {})
+            discovery_quality.update(
+                {
+                    "discovered_candidates": discovered_candidate_count,
+                    "url_backed_candidates": len(orchestration.discovered_job_urls),
+                    "linkless_candidates": linkless_candidate_count,
+                }
+            )
             return PortalCertificationRecord(
                 contract_version=CERTIFICATION_CONTRACT_VERSION,
                 run_id=run_id,

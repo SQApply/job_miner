@@ -24,6 +24,13 @@ from .acquisition import (
     AcquisitionRegistry,
     default_acquisition_registry,
 )
+from .contracts import (
+    CompletenessState,
+    DiscoveryBatch,
+    DiscoveryCandidate,
+    DiscoveryCandidateKind,
+    ScrapeStrategy,
+)
 from .page_quality import assess_page_quality
 from .url_intelligence import promote_trusted_detail_url
 
@@ -155,10 +162,17 @@ class OrchestratedScrapeResult:
     elapsed_seconds: float
     raw_discovered_urls: int = 0
     acquisition: dict[str, Any] = field(default_factory=dict)
+    discovered_candidates: list[DiscoveryCandidate] = field(default_factory=list)
+    attempted_candidate_ids: list[str] = field(default_factory=list)
+    discovery_batch: dict[str, Any] = field(default_factory=dict)
 
     @property
     def skipped_existing(self) -> int:
         return int(self.rescrape_plan.get("known_skipped") or 0)
+
+    @property
+    def linkless_candidate_count(self) -> int:
+        return sum(candidate.detail_url is None for candidate in self.discovered_candidates)
 
 
 @dataclass
@@ -302,8 +316,13 @@ class ScrapeOrchestrator:
                 }
 
         self._emit(hooks, "acquisition_complete", **acquisition)
+        discovery_batch: DiscoveryBatch
+        raw_candidate_count = 0
+        raw_url_count = 0
         if selected_acquisition is not None:
             raw_urls = list(selected_acquisition.discovered_urls)
+            raw_candidate_count = len(raw_urls)
+            raw_url_count = len(raw_urls)
             raw_preextracted_jobs = dict(selected_acquisition.preextracted_jobs)
             trusted_acquisition_hosts = tuple(selected_acquisition.trusted_hosts)
             normalizer = hooks.normalize_acquired_urls
@@ -323,6 +342,35 @@ class ScrapeOrchestrator:
                     if job.job_url == original_url and normalized_job_url != original_url:
                         job = job.model_copy(update={"job_url": normalized_job_url})
                     preextracted_jobs[normalized_job_url] = job
+            acquisition_candidates = [
+                DiscoveryCandidate.from_url(
+                    url,
+                    evidence={
+                        "origin": "platform_acquisition",
+                        "platform": selected_acquisition.platform,
+                        "strategy": selected_acquisition.strategy,
+                    },
+                    preextracted_job=preextracted_jobs.get(url),
+                )
+                for url in discovered_urls
+            ]
+            discovery_batch = DiscoveryBatch(
+                strategy=ScrapeStrategy.PLATFORM_API,
+                completeness=(
+                    CompletenessState.COMPLETE
+                    if selected_acquisition.complete and acquisition_candidates
+                    else CompletenessState.PARTIAL
+                ),
+                candidates=acquisition_candidates,
+                pages_visited=selected_acquisition.pages_visited,
+                pagination_complete=bool(
+                    selected_acquisition.complete and acquisition_candidates
+                ),
+                metrics={
+                    "origin": "platform_acquisition",
+                    "endpoint_requests": selected_acquisition.endpoint_requests,
+                },
+            )
             self._emit(
                 hooks,
                 "acquisition_selected",
@@ -339,32 +387,65 @@ class ScrapeOrchestrator:
                 page_url=self.blueprint.listing.page_url,
                 attempts=acquisition.get("attempts") or [],
             )
-            raw_urls = await self.adapter.discover_job_urls(
+            raw_discovery_batch = await self._discover_adapter_candidates(
                 crawler,
-                self.blueprint,
-                self.system_config,
-                session_logger=hooks.adapter_session_logger,
+                hooks,
             )
-            discovered_urls, rejected = hooks.normalize_discovered_urls(list(raw_urls or []))
+            raw_urls = raw_discovery_batch.discovered_urls
+            raw_url_count = int(
+                raw_discovery_batch.metrics.get("raw_url_candidates") or len(raw_urls)
+            )
+            raw_candidate_count = max(
+                len(raw_discovery_batch.candidates),
+                int(raw_discovery_batch.metrics.get("raw_url_candidates") or 0),
+            )
+            discovery_batch, rejected = self._normalize_candidate_batch(
+                raw_discovery_batch,
+                hooks.normalize_discovered_urls,
+            )
+            discovered_urls = discovery_batch.discovered_urls
+            for candidate in discovery_batch.candidates:
+                if candidate.detail_url and candidate.preextracted_job is not None:
+                    preextracted_jobs[candidate.detail_url] = candidate.preextracted_job
         rejected_urls += rejected
         discovered_urls, discovery_ranking = hooks.rank_discovered_urls(discovered_urls)
+        discovery_batch = self._rank_candidate_batch(discovery_batch, discovered_urls)
+        discovered_candidates = list(discovery_batch.candidates)
+        linkless_candidates = list(discovery_batch.linkless_candidates)
         self._emit(
             hooks,
             "discovery_complete",
-            raw_discovered_urls=len(raw_urls or []),
+            raw_discovered_urls=raw_url_count,
+            raw_discovered_candidates=raw_candidate_count,
             discovered_urls=len(discovered_urls),
+            discovered_candidates=len(discovered_candidates),
+            linkless_candidates=len(linkless_candidates),
             rejected_urls=rejected,
         )
         self._emit(hooks, "discovery_ranked", **discovery_ranking)
 
-        if not discovered_urls and options.fail_on_zero_discovery:
+        if not discovered_candidates and options.fail_on_zero_discovery:
             self._emit(
                 hooks,
                 "discovery_failed_zero_urls",
                 page_url=self.blueprint.listing.page_url,
-                message="A job portal discovery run returned zero valid URLs and is not complete.",
+                message=(
+                    "A job portal discovery run returned zero valid job URLs or "
+                    "linkless candidates and is not complete."
+                ),
             )
-            raise RuntimeError(f"Target {self.blueprint.id} discovered zero valid job URLs")
+            raise RuntimeError(
+                f"Target {self.blueprint.id} discovered zero valid job URLs or candidates"
+            )
+
+        if linkless_candidates:
+            self._emit(
+                hooks,
+                "linkless_candidates_deferred",
+                candidates=len(linkless_candidates),
+                candidate_ids=[candidate.candidate_id for candidate in linkless_candidates],
+                reason="Phase 7A records linkless candidates; browser interaction lands in Phase 7C.",
+            )
 
         if hooks.on_discovery_artifacts is not None:
             artifacts.extend(hooks.on_discovery_artifacts(discovered_urls) or [])
@@ -382,6 +463,8 @@ class ScrapeOrchestrator:
 
         rescrape_plan = dict(rescrape_plan or {})
         rescrape_plan.setdefault("discovered_urls", len(discovered_urls))
+        rescrape_plan["discovered_candidates"] = len(discovered_candidates)
+        rescrape_plan["linkless_candidates_deferred"] = len(linkless_candidates)
         rescrape_plan["urls_to_extract_count"] = len(attempted_urls)
         rescrape_plan["url_ranking"] = dict(discovery_ranking)
         self._emit(hooks, "rescrape_plan_complete", **rescrape_plan)
@@ -395,6 +478,17 @@ class ScrapeOrchestrator:
                     "bounded_urls_to_extract_count": len(attempted_urls),
                 }
             )
+
+        candidate_by_url = {
+            candidate.detail_url: candidate
+            for candidate in discovered_candidates
+            if candidate.detail_url is not None
+        }
+        attempted_candidate_ids = [
+            candidate_by_url[url].candidate_id
+            for url in attempted_urls
+            if url in candidate_by_url
+        ]
 
         concurrency = max(1, min(options.detail_concurrency, len(attempted_urls) or 1))
         semaphore = asyncio.Semaphore(concurrency)
@@ -982,8 +1076,145 @@ class ScrapeOrchestrator:
             artifacts=artifacts,
             rescrape_plan=rescrape_plan,
             elapsed_seconds=elapsed_seconds,
-            raw_discovered_urls=len(raw_urls or []),
+            raw_discovered_urls=raw_url_count,
             acquisition=acquisition,
+            discovered_candidates=discovered_candidates,
+            attempted_candidate_ids=attempted_candidate_ids,
+            discovery_batch=discovery_batch.model_dump(mode="json"),
+        )
+
+    async def _discover_adapter_candidates(
+        self,
+        crawler: Any,
+        hooks: ScrapeOrchestratorHooks,
+    ) -> DiscoveryBatch:
+        discover_candidates = getattr(self.adapter, "discover_candidates", None)
+        if callable(discover_candidates):
+            batch = await discover_candidates(
+                crawler,
+                self.blueprint,
+                self.system_config,
+                session_logger=hooks.adapter_session_logger,
+            )
+            if not isinstance(batch, DiscoveryBatch):
+                raise TypeError("discover_candidates() must return DiscoveryBatch")
+            return batch
+
+        raw_urls = await self.adapter.discover_job_urls(
+            crawler,
+            self.blueprint,
+            self.system_config,
+            session_logger=hooks.adapter_session_logger,
+        )
+        return DiscoveryBatch.from_urls(
+            list(raw_urls or []),
+            strategy=ScrapeStrategy.BLUEPRINT_DOM,
+            metrics={"adapter_mode": "legacy_url_projection"},
+        )
+
+    @staticmethod
+    def _normalize_candidate_batch(
+        batch: DiscoveryBatch,
+        normalizer: DiscoveryNormalizer,
+    ) -> tuple[DiscoveryBatch, int]:
+        normalized_candidates: list[DiscoveryCandidate] = []
+        seen_urls: set[str] = set()
+        rejected = int(batch.metrics.get("deduplicated_url_candidates") or 0) + int(
+            batch.metrics.get("invalid_url_candidates") or 0
+        )
+
+        for candidate in batch.candidates:
+            if candidate.detail_url is None:
+                normalized_candidates.append(candidate)
+                continue
+
+            normalized_urls, local_rejected = normalizer([candidate.detail_url])
+            normalized_urls = [str(url).strip() for url in normalized_urls if str(url).strip()]
+            if not normalized_urls:
+                rejected += max(1, int(local_rejected or 0))
+                continue
+
+            for normalized_url in normalized_urls:
+                if normalized_url in seen_urls:
+                    rejected += 1
+                    continue
+                seen_urls.add(normalized_url)
+                update: dict[str, Any] = {"detail_url": normalized_url}
+                if (
+                    candidate.kind == DiscoveryCandidateKind.URL
+                    and normalized_url != candidate.detail_url
+                ):
+                    update["candidate_id"] = DiscoveryCandidate.from_url(
+                        normalized_url,
+                        source_job_id=candidate.source_job_id,
+                    ).candidate_id
+                if (
+                    candidate.preextracted_job is not None
+                    and candidate.preextracted_job.job_url == candidate.detail_url
+                    and normalized_url != candidate.detail_url
+                ):
+                    update["preextracted_job"] = candidate.preextracted_job.model_copy(
+                        update={"job_url": normalized_url}
+                    )
+                normalized_candidates.append(candidate.model_copy(update=update))
+
+        metrics = dict(batch.metrics)
+        metrics.update(
+            {
+                "normalized_candidates": len(normalized_candidates),
+                "normalization_rejected": rejected,
+            }
+        )
+        has_candidates = bool(normalized_candidates)
+        return (
+            DiscoveryBatch(
+                batch_version=batch.batch_version,
+                strategy=batch.strategy,
+                completeness=(
+                    batch.completeness if has_candidates else CompletenessState.PARTIAL
+                ),
+                candidates=normalized_candidates,
+                pages_visited=batch.pages_visited,
+                pagination_complete=batch.pagination_complete if has_candidates else False,
+                reasons=list(batch.reasons),
+                metrics=metrics,
+            ),
+            rejected,
+        )
+
+    @staticmethod
+    def _rank_candidate_batch(
+        batch: DiscoveryBatch,
+        ranked_urls: list[str],
+    ) -> DiscoveryBatch:
+        candidate_by_url = {
+            candidate.detail_url: candidate
+            for candidate in batch.candidates
+            if candidate.detail_url is not None
+        }
+        ranked_candidates = [
+            candidate_by_url.get(url) or DiscoveryCandidate.from_url(url)
+            for url in ranked_urls
+        ]
+        ranked_candidates.extend(batch.linkless_candidates)
+        has_candidates = bool(ranked_candidates)
+        completeness = batch.completeness if has_candidates else CompletenessState.PARTIAL
+        metrics = dict(batch.metrics)
+        metrics.update(
+            {
+                "ranked_url_candidates": len(ranked_urls),
+                "linkless_candidates": len(batch.linkless_candidates),
+            }
+        )
+        return DiscoveryBatch(
+            batch_version=batch.batch_version,
+            strategy=batch.strategy,
+            completeness=completeness,
+            candidates=ranked_candidates,
+            pages_visited=batch.pages_visited,
+            pagination_complete=batch.pagination_complete if has_candidates else False,
+            reasons=list(batch.reasons),
+            metrics=metrics,
         )
 
     @staticmethod

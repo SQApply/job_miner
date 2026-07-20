@@ -75,6 +75,22 @@ class CertificationStatus(str, Enum):
     FAILED = "failed"
 
 
+class DiscoveryCandidateKind(str, Enum):
+    """How a discovered job can be opened or extracted.
+
+    URL preserves the existing scraper behavior.  The remaining kinds are the
+    stable contract needed by the Phase 7 browser-evidence lanes; importantly,
+    none of them requires an XPath or even a detail URL.
+    """
+
+    URL = "url"
+    API_RECORD = "api_record"
+    DOM_CLICK = "dom_click"
+    MODAL = "modal"
+    INLINE = "inline"
+    FRAME = "frame"
+
+
 DEFAULT_STRATEGY_ORDER = [
     ScrapeStrategy.PLATFORM_API,
     ScrapeStrategy.NETWORK_JSON,
@@ -225,6 +241,211 @@ def source_contract_from_blueprint(blueprint: ResolvedBlueprint) -> SourceContra
     )
 
 
+def _candidate_id(kind: DiscoveryCandidateKind, identity: str) -> str:
+    digest = hashlib.sha256(f"{kind.value}:{identity}".encode("utf-8")).hexdigest()[:24]
+    return f"{kind.value}_{digest}"
+
+
+class DiscoveryCandidate(ContractModel):
+    """A job-like unit discovered from a URL, API response, or live DOM.
+
+    ``node_token`` is an ephemeral browser-session handle, not a persisted CSS
+    selector or XPath.  ``candidate_id`` is supplied by native discovery lanes
+    from stable evidence (for example an external id or structural signature).
+    """
+
+    candidate_id: str = Field(min_length=3, max_length=200)
+    kind: DiscoveryCandidateKind
+    detail_url: str | None = Field(default=None, max_length=4096)
+    apply_url: str | None = Field(default=None, max_length=4096)
+    source_job_id: str | None = Field(default=None, max_length=500)
+    title_hint: str | None = Field(default=None, max_length=1000)
+    location_hint: str | None = Field(default=None, max_length=1000)
+    node_token: str | None = Field(default=None, max_length=500)
+    frame_url: str | None = Field(default=None, max_length=4096)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    preextracted_job: JobPosting | None = None
+
+    @field_validator(
+        "detail_url",
+        "apply_url",
+        "source_job_id",
+        "title_hint",
+        "location_hint",
+        "node_token",
+        "frame_url",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_text(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
+
+    @field_validator("detail_url")
+    @classmethod
+    def validate_detail_url(cls, value: str | None) -> str | None:
+        return None if value is None else _validate_http_url(value, "detail_url")
+
+    @field_validator("apply_url")
+    @classmethod
+    def validate_apply_url(cls, value: str | None) -> str | None:
+        return None if value is None else _validate_http_url(value, "apply_url")
+
+    @field_validator("frame_url")
+    @classmethod
+    def validate_frame_url(cls, value: str | None) -> str | None:
+        return None if value is None else _validate_http_url(value, "frame_url")
+
+    @model_validator(mode="after")
+    def validate_candidate(self) -> "DiscoveryCandidate":
+        if self.kind == DiscoveryCandidateKind.URL and not self.detail_url:
+            raise ValueError("URL discovery candidates must include detail_url")
+        if self.kind == DiscoveryCandidateKind.FRAME and not self.frame_url:
+            raise ValueError("FRAME discovery candidates must include frame_url")
+        if self.kind in {
+            DiscoveryCandidateKind.DOM_CLICK,
+            DiscoveryCandidateKind.MODAL,
+            DiscoveryCandidateKind.INLINE,
+        } and not (self.node_token or self.preextracted_job):
+            raise ValueError(
+                "interactive DOM candidates must include node_token or preextracted_job"
+            )
+        if not any(
+            (
+                self.detail_url,
+                self.source_job_id,
+                self.node_token,
+                self.frame_url,
+                self.title_hint,
+                self.preextracted_job,
+            )
+        ):
+            raise ValueError("discovery candidates must contain at least one identity signal")
+        return self
+
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        *,
+        source_job_id: str | None = None,
+        confidence: float = 1.0,
+        evidence: dict[str, Any] | None = None,
+        preextracted_job: JobPosting | None = None,
+    ) -> "DiscoveryCandidate":
+        normalized_url = _validate_http_url(str(url).strip(), "detail_url")
+        identity = str(source_job_id or normalized_url)
+        return cls(
+            candidate_id=_candidate_id(DiscoveryCandidateKind.URL, identity),
+            kind=DiscoveryCandidateKind.URL,
+            detail_url=normalized_url,
+            source_job_id=source_job_id,
+            confidence=confidence,
+            evidence=dict(evidence or {}),
+            preextracted_job=preextracted_job,
+        )
+
+    @property
+    def identity_key(self) -> str:
+        if self.source_job_id:
+            return f"source_job_id:{self.source_job_id}"
+        if self.detail_url:
+            return f"detail_url:{self.detail_url}"
+        return f"candidate_id:{self.candidate_id}"
+
+
+class DiscoveryBatch(ContractModel):
+    """Versioned result of one discovery lane.
+
+    A batch may contain both URL-backed and linkless jobs.  Completeness remains
+    explicit so a bounded browser pass can never become reconciliation evidence.
+    """
+
+    batch_version: int = Field(default=1, ge=1)
+    strategy: ScrapeStrategy
+    completeness: CompletenessState = CompletenessState.PARTIAL
+    candidates: list[DiscoveryCandidate] = Field(default_factory=list)
+    pages_visited: int = Field(default=0, ge=0)
+    pagination_complete: bool = False
+    reasons: list[str] = Field(default_factory=list)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_batch(self) -> "DiscoveryBatch":
+        candidate_ids = [candidate.candidate_id for candidate in self.candidates]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("DiscoveryBatch candidate_id values must be unique")
+        if self.completeness in {CompletenessState.COMPLETE, CompletenessState.EMPTY_CONFIRMED}:
+            if not self.pagination_complete:
+                raise ValueError("complete discovery batches must confirm pagination completion")
+        if self.completeness == CompletenessState.COMPLETE and not self.candidates:
+            raise ValueError("zero-candidate discovery must use EMPTY_CONFIRMED")
+        if self.completeness == CompletenessState.EMPTY_CONFIRMED:
+            if self.candidates:
+                raise ValueError("EMPTY_CONFIRMED discovery batches cannot contain candidates")
+            if not self.reasons:
+                raise ValueError("EMPTY_CONFIRMED discovery batches require independent evidence")
+        if self.completeness in {CompletenessState.BLOCKED, CompletenessState.FAILED} and not self.reasons:
+            raise ValueError("blocked and failed discovery batches must include a reason")
+        return self
+
+    @classmethod
+    def from_urls(
+        cls,
+        urls: list[str],
+        *,
+        strategy: ScrapeStrategy = ScrapeStrategy.BLUEPRINT_DOM,
+        completeness: CompletenessState = CompletenessState.PARTIAL,
+        pages_visited: int = 0,
+        pagination_complete: bool = False,
+        reasons: list[str] | None = None,
+        metrics: dict[str, Any] | None = None,
+    ) -> "DiscoveryBatch":
+        raw_urls = [str(url).strip() for url in urls if str(url).strip()]
+        unique_urls = list(dict.fromkeys(raw_urls))
+        candidates: list[DiscoveryCandidate] = []
+        invalid_urls = 0
+        for url in unique_urls:
+            try:
+                candidates.append(cls._url_candidate(url))
+            except (TypeError, ValueError):
+                invalid_urls += 1
+        batch_metrics = dict(metrics or {})
+        batch_metrics.setdefault("raw_url_candidates", len(raw_urls))
+        batch_metrics.setdefault("deduplicated_url_candidates", len(raw_urls) - len(unique_urls))
+        batch_metrics.setdefault("invalid_url_candidates", invalid_urls)
+        return cls(
+            strategy=strategy,
+            completeness=completeness,
+            candidates=candidates,
+            pages_visited=pages_visited,
+            pagination_complete=pagination_complete,
+            reasons=list(reasons or []),
+            metrics=batch_metrics,
+        )
+
+    @staticmethod
+    def _url_candidate(url: str) -> DiscoveryCandidate:
+        return DiscoveryCandidate.from_url(url, evidence={"origin": "legacy_url_adapter"})
+
+    @property
+    def discovered_urls(self) -> list[str]:
+        return list(
+            dict.fromkeys(
+                candidate.detail_url
+                for candidate in self.candidates
+                if candidate.detail_url is not None
+            )
+        )
+
+    @property
+    def linkless_candidates(self) -> list[DiscoveryCandidate]:
+        return [candidate for candidate in self.candidates if candidate.detail_url is None]
+
+
 class DiscoveryManifest(ContractModel):
     run_id: str = Field(min_length=1, max_length=200)
     source_id: str = Field(min_length=2, max_length=128)
@@ -232,6 +453,7 @@ class DiscoveryManifest(ContractModel):
     strategy: ScrapeStrategy
     completeness: CompletenessState
     discovered_count: int = Field(default=0, ge=0)
+    discovered_candidate_ids: list[str] = Field(default_factory=list)
     discovered_source_job_ids: list[str] = Field(default_factory=list)
     discovered_urls: list[str] = Field(default_factory=list)
     pages_visited: int = Field(default=0, ge=0)
@@ -254,6 +476,14 @@ class DiscoveryManifest(ContractModel):
             raise ValueError("discovered_source_job_ids must be unique")
         return normalized
 
+    @field_validator("discovered_candidate_ids")
+    @classmethod
+    def validate_unique_candidate_ids(cls, value: list[str]) -> list[str]:
+        normalized = [str(item).strip() for item in value if str(item).strip()]
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("discovered_candidate_ids must be unique")
+        return normalized
+
     @field_validator("discovered_urls")
     @classmethod
     def validate_unique_urls(cls, value: list[str]) -> list[str]:
@@ -274,7 +504,11 @@ class DiscoveryManifest(ContractModel):
 
     @model_validator(mode="after")
     def validate_manifest(self) -> "DiscoveryManifest":
-        observed_count = max(len(self.discovered_source_job_ids), len(self.discovered_urls))
+        observed_count = max(
+            len(self.discovered_candidate_ids),
+            len(self.discovered_source_job_ids),
+            len(self.discovered_urls),
+        )
         if self.discovered_count < observed_count:
             raise ValueError("discovered_count cannot be smaller than the recorded IDs or URLs")
         if self.completeness in {CompletenessState.COMPLETE, CompletenessState.EMPTY_CONFIRMED}:
