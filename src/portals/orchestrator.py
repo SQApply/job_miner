@@ -111,6 +111,8 @@ class ScrapeExecutionOptions:
     acquisition_timeout_seconds: float = 20.0
     require_complete_acquisition: bool = True
     prefer_static_detail_html: bool = False
+    enable_adaptive_dom_fallback: bool = False
+    adaptive_dom_max_candidates: int = 1_000
 
     def __post_init__(self) -> None:
         if self.detail_concurrency < 1:
@@ -127,6 +129,8 @@ class ScrapeExecutionOptions:
             raise ValueError("max_acquisition_pages must be at least 1")
         if self.acquisition_timeout_seconds <= 0:
             raise ValueError("acquisition_timeout_seconds must be positive")
+        if not 1 <= self.adaptive_dom_max_candidates <= 10_000:
+            raise ValueError("adaptive_dom_max_candidates must be between 1 and 10000")
 
 
 @dataclass
@@ -207,6 +211,7 @@ class ScrapeOrchestrator:
         source_platform_hint: str | None = None,
         acquisition_hints: dict[str, str] | None = None,
         acquisition_registry: AcquisitionRegistry | None = None,
+        adaptive_dom_service: Any = None,
     ) -> None:
         self.blueprint = blueprint
         self.system_config = system_config
@@ -216,6 +221,7 @@ class ScrapeOrchestrator:
         self.source_platform_hint = str(source_platform_hint or "").strip() or None
         self.acquisition_hints = dict(acquisition_hints or {})
         self.acquisition_registry = acquisition_registry or default_acquisition_registry()
+        self.adaptive_dom_service = adaptive_dom_service
 
     async def run(
         self,
@@ -387,10 +393,33 @@ class ScrapeOrchestrator:
                 page_url=self.blueprint.listing.page_url,
                 attempts=acquisition.get("attempts") or [],
             )
-            raw_discovery_batch = await self._discover_adapter_candidates(
-                crawler,
-                hooks,
-            )
+            try:
+                raw_discovery_batch = await self._discover_adapter_candidates(
+                    crawler,
+                    hooks,
+                )
+            except Exception as exc:
+                if not options.enable_adaptive_dom_fallback:
+                    raise
+                raw_discovery_batch = DiscoveryBatch(
+                    strategy=ScrapeStrategy.BLUEPRINT_DOM,
+                    completeness=CompletenessState.FAILED,
+                    reasons=[
+                        f"Existing adapter discovery failed before adaptive DOM fallback: "
+                        f"{type(exc).__name__}: {exc}"[:1_000]
+                    ],
+                    metrics={
+                        "adapter_mode": "failed_before_adaptive_dom",
+                        "adapter_error_type": type(exc).__name__,
+                        "adapter_error_message": str(exc)[:500],
+                    },
+                )
+                self._emit(
+                    hooks,
+                    "adapter_discovery_failed_adaptive_fallback",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc)[:500],
+                )
             raw_urls = raw_discovery_batch.discovered_urls
             raw_url_count = int(
                 raw_discovery_batch.metrics.get("raw_url_candidates") or len(raw_urls)
@@ -410,6 +439,73 @@ class ScrapeOrchestrator:
         rejected_urls += rejected
         discovered_urls, discovery_ranking = hooks.rank_discovered_urls(discovered_urls)
         discovery_batch = self._rank_candidate_batch(discovery_batch, discovered_urls)
+        if options.enable_adaptive_dom_fallback and not discovered_urls:
+            self._emit(
+                hooks,
+                "adaptive_dom_discovery_start",
+                page_url=self.blueprint.listing.page_url,
+                retained_linkless_candidates=len(discovery_batch.linkless_candidates),
+            )
+            try:
+                raw_adaptive_batch = await self._discover_adaptive_dom_candidates(options)
+            except Exception as exc:
+                adaptive_metrics: dict[str, Any] = {
+                    "attempted": True,
+                    "status": "failed",
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc)[:500],
+                }
+                acquisition = dict(acquisition)
+                acquisition["adaptive_dom"] = adaptive_metrics
+                self._emit(hooks, "adaptive_dom_discovery_failed", **adaptive_metrics)
+            else:
+                raw_candidate_count += len(raw_adaptive_batch.candidates)
+                raw_url_count += len(raw_adaptive_batch.discovered_urls)
+                adaptive_batch, adaptive_rejected = self._normalize_candidate_batch(
+                    raw_adaptive_batch,
+                    hooks.normalize_discovered_urls,
+                )
+                rejected_urls += adaptive_rejected
+                adaptive_ranked_urls, adaptive_ranking = hooks.rank_discovered_urls(
+                    adaptive_batch.discovered_urls
+                )
+                from .dom_discovery import preserve_evidence_backed_urls
+
+                adaptive_ranked_urls, preservation = preserve_evidence_backed_urls(
+                    adaptive_ranked_urls,
+                    adaptive_batch.candidates,
+                )
+                adaptive_batch = self._rank_candidate_batch(
+                    adaptive_batch,
+                    adaptive_ranked_urls,
+                )
+                if adaptive_batch.candidates:
+                    discovery_batch = self._merge_adaptive_candidate_batch(
+                        discovery_batch,
+                        adaptive_batch,
+                    )
+                    discovered_urls = discovery_batch.discovered_urls
+                adaptive_metrics = {
+                    "attempted": True,
+                    "status": raw_adaptive_batch.completeness.value,
+                    "raw_candidates": len(raw_adaptive_batch.candidates),
+                    "selected_candidates": len(adaptive_batch.candidates),
+                    "selected_urls": len(adaptive_ranked_urls),
+                    "linkless_candidates": len(adaptive_batch.linkless_candidates),
+                    "normalization_rejected": adaptive_rejected,
+                    "discovery": dict(raw_adaptive_batch.metrics),
+                    "ranking": dict(adaptive_ranking),
+                    **preservation,
+                }
+                acquisition = dict(acquisition)
+                acquisition["adaptive_dom"] = adaptive_metrics
+                discovery_ranking = {
+                    "strategy": "adaptive_dom_fallback",
+                    "initial": dict(discovery_ranking),
+                    "adaptive": dict(adaptive_ranking),
+                    **preservation,
+                }
+                self._emit(hooks, "adaptive_dom_discovery_complete", **adaptive_metrics)
         discovered_candidates = list(discovery_batch.candidates)
         linkless_candidates = list(discovery_batch.linkless_candidates)
         self._emit(
@@ -420,7 +516,7 @@ class ScrapeOrchestrator:
             discovered_urls=len(discovered_urls),
             discovered_candidates=len(discovered_candidates),
             linkless_candidates=len(linkless_candidates),
-            rejected_urls=rejected,
+            rejected_urls=rejected_urls,
         )
         self._emit(hooks, "discovery_ranked", **discovery_ranking)
 
@@ -444,7 +540,10 @@ class ScrapeOrchestrator:
                 "linkless_candidates_deferred",
                 candidates=len(linkless_candidates),
                 candidate_ids=[candidate.candidate_id for candidate in linkless_candidates],
-                reason="Phase 7A records linkless candidates; browser interaction lands in Phase 7C.",
+                reason=(
+                    "Structural discovery retained linkless candidates; bounded click/modal "
+                    "interaction is handled by Phase 7C2."
+                ),
             )
 
         if hooks.on_discovery_artifacts is not None:
@@ -1112,6 +1211,24 @@ class ScrapeOrchestrator:
             metrics={"adapter_mode": "legacy_url_projection"},
         )
 
+    async def _discover_adaptive_dom_candidates(
+        self,
+        options: ScrapeExecutionOptions,
+    ) -> DiscoveryBatch:
+        service = self.adaptive_dom_service
+        if service is None:
+            from .adaptive_dom import AdaptiveDomDiscoveryService
+
+            service = AdaptiveDomDiscoveryService(self.system_config.browser)
+        batch = await service.discover(
+            str(self.blueprint.listing.page_url),
+            allowed_hosts=tuple(self.blueprint.allowed_hosts),
+            max_candidates=options.adaptive_dom_max_candidates,
+        )
+        if not isinstance(batch, DiscoveryBatch):
+            raise TypeError("adaptive DOM discover() must return DiscoveryBatch")
+        return batch
+
     @staticmethod
     def _normalize_candidate_batch(
         batch: DiscoveryBatch,
@@ -1214,6 +1331,34 @@ class ScrapeOrchestrator:
             pages_visited=batch.pages_visited,
             pagination_complete=batch.pagination_complete if has_candidates else False,
             reasons=list(batch.reasons),
+            metrics=metrics,
+        )
+
+    @staticmethod
+    def _merge_adaptive_candidate_batch(
+        retained_batch: DiscoveryBatch,
+        adaptive_batch: DiscoveryBatch,
+    ) -> DiscoveryBatch:
+        candidates: list[DiscoveryCandidate] = []
+        identities: set[str] = set()
+        for candidate in [*adaptive_batch.candidates, *retained_batch.linkless_candidates]:
+            identity = candidate.identity_key
+            if identity in identities:
+                continue
+            identities.add(identity)
+            candidates.append(candidate)
+        metrics = dict(adaptive_batch.metrics)
+        metrics["retained_prior_linkless_candidates"] = len(
+            retained_batch.linkless_candidates
+        )
+        return DiscoveryBatch(
+            batch_version=adaptive_batch.batch_version,
+            strategy=adaptive_batch.strategy,
+            completeness=CompletenessState.PARTIAL,
+            candidates=candidates,
+            pages_visited=adaptive_batch.pages_visited,
+            pagination_complete=False,
+            reasons=list(dict.fromkeys([*retained_batch.reasons, *adaptive_batch.reasons])),
             metrics=metrics,
         )
 

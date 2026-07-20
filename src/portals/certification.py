@@ -528,9 +528,11 @@ class PortalFleetCertifier:
             if failure_kind == "confirmed_access_control":
                 raise PortalCertificationBlocked(f"Listing probe blocked: {failure_message}")
             if failure_kind == "javascript_shell":
-                raise PortalCertificationJavaScriptShell(
-                    "Listing probe returned a JavaScript shell that requires API/route discovery: "
-                    f"{failure_message}"
+                return _ProbeResult(
+                    effective_listing_url=checked.normalized_url,
+                    detection=replace(direct_detection, surface_kind="javascript_shell"),
+                    allowed_hosts=checked.allowed_hosts,
+                    acquisition_outcome=direct_outcome,
                 )
             raise RuntimeError(
                 f"Listing probe failed: {failure_message}"
@@ -583,10 +585,11 @@ class PortalFleetCertifier:
                 listing_url=final_checked.normalized_url,
                 detection=detection,
             )
-            if shell_outcome.selected is None:
-                raise PortalCertificationJavaScriptShell(
-                    "Rendered listing is a JavaScript shell with no evidence-bound ATS or listing route"
-                )
+            selected_hosts = (
+                list(shell_outcome.selected.trusted_hosts)
+                if shell_outcome.selected is not None
+                else []
+            )
             return _ProbeResult(
                 effective_listing_url=final_checked.normalized_url,
                 detection=detection,
@@ -595,7 +598,7 @@ class PortalFleetCertifier:
                         [
                             *checked.allowed_hosts,
                             *route_resolution.trusted_hosts,
-                            *shell_outcome.selected.trusted_hosts,
+                            *selected_hosts,
                         ]
                     )
                 ),
@@ -799,6 +802,8 @@ class PortalFleetCertifier:
                         acquisition_timeout_seconds=self.options.acquisition_timeout_seconds,
                         require_complete_acquisition=False,
                         prefer_static_detail_html=True,
+                        enable_adaptive_dom_fallback=True,
+                        adaptive_dom_max_candidates=1_000,
                     ),
                     hooks=ScrapeOrchestratorHooks(
                         normalize_discovered_urls=lambda urls: _safe_discovered_urls(urls, approved_hosts),
