@@ -288,6 +288,7 @@ class ScrapeOrchestrator:
         detail_failures: list[dict[str, Any]] = []
         rejected_urls = 0
         preextracted_jobs: dict[str, JobPosting] = {}
+        preextracted_methods: dict[str, str] = {}
         trusted_acquisition_hosts: tuple[str, ...] = ()
         acquisition: dict[str, Any] = {
             "selected": False,
@@ -348,6 +349,7 @@ class ScrapeOrchestrator:
                     if job.job_url == original_url and normalized_job_url != original_url:
                         job = job.model_copy(update={"job_url": normalized_job_url})
                     preextracted_jobs[normalized_job_url] = job
+                    preextracted_methods[normalized_job_url] = "platform_api"
             acquisition_candidates = [
                 DiscoveryCandidate.from_url(
                     url,
@@ -436,6 +438,9 @@ class ScrapeOrchestrator:
             for candidate in discovery_batch.candidates:
                 if candidate.detail_url and candidate.preextracted_job is not None:
                     preextracted_jobs[candidate.detail_url] = candidate.preextracted_job
+                    preextracted_methods[candidate.detail_url] = str(
+                        candidate.evidence.get("origin") or "adapter_preextracted"
+                    )
         rejected_urls += rejected
         discovered_urls, discovery_ranking = hooks.rank_discovered_urls(discovered_urls)
         discovery_batch = self._rank_candidate_batch(discovery_batch, discovered_urls)
@@ -474,11 +479,18 @@ class ScrapeOrchestrator:
                 adaptive_ranked_urls, preservation = preserve_evidence_backed_urls(
                     adaptive_ranked_urls,
                     adaptive_batch.candidates,
+                    ranking_metrics=adaptive_ranking,
                 )
                 adaptive_batch = self._rank_candidate_batch(
                     adaptive_batch,
                     adaptive_ranked_urls,
                 )
+                for candidate in adaptive_batch.candidates:
+                    if candidate.detail_url and candidate.preextracted_job is not None:
+                        preextracted_jobs[candidate.detail_url] = candidate.preextracted_job
+                        preextracted_methods[candidate.detail_url] = str(
+                            candidate.evidence.get("origin") or "adaptive_structured_evidence"
+                        )
                 if adaptive_batch.candidates:
                     discovery_batch = self._merge_adaptive_candidate_batch(
                         discovery_batch,
@@ -638,7 +650,10 @@ class ScrapeOrchestrator:
                             attempt=0,
                             elapsed_seconds=0.0,
                             title=acquired_job.title,
-                            extraction_method="platform_api",
+                            extraction_method=preextracted_methods.get(
+                                original_job_url,
+                                "preextracted_evidence",
+                            ),
                             validation_reason=acquired_reason,
                         )
                         return acquired_job
@@ -648,7 +663,10 @@ class ScrapeOrchestrator:
                         job_url=original_job_url,
                         item_index=item_index,
                         attempt=0,
-                        extraction_method="platform_api",
+                        extraction_method=preextracted_methods.get(
+                            original_job_url,
+                            "preextracted_evidence",
+                        ),
                         validation_reason=acquired_reason,
                     )
                 last_error = "unknown extraction failure"

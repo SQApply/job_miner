@@ -4,9 +4,10 @@ import asyncio
 import hashlib
 import json
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, AsyncIterator, Iterable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -151,6 +152,22 @@ class BrowserEvidenceReport(BrowserEvidenceModel):
         return sum(len(frame.linkless_clickable_nodes) for frame in self.frames)
 
 
+@dataclass
+class BrowserEvidenceSession:
+    """Live ephemeral page paired with its initial evidence snapshot.
+
+    The session exists only inside the collector's async context. Node tokens
+    remain live there, which lets the adaptive lane click a bounded number of
+    structurally grounded cards without persisting selectors or browser state.
+    """
+
+    collector: "BrowserEvidenceCollector"
+    context: Any
+    page: Any
+    report: BrowserEvidenceReport
+    allowed_hosts: tuple[str, ...]
+
+
 class BrowserEvidenceCollector:
     """Capture bounded live DOM and public JSON evidence with Playwright.
 
@@ -174,7 +191,34 @@ class BrowserEvidenceCollector:
         *,
         allowed_hosts: Iterable[str],
     ) -> BrowserEvidenceReport:
+        async with self.capture_session(url, allowed_hosts=allowed_hosts) as session:
+            return session.report
+
+    @asynccontextmanager
+    async def capture_session(
+        self,
+        url: str,
+        *,
+        allowed_hosts: Iterable[str],
+    ) -> AsyncIterator[BrowserEvidenceSession]:
         validated = validate_public_http_url(url, allowed_hosts=allowed_hosts)
+        async with self.open_context() as context:
+            page = await context.new_page()
+            report = await self.capture_page(
+                page,
+                validated.normalized_url,
+                allowed_hosts=validated.allowed_hosts,
+            )
+            yield BrowserEvidenceSession(
+                collector=self,
+                context=context,
+                page=page,
+                report=report,
+                allowed_hosts=validated.allowed_hosts,
+            )
+
+    @asynccontextmanager
+    async def open_context(self) -> AsyncIterator[Any]:
         try:
             from playwright.async_api import async_playwright
         except ImportError as exc:
@@ -187,28 +231,26 @@ class BrowserEvidenceCollector:
             browser = await playwright.chromium.launch(
                 headless=self.browser_settings.headless,
             )
-            context_options: dict[str, Any] = {
-                "ignore_https_errors": False,
-                "java_script_enabled": True,
-                "accept_downloads": False,
-            }
-            if self.browser_settings.geolocation_enabled:
-                context_options["geolocation"] = {
-                    "latitude": self.browser_settings.geolocation_latitude,
-                    "longitude": self.browser_settings.geolocation_longitude,
-                    "accuracy": self.browser_settings.geolocation_accuracy,
-                }
-            context = await browser.new_context(**context_options)
+            context = await browser.new_context(**self._context_options())
             try:
-                page = await context.new_page()
-                return await self.capture_page(
-                    page,
-                    validated.normalized_url,
-                    allowed_hosts=validated.allowed_hosts,
-                )
+                yield context
             finally:
                 await context.close()
                 await browser.close()
+
+    def _context_options(self) -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "ignore_https_errors": False,
+            "java_script_enabled": True,
+            "accept_downloads": False,
+        }
+        if self.browser_settings.geolocation_enabled:
+            options["geolocation"] = {
+                "latitude": self.browser_settings.geolocation_latitude,
+                "longitude": self.browser_settings.geolocation_longitude,
+                "accuracy": self.browser_settings.geolocation_accuracy,
+            }
+        return options
 
     async def capture_page(
         self,

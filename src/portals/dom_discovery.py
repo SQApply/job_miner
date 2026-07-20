@@ -27,6 +27,7 @@ _PAGE_JOB_CONTEXT = re.compile(
 )
 _ROW_JOB_EVIDENCE = re.compile(
     r"\b(location|remote|hybrid|salary|compensation|posted|apply|"
+    r"view\s+(?:job|role|position)|job\s+details?|position\s+details?|"
     r"full[- ]?time|part[- ]?time|contract|department|requisition|"
     r"vacanc(?:y|ies)|opening|openings)\b",
     re.I,
@@ -273,6 +274,14 @@ class DomCandidateDiscoverer:
                 )
                 if confidence < self.options.minimum_confidence:
                     continue
+                preservation_eligible = (
+                    page_has_job_context
+                    and unique_identity_ratio >= 0.75
+                    and (
+                        (table_rows and median_fields >= 2)
+                        or (row_has_job_evidence and median_fields >= 3)
+                    )
+                )
                 clusters_qualified += 1
                 for row_index, row in enumerate(evidence_rows):
                     candidate = self._candidate_from_root(
@@ -283,6 +292,11 @@ class DomCandidateDiscoverer:
                         cluster_size=len(evidence_rows),
                         row_index=row_index,
                         unique_identity_ratio=unique_identity_ratio,
+                        median_fields=float(median_fields),
+                        table_rows=table_rows,
+                        page_has_job_context=page_has_job_context,
+                        row_has_job_evidence=row_has_job_evidence,
+                        preservation_eligible=preservation_eligible,
                     )
                     if candidate is not None:
                         candidates.append(candidate)
@@ -349,6 +363,11 @@ class DomCandidateDiscoverer:
         cluster_size: int,
         row_index: int,
         unique_identity_ratio: float,
+        median_fields: float,
+        table_rows: bool,
+        page_has_job_context: bool,
+        row_has_job_evidence: bool,
+        preservation_eligible: bool,
     ) -> DiscoveryCandidate | None:
         evidence = {
             "origin": "adaptive_dom_repeated_cluster",
@@ -361,9 +380,15 @@ class DomCandidateDiscoverer:
             "cluster_size": cluster_size,
             "row_index": row_index,
             "unique_identity_ratio": round(unique_identity_ratio, 4),
+            "median_fields": round(median_fields, 4),
+            "table_rows": table_rows,
+            "page_job_context": page_has_job_context,
+            "row_job_evidence": row_has_job_evidence,
+            "structural_job_grounding": preservation_eligible,
             "row_text": list(row.text_values[:12]),
             "evidence_preserving": (
-                confidence >= self.options.evidence_preservation_confidence
+                preservation_eligible
+                and confidence >= self.options.evidence_preservation_confidence
             ),
         }
         if row.primary_url:
@@ -452,9 +477,11 @@ class DomCandidateDiscoverer:
                 "node_token": node.node_token,
                 "local_job_context": local_job_context,
                 "parent_repeated": parent_repeated,
-                "evidence_preserving": (
-                    confidence >= self.options.evidence_preservation_confidence
-                ),
+                # An isolated link is useful input to the normal URL ranker, but
+                # page-level careers wording is not enough evidence to override
+                # a rejection. Only repeated, structurally grounded records can
+                # preserve an unfamiliar URL shape.
+                "evidence_preserving": False,
             }
             candidates.append(
                 DiscoveryCandidate.from_url(
@@ -479,7 +506,7 @@ class DomCandidateDiscoverer:
         score += min(0.20, cluster_size * 0.02)
         score += min(0.20, unique_identity_ratio * 0.20)
         score += min(0.14, median_fields * 0.035)
-        score += 0.14 if table_rows else 0.05
+        score += 0.14 if table_rows else (0.07 if row_has_job_evidence else 0.05)
         score += 0.08 if page_has_job_context else 0.0
         score += 0.06 if row_has_job_evidence else 0.0
         return round(min(score, 1.0), 4)
@@ -598,24 +625,62 @@ def preserve_evidence_backed_urls(
     candidates: Iterable[DiscoveryCandidate],
     *,
     minimum_confidence: float = 0.74,
+    ranking_metrics: dict[str, object] | None = None,
 ) -> tuple[list[str], dict[str, int]]:
-    """Retain strongly grounded DOM URLs even if they use an unseen URL shape."""
+    """Retain only independently grounded URLs with unfamiliar shapes.
+
+    This is deliberately narrower than candidate discovery.  DOM candidates
+    still reach the ordinary URL ranker, but isolated navigation links can no
+    longer override it merely because the page contains the word ``jobs``.
+    Structured JSON records and observed linkless-card navigation may override
+    a shape-only rejection, but never a ranker's hard safety/navigation reject.
+    """
 
     selected = list(dict.fromkeys(str(url).strip() for url in ranked_urls if str(url).strip()))
     preserved = 0
     considered = 0
+    rejected_hard = 0
+    rejected_weak_evidence = 0
+    hard_rejected_urls = {
+        str(item.get("url") or "").strip()
+        for item in list((ranking_metrics or {}).get("rejected_candidates") or [])
+        if isinstance(item, dict) and bool(item.get("hard_reject"))
+    }
     for candidate in candidates:
         if not candidate.detail_url:
             continue
-        if candidate.evidence.get("origin") not in {
+        origin = str(candidate.evidence.get("origin") or "")
+        if origin not in {
             "adaptive_dom_repeated_cluster",
-            "adaptive_dom_individual_link",
+            "adaptive_dom_linkless_interaction",
+            "network_json_record",
+            "inline_json_record",
         }:
             continue
         considered += 1
+        if candidate.detail_url in hard_rejected_urls:
+            rejected_hard += 1
+            continue
         if candidate.confidence < minimum_confidence:
+            rejected_weak_evidence += 1
             continue
         if not bool(candidate.evidence.get("evidence_preserving")):
+            rejected_weak_evidence += 1
+            continue
+        if origin == "adaptive_dom_repeated_cluster" and not bool(
+            candidate.evidence.get("structural_job_grounding")
+        ):
+            rejected_weak_evidence += 1
+            continue
+        if origin == "adaptive_dom_linkless_interaction" and not bool(
+            candidate.evidence.get("source_structural_job_grounding")
+        ):
+            rejected_weak_evidence += 1
+            continue
+        if origin in {"network_json_record", "inline_json_record"} and not bool(
+            candidate.evidence.get("structured_job_record")
+        ):
+            rejected_weak_evidence += 1
             continue
         if candidate.detail_url not in selected:
             selected.append(candidate.detail_url)
@@ -623,4 +688,6 @@ def preserve_evidence_backed_urls(
     return selected, {
         "adaptive_candidates_considered": considered,
         "adaptive_urls_preserved": preserved,
+        "adaptive_urls_rejected_hard": rejected_hard,
+        "adaptive_urls_rejected_weak_evidence": rejected_weak_evidence,
     }

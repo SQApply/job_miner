@@ -795,7 +795,11 @@ class PortalFleetCertifier:
                         detail_retry_attempts=self.options.detail_retry_attempts,
                         requests_per_minute=self.options.requests_per_minute,
                         max_jobs=self.options.max_jobs,
-                        fail_on_zero_discovery=True,
+                        # Certification must retain the adaptive acquisition
+                        # diagnostics even when no candidate survives. The
+                        # explicit classification below still marks the source
+                        # failed and never enables reconciliation.
+                        fail_on_zero_discovery=False,
                         session_prefix=f"cert_detail_{entry.source_id[-16:]}",
                         prefer_platform_api=True,
                         max_acquisition_pages=self.options.max_pages,
@@ -844,17 +848,30 @@ class PortalFleetCertifier:
             if extracted == 0:
                 status = "failed"
                 certification_status = "needs_repair"
-                error_type = "zero_valid_jobs"
-                error_message = (
-                    f"Discovery selected {discovered_candidate_count} candidates "
-                    f"({len(orchestration.discovered_job_urls)} URL-backed, "
-                    f"{linkless_candidate_count} linkless), "
-                    + (
-                        "but grounded deterministic/LLM extraction produced no certifiable jobs"
-                        if self.options.allow_llm_fallback
-                        else "but deterministic extraction produced no certifiable jobs; LLM fallback was disabled"
+                if discovered_candidate_count == 0:
+                    error_type = "zero_discovery"
+                    error_message = (
+                        "Adaptive/API/DOM discovery selected zero grounded candidates; "
+                        "acquisition diagnostics were retained for repair."
                     )
-                )
+                elif not orchestration.discovered_job_urls and linkless_candidate_count:
+                    error_type = "linkless_interaction_unresolved"
+                    error_message = (
+                        f"Discovery retained {linkless_candidate_count} grounded linkless "
+                        "candidates, but bounded public interaction exposed no unique detail URL."
+                    )
+                else:
+                    error_type = "zero_valid_jobs"
+                    error_message = (
+                        f"Discovery selected {discovered_candidate_count} candidates "
+                        f"({len(orchestration.discovered_job_urls)} URL-backed, "
+                        f"{linkless_candidate_count} linkless), "
+                        + (
+                            "but grounded deterministic/LLM extraction produced no certifiable jobs"
+                            if self.options.allow_llm_fallback
+                            else "but deterministic extraction produced no certifiable jobs; LLM fallback was disabled"
+                        )
+                    )
             elif failures:
                 status = "partial"
                 certification_status = "needs_repair"

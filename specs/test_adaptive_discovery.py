@@ -399,6 +399,66 @@ class CertificationFailureTaxonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.ranked_candidates, 1)
         self.assertEqual(record.ranking_rejected_urls, 4)
 
+    async def test_zero_discovery_retains_adaptive_diagnostics_without_reconciliation(self) -> None:
+        certifier = PortalFleetCertifier(
+            root=ROOT,
+            output_dir=ROOT / "data" / "test-certification-zero",
+            options=CertificationOptions(max_jobs=1),
+        )
+        detection = detect_portal(
+            listing_url="https://careers.example.com/jobs",
+            html="",
+        )
+        probe = _ProbeResult(
+            effective_listing_url="https://careers.example.com/jobs",
+            detection=detection,
+            allowed_hosts=("careers.example.com",),
+            acquisition_outcome=AcquisitionOutcome(selected=None, attempts=[]),
+        )
+        orchestration = OrchestratedScrapeResult(
+            discovered_job_urls=[],
+            attempted_job_urls=[],
+            jobs=[],
+            rejected_urls=0,
+            detail_failures=[],
+            artifacts=[],
+            rescrape_plan={},
+            elapsed_seconds=1.0,
+            acquisition={
+                "adaptive_dom": {
+                    "attempted": True,
+                    "discovery": {
+                        "structured_discovery": {"network_documents": 3},
+                        "linkless_interaction": {"attempted": 0, "resolved": 0},
+                    },
+                }
+            },
+        )
+        entry = PortalInventoryEntry(
+            source_id="cert_careers_example_com_zero",
+            display_name="Example Zero",
+            listing_url="https://careers.example.com/jobs",
+            source_row=1,
+        )
+        run_mock = AsyncMock(return_value=orchestration)
+
+        with patch.object(certifier, "_probe", new=AsyncMock(return_value=probe)), patch(
+            "src.portals.certification.ScrapeOrchestrator.run",
+            new=run_mock,
+        ):
+            record = await certifier.certify(entry, run_id="phase7c2-zero", attempt_number=1)
+
+        options = run_mock.await_args.kwargs["options"]
+        self.assertFalse(options.fail_on_zero_discovery)
+        self.assertEqual(record.status, "failed")
+        self.assertEqual(record.error_type, "zero_discovery")
+        self.assertEqual(
+            record.acquisition["adaptive_dom"]["discovery"]["structured_discovery"][
+                "network_documents"
+            ],
+            3,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

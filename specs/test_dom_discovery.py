@@ -154,6 +154,13 @@ class StructuralDomDiscoveryTests(unittest.TestCase):
         )
         self.assertEqual(batch.metrics["individual_link_candidates"], 0)
         self.assertEqual(batch.completeness, CompletenessState.PARTIAL)
+        self.assertTrue(
+            all(
+                candidate.evidence["structural_job_grounding"]
+                and candidate.evidence["evidence_preserving"]
+                for candidate in batch.candidates
+            )
+        )
 
     def test_repeated_linkless_cards_emit_click_tokens_but_ignore_form_controls(self) -> None:
         nodes = [
@@ -195,6 +202,9 @@ class StructuralDomDiscoveryTests(unittest.TestCase):
         self.assertTrue(
             all(candidate.kind == DiscoveryCandidateKind.DOM_CLICK for candidate in batch.candidates)
         )
+        self.assertTrue(
+            all(candidate.evidence["evidence_preserving"] for candidate in batch.candidates)
+        )
         self.assertNotIn("n:filter", [candidate.node_token for candidate in batch.candidates])
 
     def test_high_confidence_dom_evidence_preserves_unfamiliar_safe_url_shapes(self) -> None:
@@ -204,6 +214,7 @@ class StructuralDomDiscoveryTests(unittest.TestCase):
             evidence={
                 "origin": "adaptive_dom_repeated_cluster",
                 "evidence_preserving": True,
+                "structural_job_grounding": True,
             },
         )
         low = DiscoveryCandidate.from_url(
@@ -212,6 +223,7 @@ class StructuralDomDiscoveryTests(unittest.TestCase):
             evidence={
                 "origin": "adaptive_dom_repeated_cluster",
                 "evidence_preserving": True,
+                "structural_job_grounding": True,
             },
         )
 
@@ -219,6 +231,49 @@ class StructuralDomDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(urls, [high.detail_url])
         self.assertEqual(metrics["adaptive_urls_preserved"], 1)
+
+    def test_individual_navigation_link_never_overrides_url_ranker(self) -> None:
+        candidate = DiscoveryCandidate.from_url(
+            "https://careers.example.com/employers/salary-guide",
+            confidence=0.98,
+            evidence={
+                "origin": "adaptive_dom_individual_link",
+                "evidence_preserving": True,
+            },
+        )
+
+        urls, metrics = preserve_evidence_backed_urls([], [candidate])
+
+        self.assertEqual(urls, [])
+        self.assertEqual(metrics["adaptive_candidates_considered"], 0)
+
+    def test_hard_ranker_rejection_wins_over_structural_confidence(self) -> None:
+        candidate = DiscoveryCandidate.from_url(
+            "https://careers.example.com/contact",
+            confidence=0.98,
+            evidence={
+                "origin": "adaptive_dom_repeated_cluster",
+                "evidence_preserving": True,
+                "structural_job_grounding": True,
+            },
+        )
+
+        urls, metrics = preserve_evidence_backed_urls(
+            [],
+            [candidate],
+            ranking_metrics={
+                "rejected_candidates": [
+                    {
+                        "url": candidate.detail_url,
+                        "hard_reject": True,
+                        "reasons": ["navigation:contact"],
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(urls, [])
+        self.assertEqual(metrics["adaptive_urls_rejected_hard"], 1)
 
 
 class FakeCollector:
@@ -298,6 +353,7 @@ class AdaptiveDomOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             evidence={
                 "origin": "adaptive_dom_repeated_cluster",
                 "evidence_preserving": True,
+                "structural_job_grounding": True,
             },
         )
         service = FakeAdaptiveService(
@@ -361,6 +417,7 @@ class AdaptiveDomOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             evidence={
                 "origin": "adaptive_dom_repeated_cluster",
                 "evidence_preserving": True,
+                "structural_job_grounding": True,
             },
         )
         service = FakeAdaptiveService(
