@@ -8,6 +8,12 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from ..schemas import JobPosting
 from ..warehouse.url_utils import canonical_job_url
+from .job_evidence import (
+    has_marketing_page_language,
+    job_detail_signal_count,
+    job_title_rejection_reason,
+    normalize_evidence_text,
+)
 from .page_quality import assess_crawl_result, visible_text
 
 
@@ -192,6 +198,20 @@ def _meaningful_hash_route(fragment: str) -> bool:
     return bool(tokens & (_JOB_TOKENS | _DETAIL_TOKENS))
 
 
+def _logical_route_path(path: str, fragment: str) -> str:
+    """Project a job-bearing SPA fragment into the route used for scoring."""
+
+    physical = unquote(str(path or "/")).lower()
+    raw_fragment = unquote(str(fragment or "")).strip()
+    if not _meaningful_hash_route(raw_fragment):
+        return physical
+    fragment_route = raw_fragment.lstrip("!#/")
+    if not fragment_route:
+        return physical
+    prefix = physical.rstrip("/")
+    return re.sub(r"/{2,}", "/", f"{prefix}/{fragment_route}" or "/")
+
+
 def _same_site(first: str, second: str) -> bool:
     first_parts = str(first or "").lower().rstrip(".").split(".")
     second_parts = str(second or "").lower().rstrip(".").split(".")
@@ -271,10 +291,14 @@ def assess_job_candidate_url(
             reasons=("telemetry_or_challenge_host",),
         )
 
-    path = unquote(parsed.path or "/").lower()
-    route_value = f"{path}#{unquote(parsed.fragment).lower()}" if parsed.fragment else path
+    physical_path = unquote(parsed.path or "/").lower()
+    path = _logical_route_path(parsed.path, parsed.fragment)
+    route_value = path
     tokens = _tokens(route_value)
-    suffix = next((suffix for suffix in _ASSET_SUFFIXES if path.endswith(suffix)), None)
+    suffix = next(
+        (suffix for suffix in _ASSET_SUFFIXES if physical_path.endswith(suffix)),
+        None,
+    )
     if suffix:
         return CandidateAssessment(
             url=url,
@@ -296,11 +320,15 @@ def assess_job_candidate_url(
     job_board_detail = bool(
         re.search(r"/(?:jb|job-board)/[^/]+/\d+(?:/|$)", path)
     )
+    requisition_slug_detail = bool(
+        re.search(r"/jobs?/[^/?#]+-\d{4,}(?:/|$)", path)
+    )
     strong_path_signature = bool(
         re.search(r"/jobs?/details?(?:/|$)", path)
         or re.search(r"/jobs?/\d+(?:/|$)", path)
         or re.search(r"/(?:job|position|requisition|posting)/[^/]+", path)
         or job_board_detail
+        or requisition_slug_detail
     )
     if (
         str(platform_hint or "").strip().lower() == "icims"
@@ -352,6 +380,9 @@ def assess_job_candidate_url(
     elif job_board_detail:
         score += 10
         reasons.append("job_board_detail_path")
+    elif requisition_slug_detail:
+        score += 12
+        reasons.append("requisition_slug_detail_path")
     elif re.search(r"/(?:job|position|requisition|posting)/[^/]+", path):
         score += 8
         reasons.append("job_entity_path")
@@ -645,17 +676,38 @@ def promote_trusted_detail_url(
 
 def assess_certification_job(job: JobPosting, source_url: str) -> tuple[bool, str]:
     """Stricter certification validator; production's backward-compatible validator remains unchanged."""
-    title = " ".join(str(job.title or "").split()).strip()
-    if len(title) < 3:
-        return False, "missing or implausibly short job title"
-    title_lower = title.lower().strip(" -|:")
-    if title_lower in _GENERIC_TITLES:
-        return False, "generic navigation title"
+    title = normalize_evidence_text(job.title)
+    title_rejection = job_title_rejection_reason(title)
+    if title_rejection is not None:
+        return False, f"navigation/non-role title rejected: {title_rejection}"
 
     url = str(job.job_url or source_url or "").strip()
     url_assessment = assess_job_candidate_url(url)
     if url_assessment.hard_reject:
         return False, "job URL is a navigation or asset URL"
+    blocked_navigation = {
+        "about",
+        "benefits",
+        "candidate",
+        "candidates",
+        "community",
+        "culture",
+        "employers",
+        "locations",
+        "recruiters",
+        "search",
+    }
+    navigation_tokens = {
+        token
+        for reason in url_assessment.reasons
+        if reason.startswith("navigation_tokens:")
+        for token in reason.partition(":")[2].split(",")
+    }
+    if url_assessment.score < 8 and navigation_tokens & blocked_navigation:
+        return False, (
+            "job URL resolves to a navigation/marketing route: "
+            + ",".join(sorted(navigation_tokens & blocked_navigation))
+        )
 
     quality_score = 3
     evidence: list[str] = ["title"]
@@ -666,7 +718,16 @@ def assess_certification_job(job: JobPosting, source_url: str) -> tuple[bool, st
         quality_score += 1
         evidence.append("plausible_url")
 
-    summary = " ".join(str(job.summary or "").split())
+    summary = normalize_evidence_text(job.summary)
+    detail_text = " | ".join(
+        [
+            summary,
+            *(normalize_evidence_text(value) for value in job.responsibilities),
+            *(normalize_evidence_text(value) for value in job.required_skills),
+            *(normalize_evidence_text(value) for value in job.preferred_skills),
+        ]
+    )
+    detail_signals = job_detail_signal_count(detail_text)
     if len(summary) >= 80:
         quality_score += 2
         evidence.append("summary")
@@ -685,6 +746,18 @@ def assess_certification_job(job: JobPosting, source_url: str) -> tuple[bool, st
     if job.company:
         quality_score += 1
         evidence.append("company")
+
+    if detail_signals:
+        quality_score += min(2, detail_signals)
+        evidence.append(f"detail_signals:{detail_signals}")
+    if (
+        url_assessment.score < 3
+        and not (job.responsibilities or job.required_skills or job.preferred_skills)
+        and detail_signals < 2
+    ):
+        return False, "unfamiliar URL lacks independent rendered job-detail evidence"
+    if has_marketing_page_language(f"{title} {summary}") and detail_signals < 2:
+        return False, "marketing copy is not an individual job detail"
 
     if quality_score < 6:
         return False, f"insufficient independent job evidence ({','.join(evidence)})"

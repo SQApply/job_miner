@@ -12,14 +12,21 @@ from ..crawl.browser_evidence import (
 )
 from ..crawl.dom_snapshot import DomNodeEvidence, FrameDomSnapshot
 from ..schemas import BrowserSettings, JobPosting
+from .job_evidence import (
+    is_plausible_job_title,
+    job_detail_signal_count,
+    job_title_rejection_reason,
+    plausible_location,
+)
 from .json_discovery import JsonCandidateDiscoverer
 
 
-RENDERED_DETAIL_CONTRACT_VERSION = "1.0"
+RENDERED_DETAIL_CONTRACT_VERSION = "1.1"
 _DETAIL_SIGNAL = re.compile(
     r"\b(job\s+description|position\s+summary|about\s+(?:the\s+)?role|"
     r"responsibilit(?:y|ies)|duties|qualifications?|requirements?|"
     r"required\s+(?:skills?|experience)|preferred\s+(?:skills?|qualifications?)|"
+    r"must[- ]haves?|"
     r"what\s+you(?:'|’)ll\s+do|skills?\s+(?:and|&)\s+experience|"
     r"benefits|compensation|employment\s+type|requisition|job\s+(?:id|reference)|"
     r"apply\s+(?:now|for))\b",
@@ -43,8 +50,9 @@ _LOCATION_SHAPE = re.compile(
     r"\b(remote|hybrid|onsite|on-site|[A-Z][A-Za-z .'-]+,\s*[A-Z]{2}(?:\s+\d{5})?)\b"
 )
 _REFERENCE = re.compile(
-    r"\b(?:job|requisition|req(?:uisition)?|reference)\s*(?:id|number|#|no\.)?\s*"
-    r"[:#\-]\s*(?P<value>[A-Za-z0-9][A-Za-z0-9._/-]{2,80})\b",
+    r"\b(?:job\s+(?:id|number|reference)|requisition(?:\s+(?:id|number))?|"
+    r"req(?:uisition)?\s*(?:id|number|#|no\.)|reference\s*(?:id|number|#|no\.)?)\s*"
+    r"[:#\-]?\s*(?P<value>(?=[A-Za-z0-9._/-]*\d)[A-Za-z0-9][A-Za-z0-9._/-]{2,80})\b",
     re.I,
 )
 _POSTED = re.compile(
@@ -121,6 +129,7 @@ class _FrameText:
     title: str | None
     title_grounded: bool
     detail_signals: int
+    strong_detail_signals: int
     source_job_id: str | None
     score: float
     delta_chars: int
@@ -151,7 +160,7 @@ class RenderedDetailExtractor:
             fallback_url=fallback_url,
             title_hint=title_hint,
         )
-        if structured is not None:
+        if structured is not None and is_plausible_job_title(structured.title):
             return RenderedDetailResult(
                 job=structured,
                 reason="structured_job_record",
@@ -204,15 +213,17 @@ class RenderedDetailExtractor:
             {
                 "selected_frame_id": selected.frame.frame_id,
                 "detail_signals": selected.detail_signals,
+                "strong_detail_signals": selected.strong_detail_signals,
                 "summary_chars": len(summary),
                 "delta_chars": selected.delta_chars,
                 "title_grounded": selected.title_grounded,
             }
         )
-        if not selected.title or _GENERIC_TITLE.fullmatch(selected.title):
+        title_rejection = job_title_rejection_reason(selected.title)
+        if title_rejection is not None:
             return RenderedDetailResult(
                 job=None,
-                reason="missing_non_generic_title",
+                reason=f"invalid_job_title:{title_rejection}",
                 metrics=metrics,
             )
         if not selected.title_grounded:
@@ -227,6 +238,12 @@ class RenderedDetailExtractor:
                 reason="missing_job_detail_signals",
                 metrics=metrics,
             )
+        if selected.strong_detail_signals < 1:
+            return RenderedDetailResult(
+                job=None,
+                reason="missing_strong_job_detail_signals",
+                metrics=metrics,
+            )
         if len(summary) < minimum_chars:
             return RenderedDetailResult(
                 job=None,
@@ -235,8 +252,12 @@ class RenderedDetailExtractor:
             )
 
         combined = " | ".join(selected.text_parts)
-        location = _text(location_hint) or self._location(selected.text_parts)
-        reference = selected.source_job_id or self._first_match(_REFERENCE, combined)
+        location = plausible_location(location_hint) or self._location(selected.text_parts)
+        reference = (
+            selected.source_job_id
+            or self._first_match(_REFERENCE, combined)
+            or self._reference_from_url(fallback_url)
+        )
         posted = self._first_match(_POSTED, combined)
         employment = self._first_text_match(_EMPLOYMENT, selected.text_parts)
         compensation = self._first_text_match(_COMPENSATION, selected.text_parts)
@@ -347,6 +368,7 @@ class RenderedDetailExtractor:
             return None
         combined = " | ".join(parts)
         detail_signals = len({_normalized(match.group(0)) for match in _DETAIL_SIGNAL.finditer(combined)})
+        strong_detail_signals = job_detail_signal_count(combined)
         title, title_grounded = self._select_title(
             usable,
             title_hint=title_hint,
@@ -354,7 +376,7 @@ class RenderedDetailExtractor:
         )
         source_job_id = self._source_job_id(usable, combined)
         delta_chars = len(" ".join(parts))
-        score = float(detail_signals * 4)
+        score = float(detail_signals * 3 + strong_detail_signals * 3)
         score += min(8.0, delta_chars / 500.0)
         score += 6.0 if title_grounded else 0.0
         score += 3.0 if any(node.role == "dialog" for node in usable) else 0.0
@@ -366,6 +388,7 @@ class RenderedDetailExtractor:
             title=title,
             title_grounded=title_grounded,
             detail_signals=detail_signals,
+            strong_detail_signals=strong_detail_signals,
             source_job_id=source_job_id,
             score=score,
             delta_chars=delta_chars,
@@ -414,7 +437,7 @@ class RenderedDetailExtractor:
         for position, node in enumerate(values):
             value = _text(node.text)
             normalized_value = _normalized(value)
-            if not value or len(value) > 300 or _GENERIC_TITLE.fullmatch(value):
+            if not value or len(value) > 300 or not is_plausible_job_title(value):
                 continue
             score = 0.0
             score += 5.0 if node.role == "heading" or re.fullmatch(r"h[1-3]", node.tag) else 0.0
@@ -433,7 +456,7 @@ class RenderedDetailExtractor:
             )
             return selected, grounded
         fallback = _text(title_hint) or _text(frame_title)
-        if fallback and not _GENERIC_TITLE.fullmatch(fallback):
+        if fallback and is_plausible_job_title(fallback):
             normalized_fallback = _normalized(fallback)
             grounded = any(
                 normalized_fallback
@@ -476,11 +499,33 @@ class RenderedDetailExtractor:
         for value in values:
             match = _LOCATION_LABEL.search(value)
             if match:
-                return _text(match.group("value"))[:1_000]
+                if location := plausible_location(match.group("value")):
+                    return location
         for value in values:
-            match = _LOCATION_SHAPE.search(value)
-            if match and len(value) <= 200:
-                return value[:1_000]
+            if location := plausible_location(value):
+                return location
+        return None
+
+    @staticmethod
+    def _reference_from_url(value: str) -> str | None:
+        try:
+            from urllib.parse import unquote, urlsplit
+
+            parsed = urlsplit(value)
+        except ValueError:
+            return None
+        logical = "/".join(
+            part.strip("!#/")
+            for part in (unquote(parsed.path), unquote(parsed.fragment))
+            if part.strip("!#/")
+        )
+        segments = [segment for segment in logical.split("/") if segment]
+        for segment in reversed(segments):
+            if re.fullmatch(r"\d{4,}", segment):
+                return segment
+            match = re.search(r"(?:^|[-_])([A-Za-z]{0,6}-?\d{4,})(?:$|[-_])", segment)
+            if match:
+                return match.group(1)
         return None
 
     @staticmethod

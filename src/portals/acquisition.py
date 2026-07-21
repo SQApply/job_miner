@@ -1499,6 +1499,7 @@ class AcquisitionRegistry:
                         "complete": result.complete,
                         "pages_visited": result.pages_visited,
                         "endpoint_requests": result.endpoint_requests,
+                        "trusted_hosts": list(result.trusted_hosts),
                         "metadata": dict(result.metadata),
                     }
                 )
@@ -1511,6 +1512,7 @@ class AcquisitionRegistry:
                         "discovered_urls": len(result.discovered_urls),
                         "pages_visited": result.pages_visited,
                         "endpoint_requests": result.endpoint_requests,
+                        "trusted_hosts": list(result.trusted_hosts),
                         "metadata": dict(result.metadata),
                     }
                 )

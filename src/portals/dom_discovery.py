@@ -17,6 +17,7 @@ from .contracts import (
     DiscoveryCandidateKind,
     ScrapeStrategy,
 )
+from .job_evidence import is_plausible_job_title, plausible_location
 
 
 DOM_DISCOVERY_CONTRACT_VERSION = "1.0"
@@ -47,7 +48,8 @@ _NAVIGATION_TEXT = re.compile(
     re.I,
 )
 _DATE_TEXT = re.compile(
-    r"^(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{1,2}-\d{1,2}|"
+    r"^(?:(?:added|posted|updated|published|date\s+posted)\s*[-:|]?\s*)?"
+    r"(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{1,2}-\d{1,2}|"
     r"\d+\s+(?:minute|hour|day|week|month)s?\s+ago)$",
     re.I,
 )
@@ -576,7 +578,11 @@ class DomCandidateDiscoverer:
         scored: list[tuple[float, int, str]] = []
         for position, node in enumerate(nodes):
             text = " ".join(str(node.text or "").split())
-            if not text or _NAVIGATION_TEXT.fullmatch(text):
+            if (
+                not text
+                or _NAVIGATION_TEXT.fullmatch(text)
+                or not is_plausible_job_title(text)
+            ):
                 continue
             score = 0.0
             score += 3.0 if node.role == "heading" else 0.0
@@ -596,8 +602,8 @@ class DomCandidateDiscoverer:
         for value in text_values:
             if value == title_hint or _DATE_TEXT.fullmatch(value):
                 continue
-            if 2 <= len(value) <= 120 and not _NAVIGATION_TEXT.fullmatch(value):
-                return value
+            if location := plausible_location(value):
+                return location
         return None
 
     @staticmethod
@@ -675,11 +681,24 @@ def preserve_evidence_backed_urls(
     preserved = 0
     considered = 0
     rejected_hard = 0
+    rejected_navigation = 0
     rejected_weak_evidence = 0
-    hard_rejected_urls = {
-        str(item.get("url") or "").strip()
+    rejected_by_url = {
+        str(item.get("url") or "").strip(): item
         for item in list((ranking_metrics or {}).get("rejected_candidates") or [])
-        if isinstance(item, dict) and bool(item.get("hard_reject"))
+        if isinstance(item, dict) and str(item.get("url") or "").strip()
+    }
+    blocked_navigation_tokens = {
+        "about",
+        "benefits",
+        "candidate",
+        "candidates",
+        "community",
+        "culture",
+        "employers",
+        "locations",
+        "recruiters",
+        "search",
     }
     for candidate in candidates:
         if not candidate.detail_url:
@@ -693,8 +712,19 @@ def preserve_evidence_backed_urls(
         }:
             continue
         considered += 1
-        if candidate.detail_url in hard_rejected_urls:
+        rejected = rejected_by_url.get(candidate.detail_url, {})
+        if bool(rejected.get("hard_reject")):
             rejected_hard += 1
+            continue
+        reasons = [str(value) for value in list(rejected.get("reasons") or [])]
+        navigation_tokens = {
+            token
+            for reason in reasons
+            if reason.startswith("navigation_tokens:")
+            for token in reason.partition(":")[2].split(",")
+        }
+        if navigation_tokens & blocked_navigation_tokens:
+            rejected_navigation += 1
             continue
         if candidate.confidence < minimum_confidence:
             rejected_weak_evidence += 1
@@ -707,11 +737,14 @@ def preserve_evidence_backed_urls(
         ):
             rejected_weak_evidence += 1
             continue
-        if origin == "adaptive_dom_linkless_interaction" and not bool(
-            candidate.evidence.get("source_structural_job_grounding")
-        ):
-            rejected_weak_evidence += 1
-            continue
+        if origin == "adaptive_dom_linkless_interaction":
+            source_grounded = bool(
+                candidate.evidence.get("source_structural_job_grounding")
+            )
+            rendered_verified = bool(candidate.evidence.get("rendered_detail_verified"))
+            if not source_grounded and not rendered_verified:
+                rejected_weak_evidence += 1
+                continue
         if origin in {"network_json_record", "inline_json_record"} and not bool(
             candidate.evidence.get("structured_job_record")
         ):
@@ -724,5 +757,6 @@ def preserve_evidence_backed_urls(
         "adaptive_candidates_considered": considered,
         "adaptive_urls_preserved": preserved,
         "adaptive_urls_rejected_hard": rejected_hard,
+        "adaptive_urls_rejected_navigation": rejected_navigation,
         "adaptive_urls_rejected_weak_evidence": rejected_weak_evidence,
     }

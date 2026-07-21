@@ -63,7 +63,7 @@ from .url_intelligence import (
 )
 
 
-CERTIFICATION_CONTRACT_VERSION = "1.3"
+CERTIFICATION_CONTRACT_VERSION = "1.4"
 _HTTP_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", flags=re.IGNORECASE)
 _XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _XLSX_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -320,6 +320,7 @@ class PortalCertificationRecord:
     resolved_route_url: str | None = None
     route_resolution: dict[str, Any] = field(default_factory=dict)
     discovery_quality: dict[str, Any] = field(default_factory=dict)
+    event_samples: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -398,11 +399,130 @@ def _with_route_hints(
 def _approved_hosts_for_url(url: str) -> list[str]:
     hostname = str(urlsplit(url).hostname or "").lower()
     approved = list(default_allowed_hosts(hostname))
+    approved.extend(_owned_sibling_hosts(hostname))
     platform = known_browser_ats_platform(url)
     if platform:
         for suffix in KNOWN_BROWSER_ATS_HOSTS[platform]:
             approved.extend((suffix, f"*.{suffix}"))
     return list(dict.fromkeys(approved))
+
+
+def _owned_sibling_hosts(hostname: str) -> list[str]:
+    """Allow a branded jobs host to redirect to its branded careers sibling.
+
+    This is deliberately narrower than a registrable-domain comparison: only
+    an explicit functional first label is removed, and public-suffix-shaped
+    roots such as ``co.uk`` are refused.
+    """
+
+    host = str(hostname or "").lower().rstrip(".")
+    labels = [label for label in host.split(".") if label]
+    if len(labels) < 3 or labels[0] not in {
+        "apply",
+        "career",
+        "careers",
+        "hire",
+        "hiring",
+        "job",
+        "jobs",
+        "recruiting",
+    }:
+        return []
+    root_labels = labels[1:]
+    if len(root_labels) == 2 and root_labels[0] in {
+        "ac",
+        "co",
+        "com",
+        "edu",
+        "gov",
+        "net",
+        "org",
+    } and len(root_labels[1]) == 2:
+        return []
+    root = ".".join(root_labels)
+    if root in {
+        "appspot.com",
+        "azurewebsites.net",
+        "cloudfront.net",
+        "github.io",
+        "herokuapp.com",
+        "netlify.app",
+        "pages.dev",
+        "vercel.app",
+    }:
+        return []
+    return [
+        root,
+        f"www.{root}",
+        f"career.{root}",
+        f"careers.{root}",
+        f"apply.{root}",
+        f"hiring.{root}",
+        f"recruiting.{root}",
+    ]
+
+
+def _empty_acquisition_listing_handoff(
+    outcome: AcquisitionOutcome,
+    *,
+    source_url: str,
+) -> tuple[str, tuple[str, ...], dict[str, Any]] | None:
+    """Reuse the final validated listing route from an otherwise empty lane."""
+
+    source_host = str(urlsplit(source_url).hostname or "").lower().rstrip(".")
+    for attempt in reversed(outcome.attempts):
+        if str(attempt.get("status") or "") != "empty":
+            continue
+        metadata = attempt.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        raw = str(metadata.get("listing_url") or "").strip()
+        if not raw or canonicalize_candidate_url(raw) == canonicalize_candidate_url(source_url):
+            continue
+        trusted = {
+            str(value).lower().rstrip(".")
+            for value in list(attempt.get("trusted_hosts") or [])
+            if str(value).strip()
+        }
+        for item in list(metadata.get("route_resolution_chain") or []):
+            if isinstance(item, dict):
+                trusted.update(
+                    str(value).lower().rstrip(".")
+                    for value in list(item.get("trusted_hosts") or [])
+                    if str(value).strip()
+                )
+        candidate_host = str(urlsplit(raw).hostname or "").lower().rstrip(".")
+        known_ats = bool(known_browser_ats_platform(raw))
+        if (
+            not candidate_host
+            or (
+                not _same_site(source_host, candidate_host)
+                and candidate_host not in trusted
+                and not known_ats
+            )
+        ):
+            continue
+        allowed_hosts = tuple(
+            dict.fromkeys(
+                [
+                    *_approved_hosts_for_url(source_url),
+                    *sorted(trusted),
+                    *(_approved_hosts_for_url(raw) if known_ats else []),
+                ]
+            )
+        )
+        checked = validate_public_http_url(raw, allowed_hosts=allowed_hosts)
+        route_resolution = {
+            "strategy": "empty_acquisition_listing_handoff",
+            "selected": {
+                "url": checked.normalized_url,
+                "route_kind": "validated_empty_acquisition_route",
+            },
+            "trusted_hosts": list(allowed_hosts),
+            "source_attempt_platform": str(attempt.get("platform") or "unknown"),
+        }
+        return checked.normalized_url, allowed_hosts, route_resolution
+    return None
 
 
 def _safe_discovered_urls(urls: list[str], approved_hosts: Iterable[str]) -> tuple[list[str], int]:
@@ -449,6 +569,50 @@ def _classify_error(exc: BaseException) -> tuple[str, str]:
     return type(exc).__name__, "needs_repair"
 
 
+_DIAGNOSTIC_EVENTS = {
+    "adaptive_dom_discovery_failed",
+    "extract_attempt_failed",
+    "extract_failed",
+    "extract_task_exception",
+    "llm_fallback_skipped_non_job",
+    "rendered_detail_failed",
+    "rendered_detail_miss",
+    "static_detail_deterministic_miss",
+    "validation_failed",
+}
+
+
+def _bounded_event_sample(event: str, payload: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "attempt",
+        "error_message",
+        "error_type",
+        "extraction_method",
+        "job_url",
+        "metrics",
+        "original_job_url",
+        "reason",
+        "rendered_reason",
+        "validation_reason",
+    }
+    sample: dict[str, Any] = {"event": event}
+    for key in allowed:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, str):
+            sample[key] = value[:1_000]
+        elif isinstance(value, (int, float, bool)) or value is None:
+            sample[key] = value
+        elif key == "metrics" and isinstance(value, dict):
+            sample[key] = {
+                str(metric_key)[:100]: metric_value
+                for metric_key, metric_value in list(value.items())[:30]
+                if isinstance(metric_value, (str, int, float, bool)) or metric_value is None
+            }
+    return sample
+
+
 class PortalFleetCertifier:
     def __init__(
         self,
@@ -482,7 +646,18 @@ class PortalFleetCertifier:
         )
 
     async def _probe(self, entry: PortalInventoryEntry) -> _ProbeResult:
-        checked = validate_public_http_url(entry.listing_url)
+        source_checked = validate_public_http_url(entry.listing_url)
+        checked = source_checked
+        source_approved_hosts = tuple(
+            dict.fromkeys(
+                [
+                    *source_checked.allowed_hosts,
+                    *_approved_hosts_for_url(source_checked.normalized_url),
+                ]
+            )
+        )
+        handoff_allowed_hosts: tuple[str, ...] = ()
+        handoff_route_resolution: dict[str, Any] = {}
         direct_detection = detect_portal(listing_url=checked.normalized_url, html="", text_content="")
         direct_outcome = await self._acquire(
             listing_url=checked.normalized_url,
@@ -508,9 +683,31 @@ class PortalFleetCertifier:
                 effective_listing_url=effective_checked.normalized_url,
                 detection=effective_detection,
                 allowed_hosts=tuple(
-                    dict.fromkeys([*checked.allowed_hosts, *selected.trusted_hosts])
+                    dict.fromkeys(
+                        [
+                            *source_approved_hosts,
+                            *_approved_hosts_for_url(effective_checked.normalized_url),
+                            *selected.trusted_hosts,
+                        ]
+                    )
                 ),
                 acquisition_outcome=direct_outcome,
+            )
+
+        handoff = _empty_acquisition_listing_handoff(
+            direct_outcome,
+            source_url=source_checked.normalized_url,
+        )
+        if handoff is not None:
+            handoff_url, handoff_allowed_hosts, handoff_route_resolution = handoff
+            checked = validate_public_http_url(
+                handoff_url,
+                allowed_hosts=handoff_allowed_hosts,
+            )
+            direct_detection = detect_portal(
+                listing_url=checked.normalized_url,
+                html="",
+                text_content="",
             )
 
         from crawl4ai import AsyncWebCrawler
@@ -531,8 +728,17 @@ class PortalFleetCertifier:
                 return _ProbeResult(
                     effective_listing_url=checked.normalized_url,
                     detection=replace(direct_detection, surface_kind="javascript_shell"),
-                    allowed_hosts=checked.allowed_hosts,
+                    allowed_hosts=tuple(
+                        dict.fromkeys(
+                            [
+                                *source_approved_hosts,
+                                *handoff_allowed_hosts,
+                                *checked.allowed_hosts,
+                            ]
+                        )
+                    ),
                     acquisition_outcome=direct_outcome,
+                    route_resolution=handoff_route_resolution,
                 )
             raise RuntimeError(
                 f"Listing probe failed: {failure_message}"
@@ -553,6 +759,15 @@ class PortalFleetCertifier:
             html=page_html,
             structured_links=getattr(result, "links", None),
         )
+        route_resolution_payload = route_resolution.to_dict()
+        if handoff_route_resolution:
+            if route_resolution.selected is None:
+                route_resolution_payload = {
+                    **handoff_route_resolution,
+                    "rendered_resolution": route_resolution_payload,
+                }
+            else:
+                route_resolution_payload["upstream_handoff"] = handoff_route_resolution
 
         original_host = checked.hostname
         final_host = final_checked.hostname
@@ -596,14 +811,17 @@ class PortalFleetCertifier:
                 allowed_hosts=tuple(
                     dict.fromkeys(
                         [
+                            *source_approved_hosts,
+                            *handoff_allowed_hosts,
                             *checked.allowed_hosts,
                             *route_resolution.trusted_hosts,
+                            *_approved_hosts_for_url(final_checked.normalized_url),
                             *selected_hosts,
                         ]
                     )
                 ),
                 acquisition_outcome=shell_outcome,
-                route_resolution=route_resolution.to_dict(),
+                route_resolution=route_resolution_payload,
             )
 
         effective_url = resolved_checked.normalized_url
@@ -632,6 +850,8 @@ class PortalFleetCertifier:
             inferred_outcome = await self._acquire(listing_url=effective_url, detection=detection)
             if inferred_outcome.selected is not None:
                 approved_hosts = [
+                    *source_approved_hosts,
+                    *handoff_allowed_hosts,
                     *checked.allowed_hosts,
                     *route_resolution.trusted_hosts,
                     *_approved_hosts_for_url(final_checked.normalized_url),
@@ -643,7 +863,7 @@ class PortalFleetCertifier:
                     detection=detection,
                     allowed_hosts=tuple(dict.fromkeys(approved_hosts)),
                     acquisition_outcome=inferred_outcome,
-                    route_resolution=route_resolution.to_dict(),
+                    route_resolution=route_resolution_payload,
                 )
             async with AsyncWebCrawler(config=browser_config) as crawler:
                 hinted_result = await crawler.arun(
@@ -697,6 +917,8 @@ class PortalFleetCertifier:
 
         acquisition_outcome = await self._acquire(listing_url=effective_url, detection=detection)
         approved_hosts = [
+            *source_approved_hosts,
+            *handoff_allowed_hosts,
             *checked.allowed_hosts,
             *route_resolution.trusted_hosts,
             *_approved_hosts_for_url(final_checked.normalized_url),
@@ -709,7 +931,7 @@ class PortalFleetCertifier:
             detection=detection,
             allowed_hosts=tuple(dict.fromkeys(approved_hosts)),
             acquisition_outcome=acquisition_outcome,
-            route_resolution=route_resolution.to_dict(),
+            route_resolution=route_resolution_payload,
         )
 
     def _failed_payload_writer(self, source_id: str) -> Callable[[str, Any], None]:
@@ -735,7 +957,18 @@ class PortalFleetCertifier:
         stage = "probe"
         probe: _ProbeResult | None = None
         event_counts: Counter[str] = Counter()
+        event_samples: list[dict[str, Any]] = []
         gpu_before = query_gpu_snapshot()
+
+        def record_event(event: str, payload: dict[str, Any]) -> None:
+            event_counts.update([event])
+            if event not in _DIAGNOSTIC_EVENTS or len(event_samples) >= 40:
+                return
+            same_event_count = sum(
+                sample.get("event") == event for sample in event_samples
+            )
+            if same_event_count < 5:
+                event_samples.append(_bounded_event_sample(event, payload))
 
         try:
             probe = await asyncio.wait_for(
@@ -829,7 +1062,7 @@ class PortalFleetCertifier:
                         validate_extracted_job=validate_certification_job,
                         should_attempt_llm=should_attempt_certification_llm,
                         validate_llm_extracted_job=assess_llm_job_grounding,
-                        on_event=lambda event, payload: event_counts.update([event]),
+                        on_event=record_event,
                         on_failed_payload=self._failed_payload_writer(entry.source_id),
                     ),
                     acquisition_outcome=probe.acquisition_outcome,
@@ -858,7 +1091,7 @@ class PortalFleetCertifier:
                 elif not orchestration.discovered_job_urls and linkless_candidate_count:
                     error_type = "linkless_interaction_unresolved"
                     error_message = (
-                        f"Discovery retained {linkless_candidate_count} grounded linkless "
+                        f"Discovery retained {linkless_candidate_count} bounded linkless "
                         "candidates, but bounded public interaction exposed no unique detail URL."
                     )
                 else:
@@ -933,6 +1166,7 @@ class PortalFleetCertifier:
                 ),
                 route_resolution=probe.route_resolution,
                 discovery_quality=discovery_quality,
+                event_samples=event_samples,
             )
         except Exception as exc:
             error_type, certification_status = _classify_error(exc)
@@ -978,6 +1212,7 @@ class PortalFleetCertifier:
                     or None
                 ),
                 route_resolution=(probe.route_resolution if probe else {}),
+                event_samples=event_samples,
             )
 
 

@@ -16,11 +16,12 @@ from .contracts import (
     ScrapeStrategy,
 )
 from .dom_discovery import DomCandidateDiscoverer
+from .job_evidence import is_plausible_job_title
 from .rendered_detail import RenderedDetailExtractor, RenderedDetailResult
 from .safety import PortalUrlSafetyError, validate_public_http_url
 
 
-LINKLESS_INTERACTION_CONTRACT_VERSION = "1.0"
+LINKLESS_INTERACTION_CONTRACT_VERSION = "1.1"
 _LINKLESS_CLICK_SCRIPT = r"""
 (nodeToken) => {
   const map = window.__jobMinerNodeMap;
@@ -70,12 +71,15 @@ _QUERY_NAVIGATION_KEYS = {
 @dataclass(frozen=True)
 class LinklessInteractionOptions:
     max_interactions: int = 10
+    verification_minimum_confidence: float = 0.62
     settle_time_ms: int = 1_200
     load_state_timeout_ms: int = 8_000
 
     def __post_init__(self) -> None:
         if not 0 <= self.max_interactions <= 100:
             raise ValueError("max_interactions must be between 0 and 100")
+        if not 0.0 <= self.verification_minimum_confidence <= 1.0:
+            raise ValueError("verification_minimum_confidence must be between 0 and 1")
         if not 0 <= self.settle_time_ms <= 30_000:
             raise ValueError("settle_time_ms must be between 0 and 30000")
         if not 500 <= self.load_state_timeout_ms <= 60_000:
@@ -116,12 +120,27 @@ class LiveLinklessResolver:
             if candidate.kind == DiscoveryCandidateKind.DOM_CLICK
             and candidate.detail_url is None
         ]
-        eligible = [
+        grounded = [
             candidate
             for candidate in raw_candidates
             if bool(candidate.evidence.get("structural_job_grounding"))
             and bool(candidate.evidence.get("evidence_preserving"))
         ]
+        grounded_ids = {candidate.candidate_id for candidate in grounded}
+        verification_only = [
+            candidate
+            for candidate in raw_candidates
+            if candidate.candidate_id not in grounded_ids
+            and candidate.confidence >= self.options.verification_minimum_confidence
+            and bool(candidate.evidence.get("page_job_context"))
+            and str(candidate.evidence.get("origin") or "")
+            == "adaptive_dom_repeated_cluster"
+            and is_plausible_job_title(candidate.title_hint)
+        ]
+        eligible = [*grounded, *verification_only]
+        verification_only_ids = {
+            candidate.candidate_id for candidate in verification_only
+        }
         bounded = eligible[: self.options.max_interactions]
         resolved: list[DiscoveryCandidate] = []
         resolved_source_ids: list[str] = []
@@ -130,6 +149,8 @@ class LiveLinklessResolver:
             "contract_version": LINKLESS_INTERACTION_CONTRACT_VERSION,
             "linkless_candidates": len(raw_candidates),
             "eligible_candidates": len(eligible),
+            "grounded_candidates": len(grounded),
+            "verification_only_candidates": len(verification_only),
             "ineligible_candidates": len(raw_candidates) - len(eligible),
             "attempted": 0,
             "resolved": 0,
@@ -147,6 +168,7 @@ class LiveLinklessResolver:
         current_report = session.report
 
         for position, original in enumerate(bounded):
+            requires_rendered_verification = original.candidate_id in verification_only_ids
             if position:
                 try:
                     current_report = await session.collector.capture_page(
@@ -272,6 +294,16 @@ class LiveLinklessResolver:
                 errors.append(
                     f"{original.candidate_id}: destination failed rendered job verification "
                     f"({rendered.reason})"
+                )
+                await self._close_popups(popup_pages)
+                continue
+            if requires_rendered_verification and (
+                rendered is None or rendered.job is None
+            ):
+                metrics["unverified_destinations"] += 1
+                errors.append(
+                    f"{original.candidate_id}: weak structural candidate did not produce "
+                    "a strictly verified rendered job"
                 )
                 await self._close_popups(popup_pages)
                 continue
@@ -452,7 +484,10 @@ class LiveLinklessResolver:
             "source_structural_job_grounding": bool(
                 original.evidence.get("structural_job_grounding")
             ),
-            "evidence_preserving": bool(original.evidence.get("evidence_preserving")),
+            "evidence_preserving": bool(
+                original.evidence.get("evidence_preserving")
+                or preextracted_job is not None
+            ),
             "cluster_signature": original.evidence.get("cluster_signature"),
             "rendered_detail_verified": preextracted_job is not None,
             "live_node_token_hash": hashlib.sha256(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from typing import Any, Iterable
+from urllib.parse import unquote, urlsplit
 
 from ..crawl.browser_evidence import (
     BrowserEvidenceCollector,
@@ -19,9 +21,19 @@ from .contracts import (
 from .dom_discovery import DomCandidateDiscoverer, DomDiscoveryOptions
 from .json_discovery import JsonCandidateDiscoverer, JsonDiscoveryOptions
 from .live_interaction import LinklessInteractionOptions, LiveLinklessResolver
+from .url_intelligence import assess_job_candidate_url
 
 
 _ACCESS_BLOCK_STATUS_CODES = {401, 403, 407, 429}
+_LISTING_EXPANSION_ROUTE = re.compile(
+    r"/(?:jobs?|careers?|openings?|opportunities|employment|search)(?:/|$)",
+    re.I,
+)
+_LISTING_EXPANSION_REJECT = re.compile(
+    r"\b(job\s*cart|alerts?|submit\s+(?:your\s+)?resume|upload\s+resume|"
+    r"benefits?|employers?|salary\s+guide|resources?)\b",
+    re.I,
+)
 
 
 class AdaptiveDomDiscoveryService:
@@ -68,19 +80,33 @@ class AdaptiveDomDiscoveryService:
                 listing_url,
                 allowed_hosts=approved_hosts,
             ) as session:
-                return await self._discover_report(
+                batch = await self._discover_report(
                     session.report,
                     listing_url=listing_url,
                     max_candidates=max_candidates,
                     session=session,
                 )
+            return await self._expand_listing_routes(
+                collector,
+                batch,
+                listing_url=listing_url,
+                allowed_hosts=approved_hosts,
+                max_candidates=max_candidates,
+            )
 
         report = await collector.capture(listing_url, allowed_hosts=approved_hosts)
-        return await self._discover_report(
+        batch = await self._discover_report(
             report,
             listing_url=listing_url,
             max_candidates=max_candidates,
             session=None,
+        )
+        return await self._expand_listing_routes(
+            collector,
+            batch,
+            listing_url=listing_url,
+            allowed_hosts=approved_hosts,
+            max_candidates=max_candidates,
         )
 
     async def _discover_report(
@@ -180,6 +206,158 @@ class AdaptiveDomDiscoveryService:
             }
         )
 
+    async def _expand_listing_routes(
+        self,
+        collector: Any,
+        batch: DiscoveryBatch,
+        *,
+        listing_url: str,
+        allowed_hosts: tuple[str, ...],
+        max_candidates: int,
+    ) -> DiscoveryBatch:
+        """Follow at most two evidence-backed category/listing routes.
+
+        This is a generic breadth-one expansion, not recursive crawling.  It is
+        used only when the first rendered surface contains no high-confidence
+        job-detail URL, and every destination remains inside the caller's
+        approved public host scope.
+        """
+
+        capture = getattr(collector, "capture", None)
+        high_confidence = [
+            candidate
+            for candidate in batch.candidates
+            if candidate.detail_url
+            and assess_job_candidate_url(
+                candidate.detail_url,
+                listing_url=listing_url,
+            ).score
+            >= 8
+        ]
+        metrics = {
+            "attempted": 0,
+            "selected_routes": [],
+            "captured_routes": 0,
+            "failed_routes": 0,
+            "added_candidates": 0,
+            "skipped_high_confidence_details_present": bool(high_confidence),
+            "available": callable(capture),
+        }
+        if high_confidence or not callable(capture):
+            return self._with_expansion_metrics(batch, metrics)
+
+        routes = self._listing_expansion_candidates(
+            batch.candidates,
+            listing_url=listing_url,
+        )[:2]
+        metrics["selected_routes"] = routes
+        if not routes:
+            return self._with_expansion_metrics(batch, metrics)
+
+        expanded_candidates = list(batch.candidates)
+        reasons = list(batch.reasons)
+        pages_visited = batch.pages_visited
+        before = len(self._select_candidates(expanded_candidates, max_candidates=max_candidates))
+        for route in routes:
+            metrics["attempted"] += 1
+            try:
+                report = await capture(route, allowed_hosts=allowed_hosts)
+                expanded = await self._discover_report(
+                    report,
+                    listing_url=route,
+                    max_candidates=max_candidates,
+                    session=None,
+                )
+            except Exception as exc:
+                metrics["failed_routes"] += 1
+                reasons.append(
+                    f"Bounded listing expansion failed for {route}: "
+                    f"{type(exc).__name__}: {exc}"[:1_000]
+                )
+                continue
+            metrics["captured_routes"] += 1
+            pages_visited += expanded.pages_visited
+            expanded_candidates.extend(expanded.candidates)
+            reasons.extend(expanded.reasons)
+
+        selected = self._select_candidates(
+            expanded_candidates,
+            max_candidates=max_candidates,
+        )
+        metrics["added_candidates"] = max(0, len(selected) - before)
+        merged_metrics = dict(batch.metrics)
+        merged_metrics["listing_expansion"] = metrics
+        merged_metrics["candidates"] = len(selected)
+        merged_metrics["url_candidates"] = sum(
+            candidate.detail_url is not None for candidate in selected
+        )
+        merged_metrics["linkless_candidates"] = sum(
+            candidate.detail_url is None for candidate in selected
+        )
+        return batch.model_copy(
+            update={
+                "candidates": selected,
+                "pages_visited": pages_visited,
+                "pagination_complete": False,
+                "completeness": CompletenessState.PARTIAL,
+                "metrics": merged_metrics,
+                "reasons": list(dict.fromkeys(reasons)),
+            }
+        )
+
+    @staticmethod
+    def _listing_expansion_candidates(
+        candidates: Iterable[DiscoveryCandidate],
+        *,
+        listing_url: str,
+    ) -> list[str]:
+        listing_host = str(urlsplit(listing_url).hostname or "").lower().rstrip(".")
+        ranked: list[tuple[int, float, str]] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            url = str(candidate.detail_url or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            try:
+                parsed = urlsplit(url)
+            except ValueError:
+                continue
+            if str(parsed.hostname or "").lower().rstrip(".") != listing_host:
+                continue
+            assessment = assess_job_candidate_url(url, listing_url=listing_url)
+            if assessment.hard_reject or not 0 <= assessment.score < 8:
+                continue
+            route_text = " ".join(
+                (
+                    unquote(parsed.path),
+                    unquote(parsed.fragment),
+                    str(candidate.title_hint or ""),
+                )
+            )
+            if not _LISTING_EXPANSION_ROUTE.search(f"/{route_text.lstrip('/')}"):
+                continue
+            if _LISTING_EXPANSION_REJECT.search(route_text.replace("-", " ")):
+                continue
+            origin = str(candidate.evidence.get("origin") or "")
+            if origin not in {
+                "adaptive_dom_individual_link",
+                "adaptive_dom_repeated_cluster",
+            }:
+                continue
+            ranked.append((assessment.score, candidate.confidence, url))
+        ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        return [url for _, _, url in ranked]
+
+    @staticmethod
+    def _with_expansion_metrics(
+        batch: DiscoveryBatch,
+        expansion: dict[str, Any],
+    ) -> DiscoveryBatch:
+        metrics = dict(batch.metrics)
+        metrics["listing_expansion"] = expansion
+        return batch.model_copy(update={"metrics": metrics})
+
     @classmethod
     def _merge_evidence_batches(
         cls,
@@ -250,6 +428,20 @@ class AdaptiveDomDiscoveryService:
         ranked = sorted(
             selected.values(),
             key=lambda candidate: (
+                -int(
+                    candidate.preextracted_job is not None
+                    and str(candidate.evidence.get("origin") or "")
+                    in {"network_json_record", "inline_json_record"}
+                ),
+                -int(
+                    candidate.detail_url is not None
+                    and not bool(candidate.evidence.get("synthetic_detail_identity"))
+                ),
+                -(
+                    assess_job_candidate_url(candidate.detail_url).score
+                    if candidate.detail_url is not None
+                    else -100
+                ),
                 -int(candidate.preextracted_job is not None),
                 -int(bool(candidate.evidence.get("evidence_preserving"))),
                 -candidate.confidence,
