@@ -196,6 +196,19 @@ def test_valid_candidate_is_accepted_with_quality_score() -> None:
     assert result.reason_codes == []
 
 
+def test_generic_find_work_title_drift_is_quarantined() -> None:
+    payload = _valid_payload()
+    payload["jobTitle"] = "FIND WORK"
+    result = validate_phase6d_candidate(
+        source_id="source_a",
+        payload=payload,
+        source_listing_url="https://source.example/jobs",
+        trusted_hosts=["source.example"],
+    )
+    assert result.status == "quarantined"
+    assert "non_job_content" in result.reason_codes
+
+
 def test_missing_title_and_short_description_are_quarantined() -> None:
     payload = _valid_payload(description="Too short")
     payload.pop("jobTitle")

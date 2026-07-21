@@ -12,12 +12,29 @@ from pydantic import Field, field_validator, model_validator
 
 from .contracts import ContractModel
 from .production_cohort import PRODUCTION_COHORT_CONTRACT_VERSION, read_source_id_file
+from .production_rollout import (
+    PHASE_7D1,
+    PHASE_7D1_COHORT_CONTRACT_VERSION,
+    PHASE_7D1_COHORT_STATUS,
+)
 
 
 PHASE_6A_CONTRACT_VERSION = "1.0"
 PHASE_6A = "6A"
 EXPECTED_COHORT_PHASE = "5.5C"
 EXPECTED_COHORT_STATUS = "frozen_certified_cohort"
+SUPPORTED_COHORT_DESCRIPTORS = {
+    (
+        PRODUCTION_COHORT_CONTRACT_VERSION,
+        EXPECTED_COHORT_PHASE,
+        EXPECTED_COHORT_STATUS,
+    ),
+    (
+        PHASE_7D1_COHORT_CONTRACT_VERSION,
+        PHASE_7D1,
+        PHASE_7D1_COHORT_STATUS,
+    ),
+}
 
 
 class ProductionIngestionError(ValueError):
@@ -178,7 +195,7 @@ def load_phase6a_production_cohort(
     *,
     expected_cohort_size: int = 19,
 ) -> LoadedProductionCohort:
-    """Load and independently verify the immutable Phase 5.5C cohort manifest."""
+    """Load and independently verify a supported immutable cohort manifest."""
 
     payload = _load_json_object(Path(cohort_path))
     stored_hash = str(payload.get("cohort_sha256") or "").strip().lower()
@@ -187,12 +204,15 @@ def load_phase6a_production_cohort(
     if not stored_hash or stored_hash != _canonical_sha256(unhashed):
         raise ProductionIngestionError("Frozen cohort checksum is missing or invalid")
 
-    if str(payload.get("contract_version") or "") != PRODUCTION_COHORT_CONTRACT_VERSION:
-        raise ProductionIngestionError("Unsupported frozen cohort contract version")
-    if str(payload.get("phase") or "") != EXPECTED_COHORT_PHASE:
-        raise ProductionIngestionError("Phase 6A requires a Phase 5.5C frozen cohort")
-    if str(payload.get("cohort_status") or "") != EXPECTED_COHORT_STATUS:
-        raise ProductionIngestionError("Cohort is not in frozen_certified_cohort status")
+    descriptor = (
+        str(payload.get("contract_version") or ""),
+        str(payload.get("phase") or ""),
+        str(payload.get("cohort_status") or ""),
+    )
+    if descriptor not in SUPPORTED_COHORT_DESCRIPTORS:
+        raise ProductionIngestionError(
+            "Unsupported frozen cohort contract, phase, or status combination"
+        )
 
     cohort_ids = _unique_ids(payload.get("cohort_source_ids"), field="cohort_source_ids")
     deferred_ids = _unique_ids(payload.get("deferred_source_ids"), field="deferred_source_ids")
@@ -230,6 +250,18 @@ def load_phase6a_production_cohort(
             raise ProductionIngestionError(
                 f"Frozen cohort safety control {key} must be {expected!r}"
             )
+    if descriptor[1] == PHASE_7D1:
+        phase7d_safety = {
+            "sample_job_evidence_revalidated": True,
+            "partial_sources_excluded": True,
+            "failed_sources_excluded": True,
+            "lifecycle_reconciliation_requires_two_clean_runs": True,
+        }
+        for key, expected in phase7d_safety.items():
+            if safety.get(key) is not expected:
+                raise ProductionIngestionError(
+                    f"Phase 7D1 cohort safety control {key} must be {expected!r}"
+                )
 
     raw_sources = payload.get("sources")
     if not isinstance(raw_sources, list):

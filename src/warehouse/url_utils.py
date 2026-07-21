@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+import re
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 _TRACKING_QUERY_PREFIXES = ("utm_",)
 _TRACKING_QUERY_NAMES = {
@@ -15,6 +16,20 @@ _TRACKING_QUERY_NAMES = {
     "ref_src",
     "source",
 }
+
+_JOB_HASH_ROUTE = re.compile(
+    r"(?:^|/)(?:jobs?|openings?|positions?|requisitions?|vacancies|roles?)/"
+    r"(?:[^/?#]+/)*[^/?#]+(?:/|$)",
+    re.IGNORECASE,
+)
+
+
+def _meaningful_job_fragment(value: str) -> str:
+    """Keep SPA fragments that identify a job, while dropping page anchors."""
+
+    fragment = unquote(str(value or "")).strip().rstrip("/")
+    logical_route = fragment.lstrip("!/")
+    return fragment if logical_route and _JOB_HASH_ROUTE.search(logical_route) else ""
 
 
 def canonical_job_url(value: str | None) -> str:
@@ -47,7 +62,8 @@ def canonical_job_url(value: str | None) -> str:
         kept_query.append((key, val))
 
     query = urlencode(kept_query, doseq=True)
-    return urlunsplit((scheme, netloc, path, query, ""))
+    fragment = _meaningful_job_fragment(parts.fragment)
+    return urlunsplit((scheme, netloc, path, query, fragment))
 
 
 def canonical_job_urls(values: list[str] | tuple[str, ...] | set[str]) -> list[str]:

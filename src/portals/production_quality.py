@@ -10,6 +10,7 @@ from pydantic import Field
 from pymongo.database import Database
 
 from .contracts import ContractModel
+from .job_evidence import job_title_rejection_reason
 from .production_jobs import (
     Phase6CNormalizedJobInput,
     Phase6CUpsertResult,
@@ -309,6 +310,7 @@ def validate_phase6d_candidate(
             field_errors.setdefault(field, []).append(message)
 
     title = normalized.get("title")
+    title_rejection = job_title_rejection_reason(title) if title else None
     description = normalized.get("description")
     external_id = normalized.get("external_job_id")
     canonical_value = normalized.get("canonical_url") or normalized.get("job_url") or normalized.get("source_url")
@@ -316,7 +318,7 @@ def validate_phase6d_candidate(
 
     if not title:
         add("missing_title", "Job title is required", "title")
-    elif str(title).casefold() in _GENERIC_TITLES:
+    elif str(title).casefold() in _GENERIC_TITLES or title_rejection is not None:
         add("non_job_content", f"Generic non-job title: {title}", "title")
 
     if not description:
@@ -366,7 +368,13 @@ def validate_phase6d_candidate(
         warnings.append("posted_date exceeded 300 characters and was removed")
 
     identity_score = 25 if external_id else 22 if _valid_http_url(str(canonical_value)) else 15 if title and fallback_evidence else 0
-    title_score = 20 if title and str(title).casefold() not in _GENERIC_TITLES else 0
+    title_score = (
+        20
+        if title
+        and str(title).casefold() not in _GENERIC_TITLES
+        and title_rejection is None
+        else 0
+    )
     description_len = len(str(description or ""))
     if description_len >= 500:
         description_score = 30
