@@ -807,6 +807,7 @@ class PortalFleetCertifier:
                         require_complete_acquisition=False,
                         prefer_static_detail_html=True,
                         enable_adaptive_dom_fallback=True,
+                        enable_rendered_detail_fallback=True,
                         adaptive_dom_max_candidates=1_000,
                     ),
                     hooks=ScrapeOrchestratorHooks(

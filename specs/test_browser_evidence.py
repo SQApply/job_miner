@@ -232,6 +232,28 @@ class BrowserEvidenceCollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("exceeded", evidence.skipped_reason or "")
         self.assertEqual(response.body_calls, 0)
 
+    async def test_post_interaction_snapshot_does_not_navigate_or_capture_network(self) -> None:
+        page = FakePage([FakeFrame("https://careers.example.com/jobs#job/REQ-7")])
+        goto_calls = 0
+
+        async def forbidden_goto(*args, **kwargs):
+            nonlocal goto_calls
+            goto_calls += 1
+            raise AssertionError("post-interaction snapshot must not reload the page")
+
+        page.goto = forbidden_goto
+        with patch("src.portals.safety._validate_host_is_public", return_value=None):
+            report = await self.collector().snapshot_current_page(
+                page,
+                "https://careers.example.com/jobs",
+                allowed_hosts=("careers.example.com",),
+            )
+
+        self.assertEqual(goto_calls, 0)
+        self.assertEqual(report.final_url, "https://careers.example.com/jobs#job/REQ-7")
+        self.assertEqual(report.metrics["snapshot_kind"], "post_interaction_dom")
+        self.assertEqual(report.network_json, [])
+
 
 if __name__ == "__main__":
     unittest.main()

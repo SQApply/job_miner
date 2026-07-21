@@ -370,6 +370,66 @@ class BrowserEvidenceCollector:
             },
         )
 
+    async def snapshot_current_page(
+        self,
+        page: Any,
+        requested_url: str,
+        *,
+        allowed_hosts: Iterable[str],
+    ) -> BrowserEvidenceReport:
+        """Snapshot the live page after an approved interaction without reloading it.
+
+        This is intentionally DOM-only. The initial session capture owns the
+        bounded network listener; post-click evidence records the rendered
+        state that is needed for same-URL dialogs and client-side route changes.
+        """
+
+        started_at = _utc_now()
+        requested = validate_public_http_url(requested_url, allowed_hosts=allowed_hosts)
+        observed_url = str(getattr(page, "url", "") or requested.normalized_url)
+        observed = validate_public_http_url(
+            observed_url,
+            allowed_hosts=requested.allowed_hosts,
+        )
+        errors: list[str] = []
+        title: str | None = None
+        try:
+            title = str(await page.title())[:1_000] or None
+        except Exception as exc:
+            errors.append(f"title_failed: {type(exc).__name__}: {exc}"[:2_000])
+        frames = await self._capture_frames(
+            page,
+            final_url=observed.normalized_url,
+            allowed_hosts=requested.allowed_hosts,
+        )
+        node_count = sum(len(frame.nodes) for frame in frames)
+        return BrowserEvidenceReport(
+            requested_url=requested.normalized_url,
+            final_url=observed.normalized_url,
+            success=any(frame.error is None for frame in frames),
+            status_code=None,
+            title=title,
+            started_at=started_at,
+            completed_at=_utc_now(),
+            frames=frames,
+            network_json=[],
+            errors=errors,
+            metrics={
+                "snapshot_kind": "post_interaction_dom",
+                "frames_seen": len(list(getattr(page, "frames", []) or [])),
+                "frames_captured": len(frames),
+                "nodes_captured": node_count,
+                "clickable_nodes": sum(len(frame.clickable_nodes) for frame in frames),
+                "linkless_clickable_nodes": sum(
+                    len(frame.linkless_clickable_nodes) for frame in frames
+                ),
+                "inline_json_documents": sum(len(frame.inline_json) for frame in frames),
+                "network_json_responses": 0,
+                "truncated_frames": sum(frame.truncated for frame in frames),
+                "node_budget": self.options.max_nodes_total,
+            },
+        )
+
     async def _capture_frames(
         self,
         page: Any,

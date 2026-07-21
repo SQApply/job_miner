@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from ..crawl.browser_evidence import BrowserEvidenceSession
 from .contracts import (
@@ -15,6 +16,7 @@ from .contracts import (
     ScrapeStrategy,
 )
 from .dom_discovery import DomCandidateDiscoverer
+from .rendered_detail import RenderedDetailExtractor, RenderedDetailResult
 from .safety import PortalUrlSafetyError, validate_public_http_url
 
 
@@ -84,9 +86,10 @@ class LiveLinklessResolver:
     """Resolve grounded linkless cards through live ephemeral node handles.
 
     Only candidates backed by repeated structural job evidence are clicked.
-    The resolver observes public navigation or a popup URL; it never invents a
-    URL, persists a selector, imports cookies, solves a challenge, or treats an
-    unchanged modal listing URL as a unique job identity.
+    The resolver verifies public navigation against the rendered destination.
+    Same-URL dialogs may become pre-extracted jobs with a stable, portal-scoped
+    fragment identity; no XPath/CSS selector, authenticated state, or challenge
+    bypass is used.
     """
 
     def __init__(
@@ -94,9 +97,11 @@ class LiveLinklessResolver:
         *,
         options: LinklessInteractionOptions | None = None,
         discoverer: DomCandidateDiscoverer | None = None,
+        rendered_extractor: RenderedDetailExtractor | None = None,
     ) -> None:
         self.options = options or LinklessInteractionOptions()
         self.discoverer = discoverer or DomCandidateDiscoverer()
+        self.rendered_extractor = rendered_extractor or RenderedDetailExtractor()
 
     async def resolve(
         self,
@@ -131,6 +136,10 @@ class LiveLinklessResolver:
             "navigations": 0,
             "popups": 0,
             "unchanged_or_modal": 0,
+            "modal_extractions": 0,
+            "verified_details": 0,
+            "unverified_destinations": 0,
+            "verification_unavailable": 0,
             "stale_tokens": 0,
             "unsafe_destinations": 0,
             "bounded": len(eligible) > len(bounded),
@@ -217,27 +226,67 @@ class LiveLinklessResolver:
                 await self._close_popups(popup_pages)
                 continue
 
-            if not self._is_openable_detail_route(
+            rendered = await self._rendered_destination(
+                session,
+                destination_page,
+                requested_url=checked.normalized_url,
+                baseline_report=current_report,
+                original=original,
+                metrics=metrics,
+                errors=errors,
+            )
+            openable_route = self._is_openable_detail_route(
                 listing_url,
                 checked.normalized_url,
                 source_job_id=original.source_job_id,
-            ):
+            )
+            if not openable_route:
+                if rendered is not None and rendered.job is not None:
+                    modal_candidate = self._resolved_modal_candidate(
+                        original,
+                        live_candidate,
+                        listing_url=listing_url,
+                        rendered=rendered,
+                    )
+                    resolved.append(modal_candidate)
+                    resolved_source_ids.append(original.candidate_id)
+                    metrics["resolved"] += 1
+                    metrics["modal_extractions"] += 1
+                    metrics["verified_details"] += 1
+                    await self._close_popups(popup_pages)
+                    continue
                 metrics["unchanged_or_modal"] += 1
                 errors.append(
-                    f"{original.candidate_id}: click did not expose a unique public detail URL"
+                    f"{original.candidate_id}: click exposed neither a unique verified detail "
+                    "URL nor an extractable rendered modal"
                     + (f" ({click_error})" if click_error else "")
+                )
+                await self._close_popups(popup_pages)
+                continue
+
+            # With the real collector, navigation alone is not job evidence.
+            # A marketing/category destination must not be preserved simply
+            # because a structurally repeated card opened it.
+            if rendered is not None and rendered.job is None:
+                metrics["unverified_destinations"] += 1
+                errors.append(
+                    f"{original.candidate_id}: destination failed rendered job verification "
+                    f"({rendered.reason})"
                 )
                 await self._close_popups(popup_pages)
                 continue
 
             if not popup_pages:
                 metrics["navigations"] += 1
+            if rendered is not None and rendered.job is not None:
+                metrics["verified_details"] += 1
             resolved.append(
                 self._resolved_candidate(
                     original,
                     live_candidate,
                     detail_url=checked.normalized_url,
                     interaction_kind=interaction_kind,
+                    preextracted_job=rendered.job if rendered is not None else None,
                 )
             )
             resolved_source_ids.append(original.candidate_id)
@@ -257,6 +306,51 @@ class LiveLinklessResolver:
             pagination_complete=False,
             reasons=reasons,
             metrics=metrics,
+        )
+
+    async def _rendered_destination(
+        self,
+        session: BrowserEvidenceSession,
+        page: Any,
+        *,
+        requested_url: str,
+        baseline_report: Any,
+        original: DiscoveryCandidate,
+        metrics: dict[str, Any],
+        errors: list[str],
+    ) -> RenderedDetailResult | None:
+        snapshot = getattr(session.collector, "snapshot_current_page", None)
+        if not callable(snapshot):
+            metrics["verification_unavailable"] += 1
+            return None
+        try:
+            report = await snapshot(
+                page,
+                requested_url,
+                allowed_hosts=session.allowed_hosts,
+            )
+        except Exception as exc:
+            metrics["unverified_destinations"] += 1
+            errors.append(
+                f"{original.candidate_id}: post-click snapshot failed: "
+                f"{type(exc).__name__}: {exc}"[:1_000]
+            )
+            return RenderedDetailResult(
+                job=None,
+                reason="post_click_snapshot_failed",
+                metrics={"error_type": type(exc).__name__},
+            )
+        baseline_url = str(getattr(baseline_report, "final_url", "") or "")
+        same_document = requested_url.rstrip("/") == baseline_url.rstrip("/")
+        return self.rendered_extractor.extract(
+            report,
+            fallback_url=report.final_url,
+            title_hint=original.title_hint,
+            location_hint=original.location_hint,
+            # DOM deltas are meaningful for same-URL dialogs. A different URL
+            # is a complete destination document and must meet the stronger
+            # non-modal detail threshold on its own.
+            baseline_report=baseline_report if same_document else None,
         )
 
     @staticmethod
@@ -348,6 +442,7 @@ class LiveLinklessResolver:
         *,
         detail_url: str,
         interaction_kind: str,
+        preextracted_job: Any | None = None,
     ) -> DiscoveryCandidate:
         evidence = {
             "origin": "adaptive_dom_linkless_interaction",
@@ -359,6 +454,7 @@ class LiveLinklessResolver:
             ),
             "evidence_preserving": bool(original.evidence.get("evidence_preserving")),
             "cluster_signature": original.evidence.get("cluster_signature"),
+            "rendered_detail_verified": preextracted_job is not None,
             "live_node_token_hash": hashlib.sha256(
                 str(live_candidate.node_token or "").encode("utf-8")
             ).hexdigest()[:16],
@@ -368,12 +464,88 @@ class LiveLinklessResolver:
             source_job_id=original.source_job_id,
             confidence=min(0.99, max(original.confidence, live_candidate.confidence) + 0.03),
             evidence=evidence,
+            preextracted_job=(
+                preextracted_job.model_copy(update={"job_url": detail_url})
+                if preextracted_job is not None
+                else None
+            ),
         )
         return candidate.model_copy(
             update={
                 "title_hint": original.title_hint or live_candidate.title_hint,
                 "location_hint": original.location_hint or live_candidate.location_hint,
             }
+        )
+
+    @staticmethod
+    def _resolved_modal_candidate(
+        original: DiscoveryCandidate,
+        live_candidate: DiscoveryCandidate,
+        *,
+        listing_url: str,
+        rendered: RenderedDetailResult,
+    ) -> DiscoveryCandidate:
+        assert rendered.job is not None
+        source_identity = (
+            original.source_job_id
+            or rendered.job.job_reference
+            or hashlib.sha256(
+                "|".join(
+                    (
+                        str(rendered.job.title or original.title_hint or ""),
+                        str(rendered.job.location_text or original.location_hint or ""),
+                    )
+                ).encode("utf-8")
+            ).hexdigest()[:20]
+        )
+        safe_identity = re.sub(r"[^A-Za-z0-9._-]+", "-", str(source_identity)).strip("-")
+        safe_identity = safe_identity[:120] or hashlib.sha256(
+            original.candidate_id.encode("utf-8")
+        ).hexdigest()[:20]
+        parts = urlsplit(listing_url)
+        detail_url = urlunsplit(
+            (parts.scheme, parts.netloc, parts.path or "/", parts.query, f"job/{safe_identity}")
+        )
+        evidence = {
+            "origin": "adaptive_dom_linkless_interaction",
+            "contract_version": LINKLESS_INTERACTION_CONTRACT_VERSION,
+            "source_candidate_id": original.candidate_id,
+            "interaction_kind": "same_url_modal",
+            "source_structural_job_grounding": bool(
+                original.evidence.get("structural_job_grounding")
+            ),
+            "evidence_preserving": True,
+            "rendered_detail_verified": True,
+            "synthetic_detail_identity": True,
+            "cluster_signature": original.evidence.get("cluster_signature"),
+            "rendered_detail_metrics": dict(rendered.metrics),
+            "live_node_token_hash": hashlib.sha256(
+                str(live_candidate.node_token or "").encode("utf-8")
+            ).hexdigest()[:16],
+        }
+        job = rendered.job.model_copy(
+            update={
+                "job_url": detail_url,
+                "apply_url": rendered.job.apply_url or listing_url,
+                "job_reference": rendered.job.job_reference or original.source_job_id,
+            }
+        )
+        digest = hashlib.sha256(
+            f"{listing_url}|{source_identity}".encode("utf-8")
+        ).hexdigest()[:24]
+        return DiscoveryCandidate(
+            candidate_id=f"modal_{digest}",
+            kind=DiscoveryCandidateKind.MODAL,
+            detail_url=detail_url,
+            apply_url=job.apply_url,
+            source_job_id=job.job_reference or original.source_job_id,
+            title_hint=job.title or original.title_hint,
+            location_hint=job.location_text or original.location_hint,
+            node_token=live_candidate.node_token or original.node_token,
+            frame_url=live_candidate.frame_url or original.frame_url,
+            confidence=max(0.90, rendered.confidence),
+            evidence=evidence,
+            preextracted_job=job,
         )
 
     @staticmethod

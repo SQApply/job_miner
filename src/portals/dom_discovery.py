@@ -32,6 +32,14 @@ _ROW_JOB_EVIDENCE = re.compile(
     r"vacanc(?:y|ies)|opening|openings)\b",
     re.I,
 )
+_ROW_STRONG_JOB_EVIDENCE = re.compile(
+    r"\b(?:job\s+)?location\s*[:\-]|"
+    r"\b[A-Z][A-Za-z .'-]+,\s*[A-Z]{2}\b|"
+    r"\b(?:posted|date\s+posted|requisition|job\s+(?:id|reference))\b|"
+    r"\b(?:view|open)\s+(?:job|role|position)\b|"
+    r"\bapply\s+(?:now|for)\b",
+    re.I,
+)
 _NAVIGATION_TEXT = re.compile(
     r"^(home|about(?: us)?|contact(?: us)?|privacy|terms|resources|news|"
     r"blog|login|sign in|register|cookie settings|skip to main content|"
@@ -197,6 +205,10 @@ class DomCandidateDiscoverer:
                     candidate.confidence >= self.options.evidence_preservation_confidence
                     for candidate in deduplicated
                 ),
+                "locally_grounded_candidates": sum(
+                    bool(candidate.evidence.get("candidate_local_job_grounding"))
+                    for candidate in deduplicated
+                ),
                 "bounded": bool(len(candidates) > self.options.max_candidates),
             }
         )
@@ -274,7 +286,7 @@ class DomCandidateDiscoverer:
                 )
                 if confidence < self.options.minimum_confidence:
                     continue
-                preservation_eligible = (
+                cluster_preservation_eligible = (
                     page_has_job_context
                     and unique_identity_ratio >= 0.75
                     and (
@@ -296,7 +308,7 @@ class DomCandidateDiscoverer:
                         table_rows=table_rows,
                         page_has_job_context=page_has_job_context,
                         row_has_job_evidence=row_has_job_evidence,
-                        preservation_eligible=preservation_eligible,
+                        preservation_eligible=cluster_preservation_eligible,
                     )
                     if candidate is not None:
                         candidates.append(candidate)
@@ -369,6 +381,25 @@ class DomCandidateDiscoverer:
         row_has_job_evidence: bool,
         preservation_eligible: bool,
     ) -> DiscoveryCandidate | None:
+        local_text = " ".join(row.text_values)
+        local_evidence_signals = {
+            " ".join(match.group(0).lower().split())
+            for match in _ROW_JOB_EVIDENCE.finditer(local_text)
+        }
+        candidate_local_job_evidence = bool(local_evidence_signals)
+        strong_local_job_evidence = bool(_ROW_STRONG_JOB_EVIDENCE.search(local_text))
+        candidate_local_job_grounding = bool(
+            preservation_eligible
+            and (
+                # Tabular result rows are independently structured records;
+                # non-table cards must carry job evidence inside that card,
+                # not merely inherit the word "jobs" from the page or cluster.
+                (table_rows and len(row.text_values) >= 2)
+                or strong_local_job_evidence
+                or len(local_evidence_signals) >= 2
+                or row.source_job_id
+            )
+        )
         evidence = {
             "origin": "adaptive_dom_repeated_cluster",
             "contract_version": DOM_DISCOVERY_CONTRACT_VERSION,
@@ -384,10 +415,14 @@ class DomCandidateDiscoverer:
             "table_rows": table_rows,
             "page_job_context": page_has_job_context,
             "row_job_evidence": row_has_job_evidence,
-            "structural_job_grounding": preservation_eligible,
+            "candidate_local_job_evidence": candidate_local_job_evidence,
+            "candidate_local_job_evidence_count": len(local_evidence_signals),
+            "strong_local_job_evidence": strong_local_job_evidence,
+            "candidate_local_job_grounding": candidate_local_job_grounding,
+            "structural_job_grounding": candidate_local_job_grounding,
             "row_text": list(row.text_values[:12]),
             "evidence_preserving": (
-                preservation_eligible
+                candidate_local_job_grounding
                 and confidence >= self.options.evidence_preservation_confidence
             ),
         }

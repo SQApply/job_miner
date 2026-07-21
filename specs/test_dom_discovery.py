@@ -275,6 +275,70 @@ class StructuralDomDiscoveryTests(unittest.TestCase):
         self.assertEqual(urls, [])
         self.assertEqual(metrics["adaptive_urls_rejected_hard"], 1)
 
+    def test_page_level_jobs_word_cannot_preserve_repeated_navigation_cards(self) -> None:
+        nodes = [
+            dom_node("n:body", None, "body", "body|||main"),
+            dom_node("n:main", "n:body", "main", "main|main||div", role="main"),
+            dom_node("n:grid", "n:main", "div", "div|||article,article,article"),
+        ]
+        for index, (label, slug) in enumerate(
+            (
+                ("Salary guide", "salary-guide"),
+                ("Professional services", "professional"),
+                ("Permanent recruitment", "permanent-recruitment"),
+            ),
+            start=1,
+        ):
+            root = f"n:category{index}"
+            nodes.extend(
+                [
+                    dom_node(root, "n:grid", "article", "article|article||h2,p,a", role="article"),
+                    dom_node(f"{root}:h", root, "h2", "h2|heading||", text=label, role="heading"),
+                    dom_node(
+                        f"{root}:p",
+                        root,
+                        "p",
+                        "p|||",
+                        text="Browse workforce insights and employer services.",
+                    ),
+                    dom_node(
+                        f"{root}:a",
+                        root,
+                        "a",
+                        "a|link|c|",
+                        text="Learn more",
+                        href=f"https://careers.example.com/employers/{slug}",
+                        role="link",
+                        clickable=True,
+                    ),
+                ]
+            )
+
+        batch = DomCandidateDiscoverer().discover(
+            evidence_report(nodes, title="Find Jobs and Careers")
+        )
+        self.assertEqual(len(batch.candidates), 3)
+        self.assertTrue(
+            all(
+                not candidate.evidence["candidate_local_job_grounding"]
+                and not candidate.evidence["evidence_preserving"]
+                for candidate in batch.candidates
+            )
+        )
+
+        urls, metrics = preserve_evidence_backed_urls(
+            [],
+            batch.candidates,
+            ranking_metrics={
+                "rejected_candidates": [
+                    {"url": candidate.detail_url, "hard_reject": False}
+                    for candidate in batch.candidates
+                ]
+            },
+        )
+        self.assertEqual(urls, [])
+        self.assertEqual(metrics["adaptive_urls_rejected_weak_evidence"], 3)
+
 
 class FakeCollector:
     def __init__(self, report: BrowserEvidenceReport) -> None:

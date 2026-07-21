@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from ..crawl.browser_lane import (
     build_browser_config,
@@ -32,6 +33,7 @@ from .contracts import (
     ScrapeStrategy,
 )
 from .page_quality import assess_page_quality
+from .rendered_detail import RenderedDetailExtractionService
 from .url_intelligence import promote_trusted_detail_url
 
 
@@ -112,6 +114,7 @@ class ScrapeExecutionOptions:
     require_complete_acquisition: bool = True
     prefer_static_detail_html: bool = False
     enable_adaptive_dom_fallback: bool = False
+    enable_rendered_detail_fallback: bool = False
     adaptive_dom_max_candidates: int = 1_000
 
     def __post_init__(self) -> None:
@@ -212,6 +215,7 @@ class ScrapeOrchestrator:
         acquisition_hints: dict[str, str] | None = None,
         acquisition_registry: AcquisitionRegistry | None = None,
         adaptive_dom_service: Any = None,
+        rendered_detail_service: Any = None,
     ) -> None:
         self.blueprint = blueprint
         self.system_config = system_config
@@ -222,6 +226,7 @@ class ScrapeOrchestrator:
         self.acquisition_hints = dict(acquisition_hints or {})
         self.acquisition_registry = acquisition_registry or default_acquisition_registry()
         self.adaptive_dom_service = adaptive_dom_service
+        self.rendered_detail_service = rendered_detail_service
 
     async def run(
         self,
@@ -604,6 +609,11 @@ class ScrapeOrchestrator:
         concurrency = max(1, min(options.detail_concurrency, len(attempted_urls) or 1))
         semaphore = asyncio.Semaphore(concurrency)
         rate_limiter = _RateLimiter(options.requests_per_minute)
+        rendered_detail_service = self.rendered_detail_service
+        if options.enable_rendered_detail_fallback and rendered_detail_service is None:
+            rendered_detail_service = RenderedDetailExtractionService(
+                self.system_config.browser
+            )
         llm_strategy: Any = None
         llm_strategy_lock = asyncio.Lock()
 
@@ -858,6 +868,19 @@ class ScrapeOrchestrator:
                                 error_message=last_error,
                                 extraction_method="browser_acquisition",
                             )
+                            if attempt == 1 and rendered_detail_service is not None:
+                                rendered_job = await self._try_rendered_detail(
+                                    rendered_detail_service,
+                                    hooks=hooks,
+                                    rate_limiter=rate_limiter,
+                                    job_url=job_url,
+                                    original_job_url=original_job_url,
+                                    candidate=candidate_by_url.get(original_job_url),
+                                    item_index=item_index,
+                                    attempt=attempt,
+                                )
+                                if rendered_job is not None:
+                                    return rendered_job
                         else:
                             final_url = self._result_final_url(result, job_url)
                             final_url = hooks.validate_detail_url(final_url)
@@ -976,6 +999,20 @@ class ScrapeOrchestrator:
                                             extraction_method="deterministic_embedded_document",
                                             validation_reason=promoted_reason,
                                         )
+
+                            if attempt == 1 and rendered_detail_service is not None:
+                                rendered_job = await self._try_rendered_detail(
+                                    rendered_detail_service,
+                                    hooks=hooks,
+                                    rate_limiter=rate_limiter,
+                                    job_url=final_url,
+                                    original_job_url=original_job_url,
+                                    candidate=candidate_by_url.get(original_job_url),
+                                    item_index=item_index,
+                                    attempt=attempt,
+                                )
+                                if rendered_job is not None:
+                                    return rendered_job
 
                             llm_allowed, llm_reason = hooks.should_attempt_llm(result, final_url)
                             if not llm_allowed:
@@ -1378,6 +1415,108 @@ class ScrapeOrchestrator:
             pagination_complete=False,
             reasons=list(dict.fromkeys([*retained_batch.reasons, *adaptive_batch.reasons])),
             metrics=metrics,
+        )
+
+    async def _try_rendered_detail(
+        self,
+        service: Any,
+        *,
+        hooks: ScrapeOrchestratorHooks,
+        rate_limiter: _RateLimiter,
+        job_url: str,
+        original_job_url: str,
+        candidate: DiscoveryCandidate | None,
+        item_index: int,
+        attempt: int,
+    ) -> JobPosting | None:
+        started = time.perf_counter()
+        self._emit(
+            hooks,
+            "rendered_detail_start",
+            job_url=job_url,
+            original_job_url=original_job_url,
+            item_index=item_index,
+            attempt=attempt,
+        )
+        try:
+            await rate_limiter.wait()
+            outcome = await service.extract(
+                job_url,
+                allowed_hosts=self._detail_allowed_hosts(job_url),
+                title_hint=candidate.title_hint if candidate is not None else None,
+                location_hint=candidate.location_hint if candidate is not None else None,
+            )
+        except Exception as exc:
+            self._emit(
+                hooks,
+                "rendered_detail_failed",
+                job_url=job_url,
+                original_job_url=original_job_url,
+                item_index=item_index,
+                attempt=attempt,
+                elapsed_seconds=round(time.perf_counter() - started, 3),
+                error_type=type(exc).__name__,
+                error_message=str(exc)[:500],
+            )
+            return None
+
+        job = getattr(outcome, "job", None)
+        metrics = dict(getattr(outcome, "metrics", {}) or {})
+        reason = str(getattr(outcome, "reason", "rendered detail miss"))
+        if job is None:
+            self._emit(
+                hooks,
+                "rendered_detail_miss",
+                job_url=job_url,
+                original_job_url=original_job_url,
+                item_index=item_index,
+                attempt=attempt,
+                elapsed_seconds=round(time.perf_counter() - started, 3),
+                reason=reason,
+                metrics=metrics,
+            )
+            return None
+
+        validation_url = str(job.job_url or job_url)
+        valid, validation_reason = hooks.validate_extracted_job(job, validation_url)
+        if not valid:
+            self._emit(
+                hooks,
+                "validation_failed",
+                job_url=validation_url,
+                original_job_url=original_job_url,
+                item_index=item_index,
+                attempt=attempt,
+                extraction_method="rendered_semantic_dom",
+                validation_reason=validation_reason,
+                rendered_reason=reason,
+            )
+            return None
+
+        self._emit(
+            hooks,
+            "extract_saved",
+            job_url=validation_url,
+            original_job_url=original_job_url,
+            item_index=item_index,
+            attempt=attempt,
+            elapsed_seconds=round(time.perf_counter() - started, 3),
+            title=job.title,
+            extraction_method="rendered_semantic_dom",
+            validation_reason=validation_reason,
+            rendered_reason=reason,
+            rendered_metrics=metrics,
+        )
+        return job
+
+    def _detail_allowed_hosts(self, job_url: str) -> tuple[str, ...]:
+        hostname = str(urlsplit(job_url).hostname or "").lower().rstrip(".")
+        return tuple(
+            dict.fromkeys(
+                str(value).strip().lower().rstrip(".")
+                for value in [*self.blueprint.allowed_hosts, hostname]
+                if str(value).strip()
+            )
         )
 
     @staticmethod
