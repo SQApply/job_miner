@@ -16,9 +16,10 @@ from .contracts import (
     DiscoveryCandidateKind,
     ScrapeStrategy,
 )
+from .job_evidence import job_title_context_rejection_reason
 
 
-JSON_DISCOVERY_CONTRACT_VERSION = "1.0"
+JSON_DISCOVERY_CONTRACT_VERSION = "1.1"
 _KEY_CLEANER = re.compile(r"[^a-z0-9]+")
 _JOB_CONTEXT_KEY = re.compile(
     r"(?:^|[^a-z])(job|jobs|jobposting|jobpostings|opening|openings|position|"
@@ -157,6 +158,7 @@ class JsonDiscoveryOptions:
     max_candidates: int = 1_000
     minimum_confidence: float = 0.76
     evidence_preservation_confidence: float = 0.82
+    allow_url_less_records: bool = False
 
     def __post_init__(self) -> None:
         if not 2 <= self.max_depth <= 30:
@@ -184,9 +186,12 @@ class JsonCandidateDiscoverer:
     """Discover grounded jobs in captured public XHR, GraphQL, and inline JSON.
 
     The walker does not know a vendor schema.  It recursively inspects bounded
-    records and requires a title, an openable HTTP URL, and independent job
-    semantics. Generic ``name``/``url`` marketing cards are intentionally
-    rejected. Raw payloads are never copied into candidate evidence.
+    records and normally requires a title, an openable HTTP URL, and independent
+    job semantics. A rendered-detail caller may explicitly accept URL-less
+    records only when a stable requisition id and multiple independent fields
+    are present; listing discovery keeps that mode disabled. Generic
+    ``name``/``url`` marketing cards are intentionally rejected. Raw payloads
+    are never copied into candidate evidence.
     """
 
     def __init__(self, options: JsonDiscoveryOptions | None = None) -> None:
@@ -362,9 +367,6 @@ class JsonCandidateDiscoverer:
         detail_url = _http_url(detail_field.value, base_url=base_url) if detail_field else None
         apply_url = _http_url(apply_field.value, base_url=base_url) if apply_field else None
         detail_url = detail_url or apply_url
-        if not detail_url:
-            return None
-
         id_field = self._first_field(by_key, _ID_KEYS)
         source_job_id = _bounded_text(id_field.value, limit=500) if id_field else None
         location_field = self._first_field(by_key, _LOCATION_KEYS)
@@ -388,6 +390,11 @@ class JsonCandidateDiscoverer:
             bool(value)
             for value in (source_job_id, location, summary, company, employment, posted)
         )
+        if job_title_context_rejection_reason(
+            title,
+            [summary, location, company, employment],
+        ) is not None:
+            return None
         structured_job_record = bool(
             schema_job
             or (path_job_context and (independent_signals >= 1 or title_specific or url_specific))
@@ -395,6 +402,15 @@ class JsonCandidateDiscoverer:
             or (source_job_id and independent_signals >= 2)
         )
         if not structured_job_record:
+            return None
+        url_less_detail_record = bool(
+            not detail_url
+            and self.options.allow_url_less_records
+            and source_job_id
+            and independent_signals >= 3
+            and (schema_job or path_job_context or title_specific)
+        )
+        if not detail_url and not url_less_detail_record:
             return None
 
         confidence = 0.70
@@ -423,7 +439,9 @@ class JsonCandidateDiscoverer:
                 job_reference=source_job_id,
             )
 
-        stable_identity = f"{source_job_id or ''}|{detail_url}"
+        stable_identity = (
+            f"{source_job_id or ''}|{detail_url or ''}|{document_id}|{'/'.join(path[-8:])}"
+        )
         candidate_id = "api_record_" + hashlib.sha256(
             f"{origin}:{stable_identity}".encode("utf-8")
         ).hexdigest()[:24]
@@ -439,6 +457,7 @@ class JsonCandidateDiscoverer:
             "path_job_context": path_job_context,
             "independent_signals": independent_signals,
             "structured_job_record": structured_job_record,
+            "url_less_detail_record": url_less_detail_record,
             "evidence_preserving": (
                 confidence >= self.options.evidence_preservation_confidence
             ),
@@ -483,10 +502,13 @@ class JsonCandidateDiscoverer:
                     return field
         return None
 
-    @staticmethod
-    def _looks_candidate_shaped(record: dict[str, Any]) -> bool:
+    def _looks_candidate_shaped(self, record: dict[str, Any]) -> bool:
         keys = {_normalized_key(key) for key in record}
-        return bool(keys & set(_TITLE_KEYS)) and bool(keys & set(_URL_KEYS))
+        has_title = bool(keys & set(_TITLE_KEYS))
+        return has_title and (
+            bool(keys & set(_URL_KEYS))
+            or (self.options.allow_url_less_records and bool(keys & set(_ID_KEYS)))
+        )
 
     @staticmethod
     def _deduplicate(candidates: list[DiscoveryCandidate]) -> list[DiscoveryCandidate]:

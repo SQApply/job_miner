@@ -7,7 +7,7 @@ import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Iterable
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -16,7 +16,7 @@ from ..schemas import BrowserSettings
 from .dom_snapshot import DOM_SNAPSHOT_SCRIPT, FrameDomSnapshot, frame_snapshot_from_payload
 
 
-BROWSER_EVIDENCE_CONTRACT_VERSION = "1.0"
+BROWSER_EVIDENCE_CONTRACT_VERSION = "1.1"
 _JSON_CONTENT_PATTERN = re.compile(r"(?:application|text)/(?:[a-z0-9.+-]*\+)?json", re.I)
 _SENSITIVE_KEY_PATTERN = re.compile(
     r"password|passwd|secret|token|cookie|session|csrf|authorization|api[-_]?key|"
@@ -379,9 +379,9 @@ class BrowserEvidenceCollector:
     ) -> BrowserEvidenceReport:
         """Snapshot the live page after an approved interaction without reloading it.
 
-        This is intentionally DOM-only. The initial session capture owns the
-        bounded network listener; post-click evidence records the rendered
-        state that is needed for same-URL dialogs and client-side route changes.
+        This method is intentionally DOM-only. The interaction resolver may
+        merge a separately bounded network window captured around the click;
+        the snapshot records same-URL dialogs and client-side route changes.
         """
 
         started_at = _utc_now()
@@ -429,6 +429,73 @@ class BrowserEvidenceCollector:
                 "node_budget": self.options.max_nodes_total,
             },
         )
+
+    async def capture_interaction_network(
+        self,
+        event_source: Any,
+        operation: Callable[[], Awaitable[Any]],
+        *,
+        allowed_hosts: Iterable[str],
+    ) -> tuple[Any, list[NetworkJsonEvidence], list[str]]:
+        """Capture bounded public JSON emitted only while one card is clicked.
+
+        The listener is attached to the ephemeral browser context so same-page
+        dialogs, client-side navigation, and popups share one evidence window.
+        It never replays a request and applies the same host, body-size,
+        sensitive-key, and response-count limits as initial page capture.
+        """
+
+        on = getattr(event_source, "on", None)
+        off = getattr(event_source, "off", None)
+        if not callable(on):
+            result = await operation()
+            return result, [], ["interaction_network_listener_unavailable"]
+
+        approved_hosts = tuple(allowed_hosts)
+        pending_response_tasks: set[asyncio.Task[Any]] = set()
+        network_results: dict[int, NetworkJsonEvidence] = {}
+        errors: list[str] = []
+        response_sequence = 0
+
+        def on_response(response: Any) -> None:
+            nonlocal response_sequence
+            if self.options.max_network_json_responses <= 0:
+                return
+            request = getattr(response, "request", None)
+            resource_type = str(getattr(request, "resource_type", "") or "").lower()
+            if resource_type not in {"xhr", "fetch", "document"}:
+                return
+            if response_sequence >= self.options.max_network_json_responses * 5:
+                return
+            response_sequence += 1
+            task = asyncio.create_task(
+                self._capture_network_response(
+                    response,
+                    sequence=response_sequence,
+                    allowed_hosts=approved_hosts,
+                )
+            )
+            pending_response_tasks.add(task)
+
+        on("response", on_response)
+        try:
+            result = await operation()
+        finally:
+            if callable(off):
+                try:
+                    off("response", on_response)
+                except Exception:
+                    pass
+            await self._drain_response_tasks(
+                pending_response_tasks,
+                network_results,
+                errors,
+            )
+        evidence = [
+            network_results[key]
+            for key in sorted(network_results)[: self.options.max_network_json_responses]
+        ]
+        return result, evidence, errors
 
     async def _capture_frames(
         self,

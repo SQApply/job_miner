@@ -21,7 +21,7 @@ from .rendered_detail import RenderedDetailExtractor, RenderedDetailResult
 from .safety import PortalUrlSafetyError, validate_public_http_url
 
 
-LINKLESS_INTERACTION_CONTRACT_VERSION = "1.1"
+LINKLESS_INTERACTION_CONTRACT_VERSION = "1.2"
 _LINKLESS_CLICK_SCRIPT = r"""
 (nodeToken) => {
   const map = window.__jobMinerNodeMap;
@@ -163,6 +163,9 @@ class LiveLinklessResolver:
             "verification_unavailable": 0,
             "stale_tokens": 0,
             "unsafe_destinations": 0,
+            "interaction_network_responses": 0,
+            "interaction_network_errors": 0,
+            "structured_network_extractions": 0,
             "bounded": len(eligible) > len(bounded),
         }
         current_report = session.report
@@ -200,26 +203,68 @@ class LiveLinklessResolver:
 
             metrics["attempted"] += 1
             pages_before = list(getattr(session.context, "pages", []) or [])
-            click_error: str | None = None
-            try:
-                clicked = await frame.evaluate(
-                    _LINKLESS_CLICK_SCRIPT,
-                    live_candidate.node_token,
-                )
-                if not isinstance(clicked, dict) or not bool(clicked.get("clicked")):
-                    metrics["stale_tokens"] += 1
-                    errors.append(
-                        f"{original.candidate_id}: "
-                        f"{str((clicked or {}).get('reason') if isinstance(clicked, dict) else clicked)[:300]}"
+            interaction_network: list[Any] = []
+            interaction_network_errors: list[str] = []
+
+            async def perform_click() -> tuple[Any, str | None]:
+                click_error: str | None = None
+                clicked: Any = None
+                try:
+                    clicked = await frame.evaluate(
+                        _LINKLESS_CLICK_SCRIPT,
+                        live_candidate.node_token,
                     )
-                    continue
+                except Exception as exc:
+                    # Immediate navigation can destroy the JavaScript execution
+                    # context before evaluate() returns. Treat that as ambiguous
+                    # until the observable page/popup URL is checked below.
+                    click_error = f"{type(exc).__name__}: {exc}"[:500]
+                if self.options.settle_time_ms and (
+                    click_error is not None
+                    or (
+                        isinstance(clicked, dict)
+                        and bool(clicked.get("clicked"))
+                    )
+                ):
+                    await asyncio.sleep(self.options.settle_time_ms / 1_000.0)
+                return clicked, click_error
+
+            capture_network = getattr(
+                session.collector,
+                "capture_interaction_network",
+                None,
+            )
+            try:
+                if callable(capture_network):
+                    (
+                        (clicked, click_error),
+                        interaction_network,
+                        interaction_network_errors,
+                    ) = await capture_network(
+                        session.context,
+                        perform_click,
+                        allowed_hosts=session.allowed_hosts,
+                    )
+                else:
+                    clicked, click_error = await perform_click()
             except Exception as exc:
-                # Immediate navigation can destroy the JavaScript execution
-                # context before evaluate() returns. Treat that as ambiguous
-                # until the observable page/popup URL is checked below.
+                clicked = None
                 click_error = f"{type(exc).__name__}: {exc}"[:500]
-            if self.options.settle_time_ms:
-                await asyncio.sleep(self.options.settle_time_ms / 1_000.0)
+            if clicked is not None and (
+                not isinstance(clicked, dict) or not bool(clicked.get("clicked"))
+            ):
+                metrics["stale_tokens"] += 1
+                errors.append(
+                    f"{original.candidate_id}: "
+                    f"{str((clicked or {}).get('reason') if isinstance(clicked, dict) else clicked)[:300]}"
+                )
+                continue
+            metrics["interaction_network_responses"] += len(interaction_network)
+            metrics["interaction_network_errors"] += len(interaction_network_errors)
+            errors.extend(
+                f"{original.candidate_id}: {message}"[:1_000]
+                for message in interaction_network_errors[:5]
+            )
 
             pages_after = list(getattr(session.context, "pages", []) or [])
             popup_pages = [page for page in pages_after if page not in pages_before]
@@ -256,7 +301,16 @@ class LiveLinklessResolver:
                 original=original,
                 metrics=metrics,
                 errors=errors,
+                interaction_network=interaction_network,
+                interaction_network_errors=interaction_network_errors,
             )
+            if (
+                rendered is not None
+                and rendered.job is not None
+                and rendered.metrics.get("strategy") == "structured_json"
+                and interaction_network
+            ):
+                metrics["structured_network_extractions"] += 1
             openable_route = self._is_openable_detail_route(
                 listing_url,
                 checked.normalized_url,
@@ -350,6 +404,8 @@ class LiveLinklessResolver:
         original: DiscoveryCandidate,
         metrics: dict[str, Any],
         errors: list[str],
+        interaction_network: list[Any],
+        interaction_network_errors: list[str],
     ) -> RenderedDetailResult | None:
         snapshot = getattr(session.collector, "snapshot_current_page", None)
         if not callable(snapshot):
@@ -371,6 +427,21 @@ class LiveLinklessResolver:
                 job=None,
                 reason="post_click_snapshot_failed",
                 metrics={"error_type": type(exc).__name__},
+            )
+        if interaction_network:
+            report_metrics = dict(report.metrics)
+            report_metrics.update(
+                {
+                    "snapshot_kind": "post_interaction_dom_and_network",
+                    "network_json_responses": len(interaction_network),
+                }
+            )
+            report = report.model_copy(
+                update={
+                    "network_json": interaction_network,
+                    "errors": [*report.errors, *interaction_network_errors],
+                    "metrics": report_metrics,
+                }
             )
         baseline_url = str(getattr(baseline_report, "final_url", "") or "")
         same_document = requested_url.rstrip("/") == baseline_url.rstrip("/")

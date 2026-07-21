@@ -9,7 +9,7 @@ from typing import Any, Iterable
 from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 
 
-ROUTE_RESOLUTION_CONTRACT_VERSION = "1.0"
+ROUTE_RESOLUTION_CONTRACT_VERSION = "1.1"
 
 _STRONG_LISTING_LABELS = (
     "browse jobs",
@@ -494,6 +494,20 @@ def _score_candidate(
     }
 
     path_parts = [part.lower() for part in path.split("/") if part]
+    provider_navigation_path = bool(
+        path_parts
+        and path_parts[-1] in {"categories", "category", "locations", "location"}
+    )
+    consent_or_navigation_label = bool(
+        re.search(r"\b(?:revoke\s+consent|cookie\s+settings|privacy\s+choices)\b", label_text)
+    )
+    if (
+        platform
+        and (provider_navigation_path or consent_or_navigation_label)
+        and not strong_label
+        and not ({"iframe", "redirect"} & sources)
+    ):
+        return None
     provider_detail_path = bool(
         (platform in {"ashby", "lever", "smartrecruiters"} and len(path_parts) >= 2)
         or (platform == "workable" and "j" in path_parts)
@@ -513,12 +527,12 @@ def _score_candidate(
         hostname == source_host
         and source_strength >= 2
         and candidate_strength <= source_strength
-        and not platform
-        and not ({"iframe", "config", "redirect"} & sources)
+        and not ({"iframe", "redirect"} & sources)
     ):
         # Once already on a strong listing/results route, do not bounce to a
-        # peer locale or navigation route. The current document should be
-        # harvested; equal-strength routes caused the observed fleet loops.
+        # provider root, peer locale, category, or navigation route merely
+        # because that link is also on a known ATS host. The current document
+        # should be harvested; equal/weaker routes caused observed fleet loops.
         return None
     negative = route_tokens & _NEGATIVE_ROUTE_TOKENS
     if negative and not strong_label and not platform and not ({"iframe", "redirect"} & sources):

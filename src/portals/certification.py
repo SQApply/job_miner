@@ -572,6 +572,7 @@ def _classify_error(exc: BaseException) -> tuple[str, str]:
 _DIAGNOSTIC_EVENTS = {
     "adaptive_dom_discovery_failed",
     "extract_attempt_failed",
+    "extracted_duplicate_collapsed",
     "extract_failed",
     "extract_task_exception",
     "llm_fallback_skipped_non_job",
@@ -585,15 +586,19 @@ _DIAGNOSTIC_EVENTS = {
 def _bounded_event_sample(event: str, payload: dict[str, Any]) -> dict[str, Any]:
     allowed = {
         "attempt",
+        "canonical_job_url",
+        "discarded_title",
         "error_message",
         "error_type",
         "extraction_method",
         "job_url",
+        "kept_title",
         "metrics",
         "original_job_url",
         "reason",
         "rendered_reason",
         "validation_reason",
+        "replaced_existing",
     }
     sample: dict[str, Any] = {"event": event}
     for key in allowed:

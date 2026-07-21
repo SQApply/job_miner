@@ -34,7 +34,7 @@ from .contracts import (
 )
 from .page_quality import assess_page_quality
 from .rendered_detail import RenderedDetailExtractionService
-from .url_intelligence import promote_trusted_detail_url
+from .url_intelligence import canonicalize_candidate_url, promote_trusted_detail_url
 
 
 EventCallback = Callable[[str, dict[str, Any]], None]
@@ -96,6 +96,73 @@ def _always_allow_llm(_: Any, __: str) -> tuple[bool, str]:
 
 def _accept_llm_payload(_: JobPosting, __: str, ___: Any) -> tuple[bool, str]:
     return True, "grounding_not_configured"
+
+
+def _job_evidence_weight(job: JobPosting) -> tuple[int, int, int]:
+    scalar_values = (
+        job.title,
+        job.apply_url,
+        job.company,
+        job.location_text,
+        job.employment_type,
+        job.duration,
+        job.compensation_text,
+        job.posted_date,
+        job.job_reference,
+    )
+    return (
+        sum(bool(value) for value in scalar_values)
+        + len(job.responsibilities)
+        + len(job.required_skills)
+        + len(job.preferred_skills),
+        len(str(job.summary or "")),
+        sum(
+            len(str(value or ""))
+            for value in (
+                *job.responsibilities,
+                *job.required_skills,
+                *job.preferred_skills,
+            )
+        ),
+    )
+
+
+def deduplicate_extracted_jobs(
+    jobs: list[JobPosting],
+) -> tuple[list[JobPosting], list[dict[str, Any]]]:
+    """Collapse details that redirect to the same canonical job identity.
+
+    Discovery URLs can differ while the browser resolves both to one posting.
+    The richer grounded extraction wins and the duplicate remains observable in
+    run metrics instead of becoming a second database job.
+    """
+
+    selected: list[JobPosting] = []
+    positions: dict[str, int] = {}
+    duplicates: list[dict[str, Any]] = []
+    for job in jobs:
+        identity = canonicalize_candidate_url(str(job.job_url or ""))
+        if not identity:
+            selected.append(job)
+            continue
+        position = positions.get(identity)
+        if position is None:
+            positions[identity] = len(selected)
+            selected.append(job)
+            continue
+        existing = selected[position]
+        replace_existing = _job_evidence_weight(job) > _job_evidence_weight(existing)
+        if replace_existing:
+            selected[position] = job
+        duplicates.append(
+            {
+                "canonical_job_url": identity,
+                "kept_title": (job.title if replace_existing else existing.title),
+                "discarded_title": (existing.title if replace_existing else job.title),
+                "replaced_existing": replace_existing,
+            }
+        )
+    return selected, duplicates
 
 
 @dataclass(frozen=True)
@@ -1198,7 +1265,7 @@ class ScrapeOrchestrator:
             *(extract_one(index, url) for index, url in enumerate(attempted_urls, start=1)),
             return_exceptions=True,
         )
-        jobs: list[JobPosting] = []
+        raw_jobs: list[JobPosting] = []
         for item in extraction_results:
             if isinstance(item, BaseException):
                 failure = {
@@ -1209,7 +1276,13 @@ class ScrapeOrchestrator:
                 detail_failures.append(failure)
                 self._emit(hooks, "extract_task_exception", **failure)
             elif isinstance(item, JobPosting):
-                jobs.append(item)
+                raw_jobs.append(item)
+
+        jobs, extracted_duplicates = deduplicate_extracted_jobs(raw_jobs)
+        for duplicate in extracted_duplicates:
+            self._emit(hooks, "extracted_duplicate_collapsed", **duplicate)
+        rescrape_plan["raw_extracted_jobs"] = len(raw_jobs)
+        rescrape_plan["extracted_duplicate_urls_collapsed"] = len(extracted_duplicates)
 
         elapsed_seconds = round(time.perf_counter() - started, 3)
         self._emit(
@@ -1218,6 +1291,8 @@ class ScrapeOrchestrator:
             attempted_urls=len(attempted_urls),
             discovered_urls=len(discovered_urls),
             extracted_jobs=len(jobs),
+            raw_extracted_jobs=len(raw_jobs),
+            extracted_duplicate_urls_collapsed=len(extracted_duplicates),
             detail_failures=len(detail_failures),
             elapsed_seconds=elapsed_seconds,
         )

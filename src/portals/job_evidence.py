@@ -43,6 +43,7 @@ _MARKETING_PHRASE = re.compile(
     re.I,
 )
 _URLISH = re.compile(r"^(?:https?://|www\.)|\.(?:com|net|org)(?:/|$)", re.I)
+_RELATED_JOBS_HEADING = re.compile(r"^related\s+.{2,180}\s+jobs?$", re.I)
 
 _GENERIC_TITLES = {
     "about",
@@ -132,6 +133,8 @@ def job_title_rejection_reason(value: object) -> str | None:
         return "section_heading_title"
     if _PURE_DATE.fullmatch(title) or _DATED_LABEL.fullmatch(title):
         return "date_label_title"
+    if _RELATED_JOBS_HEADING.fullmatch(title):
+        return "related_jobs_heading"
     if _URLISH.search(title):
         return "url_or_website_title"
     if _MARKETING_PHRASE.search(title):
@@ -141,6 +144,36 @@ def job_title_rejection_reason(value: object) -> str | None:
         token in words for token in ("you", "your", "our", "across", "employers")
     ):
         return "sentence_like_marketing_title"
+    return None
+
+
+def job_title_context_rejection_reason(
+    value: object,
+    context: str | Iterable[object],
+) -> str | None:
+    """Reject a plausible-looking label when the surrounding page proves it is taxonomy.
+
+    Category names such as ``Accounting / Finance`` can look like role titles in
+    isolation.  Many job boards disambiguate them with an exact, rendered
+    ``Related <category> Jobs`` label.  Using that relationship is structural
+    evidence, not a portal selector or a hard-coded category vocabulary.
+    """
+
+    rejection = job_title_rejection_reason(value)
+    if rejection is not None:
+        return rejection
+
+    title_key = normalized_evidence_key(value)
+    title_words = title_key.split()
+    if not title_key or len(title_words) > 14:
+        return None
+    values = [context] if isinstance(context, str) else list(context)
+    marker = f"related {title_key} jobs"
+    singular_marker = f"related {title_key} job"
+    for item in values:
+        context_key = normalized_evidence_key(item)
+        if marker in context_key or singular_marker in context_key:
+            return "related_jobs_taxonomy_title"
     return None
 
 

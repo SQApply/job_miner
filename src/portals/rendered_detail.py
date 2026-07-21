@@ -13,15 +13,14 @@ from ..crawl.browser_evidence import (
 from ..crawl.dom_snapshot import DomNodeEvidence, FrameDomSnapshot
 from ..schemas import BrowserSettings, JobPosting
 from .job_evidence import (
-    is_plausible_job_title,
     job_detail_signal_count,
-    job_title_rejection_reason,
+    job_title_context_rejection_reason,
     plausible_location,
 )
-from .json_discovery import JsonCandidateDiscoverer
+from .json_discovery import JsonCandidateDiscoverer, JsonDiscoveryOptions
 
 
-RENDERED_DETAIL_CONTRACT_VERSION = "1.1"
+RENDERED_DETAIL_CONTRACT_VERSION = "1.2"
 _DETAIL_SIGNAL = re.compile(
     r"\b(job\s+description|position\s+summary|about\s+(?:the\s+)?role|"
     r"responsibilit(?:y|ies)|duties|qualifications?|requirements?|"
@@ -160,7 +159,15 @@ class RenderedDetailExtractor:
             fallback_url=fallback_url,
             title_hint=title_hint,
         )
-        if structured is not None and is_plausible_job_title(structured.title):
+        structured_context = self._job_context(structured) if structured is not None else []
+        if (
+            structured is not None
+            and job_title_context_rejection_reason(
+                structured.title,
+                structured_context,
+            )
+            is None
+        ):
             return RenderedDetailResult(
                 job=structured,
                 reason="structured_job_record",
@@ -219,7 +226,10 @@ class RenderedDetailExtractor:
                 "title_grounded": selected.title_grounded,
             }
         )
-        title_rejection = job_title_rejection_reason(selected.title)
+        title_rejection = job_title_context_rejection_reason(
+            selected.title,
+            selected.text_parts,
+        )
         if title_rejection is not None:
             return RenderedDetailResult(
                 job=None,
@@ -295,7 +305,13 @@ class RenderedDetailExtractor:
         fallback_url: str,
         title_hint: str | None,
     ) -> JobPosting | None:
-        batch = JsonCandidateDiscoverer().discover(report)
+        # A detail response emitted after a click may have a stable requisition
+        # id and full job fields without publishing a separate detail URL.  It
+        # is safe here because the rendered destination supplies the canonical
+        # fallback URL; listing discovery keeps the stricter URL requirement.
+        batch = JsonCandidateDiscoverer(
+            JsonDiscoveryOptions(allow_url_less_records=True)
+        ).discover(report)
         candidates = [
             candidate
             for candidate in batch.candidates
@@ -432,12 +448,17 @@ class RenderedDetailExtractor:
         frame_title: str | None,
     ) -> tuple[str | None, bool]:
         values = list(nodes)
+        context_values = [node.text for node in values if node.text]
         normalized_hint = _normalized(title_hint)
         scored: list[tuple[float, int, str]] = []
         for position, node in enumerate(values):
             value = _text(node.text)
             normalized_value = _normalized(value)
-            if not value or len(value) > 300 or not is_plausible_job_title(value):
+            if (
+                not value
+                or len(value) > 300
+                or job_title_context_rejection_reason(value, context_values) is not None
+            ):
                 continue
             score = 0.0
             score += 5.0 if node.role == "heading" or re.fullmatch(r"h[1-3]", node.tag) else 0.0
@@ -456,7 +477,10 @@ class RenderedDetailExtractor:
             )
             return selected, grounded
         fallback = _text(title_hint) or _text(frame_title)
-        if fallback and is_plausible_job_title(fallback):
+        if (
+            fallback
+            and job_title_context_rejection_reason(fallback, context_values) is None
+        ):
             normalized_fallback = _normalized(fallback)
             grounded = any(
                 normalized_fallback
@@ -465,6 +489,15 @@ class RenderedDetailExtractor:
             )
             return fallback[:1_000], grounded
         return None, False
+
+    @staticmethod
+    def _job_context(job: JobPosting) -> list[object]:
+        return [
+            job.summary,
+            *job.responsibilities,
+            *job.required_skills,
+            *job.preferred_skills,
+        ]
 
     @staticmethod
     def _source_job_id(nodes: Iterable[DomNodeEvidence], combined: str) -> str | None:

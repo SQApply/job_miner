@@ -17,7 +17,7 @@ from .contracts import (
     DiscoveryCandidateKind,
     ScrapeStrategy,
 )
-from .job_evidence import is_plausible_job_title, plausible_location
+from .job_evidence import job_title_context_rejection_reason, plausible_location
 
 
 DOM_DISCOVERY_CONTRACT_VERSION = "1.0"
@@ -575,13 +575,14 @@ class DomCandidateDiscoverer:
         nodes: list[DomNodeEvidence],
         primary_url: str | None,
     ) -> str | None:
+        context_values = [node.text for node in nodes if node.text]
         scored: list[tuple[float, int, str]] = []
         for position, node in enumerate(nodes):
             text = " ".join(str(node.text or "").split())
             if (
                 not text
                 or _NAVIGATION_TEXT.fullmatch(text)
-                or not is_plausible_job_title(text)
+                or job_title_context_rejection_reason(text, context_values) is not None
             ):
                 continue
             score = 0.0

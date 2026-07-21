@@ -11,7 +11,7 @@ from ..warehouse.url_utils import canonical_job_url
 from .job_evidence import (
     has_marketing_page_language,
     job_detail_signal_count,
-    job_title_rejection_reason,
+    job_title_context_rejection_reason,
     normalize_evidence_text,
 )
 from .page_quality import assess_crawl_result, visible_text
@@ -677,7 +677,16 @@ def promote_trusted_detail_url(
 def assess_certification_job(job: JobPosting, source_url: str) -> tuple[bool, str]:
     """Stricter certification validator; production's backward-compatible validator remains unchanged."""
     title = normalize_evidence_text(job.title)
-    title_rejection = job_title_rejection_reason(title)
+    summary = normalize_evidence_text(job.summary)
+    detail_text = " | ".join(
+        [
+            summary,
+            *(normalize_evidence_text(value) for value in job.responsibilities),
+            *(normalize_evidence_text(value) for value in job.required_skills),
+            *(normalize_evidence_text(value) for value in job.preferred_skills),
+        ]
+    )
+    title_rejection = job_title_context_rejection_reason(title, detail_text)
     if title_rejection is not None:
         return False, f"navigation/non-role title rejected: {title_rejection}"
 
@@ -718,15 +727,6 @@ def assess_certification_job(job: JobPosting, source_url: str) -> tuple[bool, st
         quality_score += 1
         evidence.append("plausible_url")
 
-    summary = normalize_evidence_text(job.summary)
-    detail_text = " | ".join(
-        [
-            summary,
-            *(normalize_evidence_text(value) for value in job.responsibilities),
-            *(normalize_evidence_text(value) for value in job.required_skills),
-            *(normalize_evidence_text(value) for value in job.preferred_skills),
-        ]
-    )
     detail_signals = job_detail_signal_count(detail_text)
     if len(summary) >= 80:
         quality_score += 2
