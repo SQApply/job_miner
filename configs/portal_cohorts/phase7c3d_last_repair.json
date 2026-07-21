@@ -1,0 +1,30 @@
+{
+  "cohort_id": "phase7c3d_last_repair",
+  "baseline_production_ready": 24,
+  "maximum_attempts": 1,
+  "groups": {
+    "false_success_recheck": [
+      "cert_www_artisantalent_com_be3b315486fe",
+      "cert_www_optechus_com_1eb1427b3bfb",
+      "cert_www_thebestirs_com_f4d7a04bc7fc"
+    ],
+    "partial_extraction_recheck": [
+      "cert_www_computerfutures_com_ee1a6bd72e7d",
+      "cert_www_experis_com_72e0117af7e9",
+      "cert_www_experis_com_8f36c1b10940",
+      "cert_www_helpmates_com_23c208136a17",
+      "cert_www_rxrelief_com_ed90067ac16a"
+    ],
+    "url_backed_gpu_rescue": [
+      "cert_www_belcan_com_c9eaf1863e2a",
+      "cert_www_extensionrecruiting_com_100521083f46",
+      "cert_www_motusrecruiting_com_4d411449e3fe",
+      "cert_www_thebossgroup_com_8bbc4eea98d2"
+    ],
+    "workday_api_hydration": [
+      "cert_capgroup_wd1_myworkdayjobs_com_2d07c72da5d7",
+      "cert_www_bakertilly_com_f42621328e0c",
+      "cert_www_comphealth_com_609ddbde172d"
+    ]
+  }
+}

@@ -12,6 +12,7 @@ from .job_evidence import (
     has_marketing_page_language,
     job_detail_signal_count,
     job_title_context_rejection_reason,
+    job_title_source_rejection_reason,
     normalize_evidence_text,
 )
 from .page_quality import assess_crawl_result, visible_text
@@ -689,6 +690,14 @@ def assess_certification_job(job: JobPosting, source_url: str) -> tuple[bool, st
     title_rejection = job_title_context_rejection_reason(title, detail_text)
     if title_rejection is not None:
         return False, f"navigation/non-role title rejected: {title_rejection}"
+    source_title_rejection = job_title_source_rejection_reason(
+        title,
+        job_url=job.job_url or source_url,
+        job_reference=job.job_reference,
+        summary=detail_text,
+    )
+    if source_title_rejection is not None:
+        return False, f"site/non-role title rejected: {source_title_rejection}"
 
     url = str(job.job_url or source_url or "").strip()
     url_assessment = assess_job_candidate_url(url)

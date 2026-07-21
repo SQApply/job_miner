@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Iterable
+from urllib.parse import unquote, urlsplit
 
 
 _PURE_DATE = re.compile(
@@ -44,6 +45,48 @@ _MARKETING_PHRASE = re.compile(
 )
 _URLISH = re.compile(r"^(?:https?://|www\.)|\.(?:com|net|org)(?:/|$)", re.I)
 _RELATED_JOBS_HEADING = re.compile(r"^related\s+.{2,180}\s+jobs?$", re.I)
+_COMPANY_SUFFIXES = {
+    "co",
+    "company",
+    "corp",
+    "corporation",
+    "group",
+    "inc",
+    "llc",
+    "ltd",
+    "solutions",
+    "staffing",
+    "talent",
+    "us",
+    "usa",
+}
+_HOST_NOISE = {
+    "apply",
+    "career",
+    "careers",
+    "hire",
+    "hiring",
+    "job",
+    "jobs",
+    "recruiting",
+    "www",
+}
+_URL_TITLE_NOISE = {
+    "apply",
+    "career",
+    "careers",
+    "detail",
+    "details",
+    "job",
+    "jobs",
+    "job-posting",
+    "opening",
+    "openings",
+    "position",
+    "positions",
+    "role",
+    "search",
+}
 
 _GENERIC_TITLES = {
     "about",
@@ -174,6 +217,98 @@ def job_title_context_rejection_reason(
         context_key = normalized_evidence_key(item)
         if marker in context_key or singular_marker in context_key:
             return "related_jobs_taxonomy_title"
+    return None
+
+
+def _host_brand_key(url: object) -> str:
+    try:
+        hostname = str(urlsplit(str(url or "")).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
+    labels = [label for label in hostname.split(".") if label]
+    if len(labels) < 2:
+        return ""
+    meaningful = [label for label in labels[:-1] if label not in _HOST_NOISE]
+    return re.sub(r"[^a-z0-9]+", "", meaningful[-1] if meaningful else "")
+
+
+def _title_matches_host_brand(title: object, job_url: object) -> bool:
+    brand = _host_brand_key(job_url)
+    title_words = normalized_evidence_key(title).split()
+    compact_title = "".join(title_words)
+    if len(brand) < 4 or len(compact_title) < 4:
+        return False
+    if compact_title == brand or brand in compact_title:
+        return True
+    if brand.startswith(compact_title) and brand[len(compact_title) :] in {"us", "usa"}:
+        return True
+    if compact_title.startswith(brand):
+        remainder = normalized_evidence_key(title)[len(normalized_evidence_key(title).split()[0]) :]
+        remainder_words = set(normalized_evidence_key(remainder).split())
+        return bool(remainder_words) and remainder_words <= _COMPANY_SUFFIXES
+    return False
+
+
+def job_title_source_rejection_reason(
+    value: object,
+    *,
+    job_url: object,
+    job_reference: object = None,
+    summary: object = None,
+) -> str | None:
+    """Reject a site/organization title masquerading as a job title.
+
+    The decision uses generic source evidence: hostname overlap, a website-level
+    JSON-LD identifier, and the absence of job-detail language.  It does not
+    contain portal names or selectors.
+    """
+
+    rejection = job_title_rejection_reason(value)
+    if rejection is not None:
+        return rejection
+    if not _title_matches_host_brand(value, job_url):
+        return None
+    title_words = set(normalized_evidence_key(value).split())
+    reference = normalize_evidence_text(job_reference).lower()
+    website_reference = bool(
+        reference
+        and (
+            reference.endswith("#website")
+            or normalized_evidence_key(reference).endswith(" website")
+        )
+    )
+    if "jobs" in title_words or "careers" in title_words:
+        return "site_brand_title"
+    if website_reference and job_detail_signal_count(normalize_evidence_text(summary)) == 0:
+        return "website_schema_title"
+    return None
+
+
+def infer_job_title_from_url(value: object) -> str | None:
+    """Infer a conservative title hint from an unfamiliar detail URL slug.
+
+    This is a hint for rendered-DOM scoring, never sufficient evidence by
+    itself. Numeric requisition suffixes and navigation segments are removed.
+    """
+
+    try:
+        parsed = urlsplit(str(value or ""))
+    except ValueError:
+        return None
+    segments = [unquote(segment).strip() for segment in parsed.path.split("/") if segment.strip()]
+    for raw in reversed(segments):
+        lowered = raw.lower().strip("-_")
+        if not lowered or lowered in _URL_TITLE_NOISE or re.fullmatch(r"\d{3,}", lowered):
+            continue
+        cleaned = re.sub(r"(?:[-_](?:[A-Z]{1,8}[-_]?)?\d{4,})+$", "", raw)
+        cleaned = re.sub(r"[-_]+", " ", cleaned)
+        cleaned = normalize_evidence_text(cleaned).strip(" -|:")
+        words = normalized_evidence_key(cleaned).split()
+        if not 2 <= len(words) <= 16 or not any(len(word) >= 3 for word in words):
+            continue
+        if job_title_rejection_reason(cleaned) is not None:
+            continue
+        return cleaned[:300]
     return None
 
 

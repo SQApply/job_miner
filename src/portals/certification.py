@@ -647,6 +647,7 @@ class PortalFleetCertifier:
                 max_pages=self.options.max_pages,
                 timeout_seconds=self.options.acquisition_timeout_seconds,
                 require_complete=False,
+                max_records=self.options.max_jobs,
             )
         )
 

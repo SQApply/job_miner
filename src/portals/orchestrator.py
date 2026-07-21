@@ -1625,6 +1625,7 @@ class ScrapeOrchestrator:
             max_pages=options.max_acquisition_pages,
             timeout_seconds=options.acquisition_timeout_seconds,
             require_complete=options.require_complete_acquisition,
+            max_records=options.max_jobs,
         )
 
 

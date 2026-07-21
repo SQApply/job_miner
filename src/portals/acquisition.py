@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from ..schemas import JobPosting
@@ -423,12 +423,15 @@ class AcquisitionContext:
     max_pages: int = 50
     timeout_seconds: float = 20.0
     require_complete: bool = True
+    max_records: int | None = None
 
     def __post_init__(self) -> None:
         if self.max_pages < 1:
             raise ValueError("max_pages must be at least 1")
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if self.max_records is not None and self.max_records < 1:
+            raise ValueError("max_records must be at least 1 when supplied")
 
 
 @dataclass(frozen=True)
@@ -783,6 +786,71 @@ def _workday_match(url: str) -> ProviderMatch | None:
     )
 
 
+def _workday_field(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in ("descriptor", "name", "label", "value"):
+            if rendered := _plain_text(value.get(key)):
+                return rendered
+        return None
+    if isinstance(value, list):
+        return _joined_text(*(_workday_field(item) for item in value))
+    return _plain_text(value)
+
+
+def _workday_reference(info: dict[str, Any], job_url: str) -> str | None:
+    for key in ("jobReqId", "jobRequisitionId", "requisitionId", "id"):
+        if value := _workday_field(info.get(key)):
+            return value
+    try:
+        slug = unquote(urlsplit(job_url).path.rsplit("/", 1)[-1])
+    except ValueError:
+        return None
+    match = re.search(r"(?:^|[_-])([A-Za-z]{0,8}-?\d{2,})(?:$|[_-])", slug)
+    return match.group(1) if match else None
+
+
+def _workday_job(
+    payload: Any,
+    *,
+    listing_row: dict[str, Any],
+    job_url: str,
+    hostname: str,
+) -> JobPosting | None:
+    if not isinstance(payload, dict):
+        return None
+    raw_info = payload.get("jobPostingInfo")
+    info = raw_info if isinstance(raw_info, dict) else payload
+    title = _workday_field(info.get("title")) or _workday_field(listing_row.get("title"))
+    summary = _workday_field(
+        info.get("jobDescription")
+        or info.get("description")
+        or info.get("jobDescriptionText")
+    )
+    if not title or not summary:
+        return None
+    external_apply = _validated_provider_url(
+        info.get("externalUrl") or info.get("applyUrl"),
+        allowed_hosts=(hostname,),
+    )
+    location = _workday_field(info.get("location")) or _workday_field(
+        listing_row.get("locationsText")
+    )
+    additional = _workday_field(info.get("additionalLocations"))
+    return JobPosting(
+        title=title,
+        job_url=job_url,
+        apply_url=external_apply or job_url,
+        company=_workday_field(info.get("company")),
+        location_text=_joined_text(location, additional),
+        employment_type=_workday_field(info.get("timeType") or info.get("workerType")),
+        posted_date=_workday_field(
+            info.get("startDate") or info.get("postedOn") or listing_row.get("postedOn")
+        ),
+        summary=summary,
+        job_reference=_workday_reference(info, job_url),
+    )
+
+
 class WorkdayProvider:
     platform = "workday"
     page_size = 20
@@ -805,6 +873,7 @@ class WorkdayProvider:
         site = match.metadata["site"]
         endpoint = f"https://{hostname}/wday/cxs/{tenant}/{site}/jobs"
         discovered: list[str] = []
+        listing_rows: dict[str, dict[str, Any]] = {}
         seen: set[str] = set()
         offset = 0
         total: int | None = None
@@ -848,6 +917,7 @@ class WorkdayProvider:
                 if url and url not in seen:
                     seen.add(url)
                     discovered.append(url)
+                    listing_rows[url] = row
 
             offset += len(rows)
             reached_positive_total = total is not None and total > 0 and offset >= total
@@ -855,20 +925,54 @@ class WorkdayProvider:
                 complete = True
                 break
 
+        listing_pages = requests
+        preextracted: dict[str, JobPosting] = {}
+        detail_failures = 0
+        detail_limit = min(len(discovered), int(context.max_records or 0))
+        for job_url in discovered[:detail_limit]:
+            path = str(listing_rows[job_url].get("externalPath") or "").strip()
+            detail_endpoint = urljoin(
+                f"https://{hostname}/wday/cxs/{tenant}/{site}/",
+                f"/wday/cxs/{tenant}/{site}{path}",
+            )
+            try:
+                detail_payload = await client.request_json(
+                    detail_endpoint,
+                    timeout_seconds=context.timeout_seconds,
+                )
+                requests += 1
+            except Exception:
+                requests += 1
+                detail_failures += 1
+                continue
+            job = _workday_job(
+                detail_payload,
+                listing_row=listing_rows[job_url],
+                job_url=job_url,
+                hostname=hostname,
+            )
+            if job is None:
+                detail_failures += 1
+                continue
+            preextracted[job_url] = job
+
         return AcquisitionResult(
             platform=self.platform,
-            strategy="platform_api_discovery",
+            strategy="platform_api" if preextracted else "platform_api_discovery",
             discovered_urls=discovered,
-            preextracted_jobs={},
+            preextracted_jobs=preextracted,
             trusted_hosts=(hostname,),
             complete=complete,
-            pages_visited=requests,
+            pages_visited=listing_pages,
             endpoint_requests=requests,
             metadata={
                 "tenant": tenant,
                 "site": site,
                 "reported_total": total,
                 "page_size": self.page_size,
+                "detail_records_requested": detail_limit,
+                "detail_records_hydrated": len(preextracted),
+                "detail_record_failures": detail_failures,
             },
         )
 

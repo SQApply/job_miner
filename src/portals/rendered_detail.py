@@ -13,8 +13,10 @@ from ..crawl.browser_evidence import (
 from ..crawl.dom_snapshot import DomNodeEvidence, FrameDomSnapshot
 from ..schemas import BrowserSettings, JobPosting
 from .job_evidence import (
+    infer_job_title_from_url,
     job_detail_signal_count,
     job_title_context_rejection_reason,
+    job_title_source_rejection_reason,
     plausible_location,
 )
 from .json_discovery import JsonCandidateDiscoverer, JsonDiscoveryOptions
@@ -154,10 +156,11 @@ class RenderedDetailExtractor:
         location_hint: str | None = None,
         baseline_report: BrowserEvidenceReport | None = None,
     ) -> RenderedDetailResult:
+        effective_title_hint = title_hint or infer_job_title_from_url(fallback_url)
         structured = self._structured_job(
             report,
             fallback_url=fallback_url,
-            title_hint=title_hint,
+            title_hint=effective_title_hint,
         )
         structured_context = self._job_context(structured) if structured is not None else []
         if (
@@ -165,6 +168,13 @@ class RenderedDetailExtractor:
             and job_title_context_rejection_reason(
                 structured.title,
                 structured_context,
+            )
+            is None
+            and job_title_source_rejection_reason(
+                structured.title,
+                job_url=fallback_url,
+                job_reference=structured.job_reference,
+                summary=structured.summary,
             )
             is None
         ):
@@ -186,7 +196,7 @@ class RenderedDetailExtractor:
             if (
                 value := self._frame_text(
                     frame,
-                    title_hint=title_hint,
+                    title_hint=effective_title_hint,
                     baseline_counts=baseline_counts,
                     modal_mode=baseline_report is not None,
                 )
@@ -230,10 +240,15 @@ class RenderedDetailExtractor:
             selected.title,
             selected.text_parts,
         )
-        if title_rejection is not None:
+        source_title_rejection = job_title_source_rejection_reason(
+            selected.title,
+            job_url=fallback_url,
+            summary=summary,
+        )
+        if title_rejection is not None or source_title_rejection is not None:
             return RenderedDetailResult(
                 job=None,
-                reason=f"invalid_job_title:{title_rejection}",
+                reason=f"invalid_job_title:{title_rejection or source_title_rejection}",
                 metrics=metrics,
             )
         if not selected.title_grounded:
