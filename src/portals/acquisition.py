@@ -928,7 +928,11 @@ class WorkdayProvider:
         listing_pages = requests
         preextracted: dict[str, JobPosting] = {}
         detail_failures = 0
-        detail_limit = min(len(discovered), int(context.max_records or 0))
+        detail_limit = (
+            len(discovered)
+            if context.max_records is None
+            else min(len(discovered), int(context.max_records))
+        )
         for job_url in discovered[:detail_limit]:
             path = str(listing_rows[job_url].get("externalPath") or "").strip()
             detail_endpoint = urljoin(

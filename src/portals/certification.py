@@ -14,7 +14,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Literal
 from urllib.parse import urlsplit, urlunsplit
 from xml.etree import ElementTree
 
@@ -258,7 +258,10 @@ def read_portal_inventory(path: Path) -> list[PortalInventoryEntry]:
 
 @dataclass(frozen=True)
 class CertificationOptions:
-    max_jobs: int = 10
+    catalog_mode: Literal["bounded_certification", "complete_catalog"] = (
+        "bounded_certification"
+    )
+    max_jobs: int | None = 10
     max_pages: int = 3
     detail_concurrency: int = 1
     detail_retry_attempts: int = 1
@@ -269,10 +272,15 @@ class CertificationOptions:
     allow_llm_fallback: bool = False
 
     def __post_init__(self) -> None:
-        if not 1 <= self.max_jobs <= 10:
-            raise ValueError("Certification max_jobs must be between 1 and 10")
+        if self.catalog_mode == "bounded_certification":
+            if self.max_jobs is None or not 1 <= self.max_jobs <= 10:
+                raise ValueError("Bounded certification max_jobs must be between 1 and 10")
+        elif self.max_jobs is not None:
+            raise ValueError("Complete-catalog acquisition cannot set max_jobs")
         if self.max_pages < 1:
             raise ValueError("max_pages must be at least 1")
+        if self.max_pages > 500:
+            raise ValueError("max_pages cannot exceed the complete-catalog safety cap of 500")
         if not 1 <= self.detail_concurrency <= 2:
             raise ValueError("detail_concurrency must be 1 or 2 for bounded local-GPU certification")
         if not 0 <= self.detail_retry_attempts <= 2:
@@ -321,6 +329,9 @@ class PortalCertificationRecord:
     route_resolution: dict[str, Any] = field(default_factory=dict)
     discovery_quality: dict[str, Any] = field(default_factory=dict)
     event_samples: list[dict[str, Any]] = field(default_factory=list)
+    catalog_mode: str = "bounded_certification"
+    discovery_complete: bool = False
+    catalog_complete: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -646,7 +657,7 @@ class PortalFleetCertifier:
                 acquisition_hints=detection.acquisition_hints,
                 max_pages=self.options.max_pages,
                 timeout_seconds=self.options.acquisition_timeout_seconds,
-                require_complete=False,
+                require_complete=self.options.catalog_mode == "complete_catalog",
                 max_records=self.options.max_jobs,
             )
         )
@@ -981,7 +992,11 @@ class PortalFleetCertifier:
                 self._probe(entry),
                 timeout=self.options.source_timeout_seconds,
             )
-            stage = "bounded_extraction"
+            stage = (
+                "complete_catalog_extraction"
+                if self.options.catalog_mode == "complete_catalog"
+                else "bounded_extraction"
+            )
             portal = {
                 "id": entry.source_id,
                 "target_id": entry.source_id,
@@ -1043,7 +1058,9 @@ class PortalFleetCertifier:
                         prefer_platform_api=True,
                         max_acquisition_pages=self.options.max_pages,
                         acquisition_timeout_seconds=self.options.acquisition_timeout_seconds,
-                        require_complete_acquisition=False,
+                        require_complete_acquisition=(
+                            self.options.catalog_mode == "complete_catalog"
+                        ),
                         prefer_static_detail_html=True,
                         enable_adaptive_dom_fallback=True,
                         enable_rendered_detail_fallback=True,
@@ -1078,6 +1095,25 @@ class PortalFleetCertifier:
 
             extracted = len(orchestration.jobs)
             failures = len(orchestration.detail_failures)
+            discovery_payload = dict(orchestration.discovery_batch or {})
+            if orchestration.acquisition.get("selected") is True:
+                discovery_complete = orchestration.acquisition.get("complete") is True
+            else:
+                discovery_complete = (
+                    discovery_payload.get("completeness") == "complete"
+                    and discovery_payload.get("pagination_complete") is True
+                )
+            raw_extracted = int(
+                orchestration.rescrape_plan.get("raw_extracted_jobs") or extracted
+            )
+            catalog_complete = (
+                discovery_complete
+                and failures == 0
+                and raw_extracted == len(orchestration.attempted_job_urls)
+                and len(orchestration.attempted_job_urls)
+                == len(orchestration.discovered_job_urls)
+                and extracted > 0
+            )
             discovered_candidate_count = (
                 len(orchestration.discovered_candidates)
                 or len(orchestration.discovered_job_urls)
@@ -1112,12 +1148,26 @@ class PortalFleetCertifier:
                             else "but deterministic extraction produced no certifiable jobs; LLM fallback was disabled"
                         )
                     )
+            elif self.options.catalog_mode == "complete_catalog" and not catalog_complete:
+                status = "partial"
+                certification_status = "catalog_incomplete"
+                error_type = "catalog_incomplete"
+                error_message = (
+                    "Complete-catalog execution did not prove discovery and detail exhaustion: "
+                    f"discovery_complete={str(discovery_complete).lower()}, "
+                    f"discovered={len(orchestration.discovered_job_urls)}, "
+                    f"attempted={len(orchestration.attempted_job_urls)}, "
+                    f"raw_extracted={raw_extracted}, detail_failures={failures}."
+                )
             elif failures:
                 status = "partial"
                 certification_status = "needs_repair"
                 error_type = "detail_extraction_shortfall"
                 error_message = f"{failures} of {len(orchestration.attempted_job_urls)} attempted details failed"
-            elif len(orchestration.discovered_job_urls) < self.options.max_jobs:
+            elif (
+                self.options.max_jobs is not None
+                and len(orchestration.discovered_job_urls) < self.options.max_jobs
+            ):
                 status = "success"
                 certification_status = "source_exhausted"
             else:
@@ -1131,8 +1181,13 @@ class PortalFleetCertifier:
                     "discovered_candidates": discovered_candidate_count,
                     "url_backed_candidates": len(orchestration.discovered_job_urls),
                     "linkless_candidates": linkless_candidate_count,
+                    "discovery_complete": discovery_complete,
+                    "catalog_complete": catalog_complete,
                 }
             )
+            sampled_jobs = orchestration.jobs
+            if self.options.max_jobs is not None:
+                sampled_jobs = sampled_jobs[: self.options.max_jobs]
             return PortalCertificationRecord(
                 contract_version=CERTIFICATION_CONTRACT_VERSION,
                 run_id=run_id,
@@ -1149,7 +1204,7 @@ class PortalFleetCertifier:
                 discovered_urls=len(orchestration.discovered_job_urls),
                 attempted_urls=len(orchestration.attempted_job_urls),
                 extracted_jobs=extracted,
-                sample_jobs=[job.model_dump(mode="json") for job in orchestration.jobs[: self.options.max_jobs]],
+                sample_jobs=[job.model_dump(mode="json") for job in sampled_jobs],
                 acquisition=orchestration.acquisition,
                 detail_failures=orchestration.detail_failures[:25],
                 rejected_urls=orchestration.rejected_urls,
@@ -1173,6 +1228,9 @@ class PortalFleetCertifier:
                 route_resolution=probe.route_resolution,
                 discovery_quality=discovery_quality,
                 event_samples=event_samples,
+                catalog_mode=self.options.catalog_mode,
+                discovery_complete=discovery_complete,
+                catalog_complete=catalog_complete,
             )
         except Exception as exc:
             error_type, certification_status = _classify_error(exc)
@@ -1219,6 +1277,9 @@ class PortalFleetCertifier:
                 ),
                 route_resolution=(probe.route_resolution if probe else {}),
                 event_samples=event_samples,
+                catalog_mode=self.options.catalog_mode,
+                discovery_complete=False,
+                catalog_complete=False,
             )
 
 

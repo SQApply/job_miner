@@ -62,8 +62,11 @@ class Phase6ERunnerConfig(ContractModel):
     max_source_concurrency: int = Field(default=2, ge=1, le=4)
     max_attempts: int = Field(default=2, ge=1, le=3)
     retry_backoff_seconds: float = Field(default=1.0, ge=0, le=300)
-    max_jobs: int = Field(default=10, ge=1, le=10)
-    max_pages: int = Field(default=3, ge=1, le=50)
+    catalog_mode: Literal["bounded_certification", "complete_catalog"] = (
+        "bounded_certification"
+    )
+    max_jobs: int | None = Field(default=10, ge=1, le=10)
+    max_pages: int = Field(default=3, ge=1, le=500)
     detail_concurrency: int = Field(default=1, ge=1, le=2)
     detail_retry_attempts: int = Field(default=1, ge=0, le=2)
     requests_per_minute: int = Field(default=30, ge=1, le=600)
@@ -84,10 +87,16 @@ class Phase6ERunnerConfig(ContractModel):
             raise ValueError("Phase 6E cannot enable lifecycle reconciliation")
         if self.deactivation_enabled:
             raise ValueError("Phase 6E cannot enable job deactivation")
+        if self.catalog_mode == "bounded_certification":
+            if self.max_jobs is None:
+                raise ValueError("Bounded certification requires max_jobs")
+        elif self.max_jobs is not None:
+            raise ValueError("Complete-catalog execution cannot set max_jobs")
         return self
 
     def certification_options(self) -> CertificationOptions:
         return CertificationOptions(
+            catalog_mode=self.catalog_mode,
             max_jobs=self.max_jobs,
             max_pages=self.max_pages,
             detail_concurrency=self.detail_concurrency,
@@ -126,6 +135,9 @@ class Phase6ESourceResult(ContractModel):
     unchanged_count: int = Field(default=0, ge=0)
     reactivated_count: int = Field(default=0, ge=0)
     source_run_id: str | None = None
+    catalog_mode: str = "bounded_certification"
+    discovery_complete: bool = False
+    catalog_complete: bool = False
     error_type: str | None = None
     error_message: str | None = None
     elapsed_seconds: float = Field(default=0, ge=0)
@@ -454,7 +466,14 @@ class Phase6EProductionRunner:
                 "max_source_concurrency": self.config.max_source_concurrency,
                 "max_attempts": self.config.max_attempts,
                 "max_jobs_per_source": self.config.max_jobs,
-                "bounded_pilot_execution": True,
+                "max_pages_per_source": self.config.max_pages,
+                "catalog_mode": self.config.catalog_mode,
+                "catalog_completion_required": (
+                    self.config.catalog_mode == "complete_catalog"
+                ),
+                "bounded_pilot_execution": (
+                    self.config.catalog_mode == "bounded_certification"
+                ),
             },
         )
         return manifest
@@ -473,8 +492,11 @@ class Phase6EProductionRunner:
             source_run = self.audit.start_source_run(
                 fleet_run_id=fleet_run_id,
                 source=source,
-                extractor_version="phase6e-production-runner-1.0",
-                metadata={"execution_mode": self.config.execution_mode},
+                extractor_version="phase6e-production-runner-1.1",
+                metadata={
+                    "execution_mode": self.config.execution_mode,
+                    "catalog_mode": self.config.catalog_mode,
+                },
             )
 
         record: PortalCertificationRecord | None = None
@@ -555,6 +577,7 @@ class Phase6EProductionRunner:
                 status=terminal_status,
                 attempts=attempts,
                 source_run_id=source_run.source_run_id if source_run else None,
+                catalog_mode=self.config.catalog_mode,
                 error_type=error_type,
                 error_message=error_message,
                 elapsed_seconds=round(time.perf_counter() - started, 3),
@@ -621,6 +644,14 @@ class Phase6EProductionRunner:
         terminal_status = _record_terminal_status(record, accepted=accepted)
         error_type = record.error_type
         error_message = record.error_message
+        if self.config.catalog_mode == "complete_catalog" and (
+            record.catalog_mode != "complete_catalog" or not record.catalog_complete
+        ):
+            terminal_status = "failed"
+            error_type = error_type or "catalog_incomplete"
+            error_message = error_message or (
+                "Complete-catalog execution did not produce complete discovery and detail evidence"
+            )
         if terminal_status == "failed" and record.status == "success" and accepted == 0:
             error_type = "quality_gate_rejected_all"
             error_message = "Scraping succeeded but no extracted jobs passed the Phase 6D quality gate"
@@ -642,7 +673,12 @@ class Phase6EProductionRunner:
                 metadata={
                     "attempts": [item.model_dump(mode="json") for item in attempts],
                     "certification_status": record.certification_status,
-                    "bounded_pilot_execution": True,
+                    "catalog_mode": record.catalog_mode,
+                    "discovery_complete": record.discovery_complete,
+                    "catalog_complete": record.catalog_complete,
+                    "bounded_pilot_execution": (
+                        self.config.catalog_mode == "bounded_certification"
+                    ),
                 },
             )
 
@@ -663,6 +699,9 @@ class Phase6EProductionRunner:
             unchanged_count=outcome_counts.get("unchanged", 0),
             reactivated_count=outcome_counts.get("reactivated", 0),
             source_run_id=source_run.source_run_id if source_run else None,
+            catalog_mode=record.catalog_mode,
+            discovery_complete=record.discovery_complete,
+            catalog_complete=record.catalog_complete,
             error_type=error_type if terminal_status != "success" else None,
             error_message=error_message if terminal_status != "success" else None,
             elapsed_seconds=round(time.perf_counter() - started, 3),

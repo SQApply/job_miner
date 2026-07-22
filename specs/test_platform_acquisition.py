@@ -283,6 +283,48 @@ class PlatformAcquisitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(production.selected)
         self.assertEqual(production.attempts[0]["status"], "incomplete")
 
+    async def test_workday_complete_catalog_hydrates_every_discovered_job(self) -> None:
+        listing = {
+            "total": 2,
+            "jobPostings": [
+                {"externalPath": "/job/Chicago/data-engineer_JR1"},
+                {"externalPath": "/job/Remote/ml-engineer_JR2"},
+            ],
+        }
+        details = [
+            {
+                "jobPostingInfo": {
+                    "title": "Data Engineer",
+                    "jobDescription": "Build reliable production data pipelines.",
+                    "jobReqId": "JR1",
+                }
+            },
+            {
+                "jobPostingInfo": {
+                    "title": "ML Engineer",
+                    "jobDescription": "Build and operate production machine learning systems.",
+                    "jobReqId": "JR2",
+                }
+            },
+        ]
+        outcome = await AcquisitionRegistry(
+            client=FakeJsonClient([listing, *details])
+        ).acquire(
+            AcquisitionContext(
+                listing_url="https://acme.wd5.myworkdayjobs.com/en-US/External",
+                max_pages=1,
+                require_complete=True,
+                max_records=None,
+            )
+        )
+
+        assert outcome.selected is not None
+        self.assertTrue(outcome.selected.complete)
+        self.assertEqual(len(outcome.selected.discovered_urls), 2)
+        self.assertEqual(len(outcome.selected.preextracted_jobs), 2)
+        self.assertEqual(outcome.selected.metadata["detail_records_requested"], 2)
+        self.assertEqual(outcome.selected.metadata["detail_records_hydrated"], 2)
+
     async def test_workday_one_segment_site_does_not_mistake_jobs_for_site_token(self) -> None:
         client = FakeJsonClient(
             [
