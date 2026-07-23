@@ -1,0 +1,81 @@
+{
+  "contract_version": "1.0",
+  "phase": "7D3C",
+  "policy_status": "target_25_promotion_policy",
+  "expected_inventory_count": 102,
+  "expected_phase7d3b_source_count": 26,
+  "expected_complete_catalog_count": 5,
+  "expected_partial_safe_count": 11,
+  "expected_nonproductive_count": 10,
+  "target_production_source_count": 25,
+  "promotion_candidates": [
+    {
+      "source_id": "cert_www_experis_com_8f36c1b10940",
+      "display_name": "Experis",
+      "evidence": "Seven previously validated jobs; complete-catalog pagination must be re-proven."
+    },
+    {
+      "source_id": "cert_www_computerfutures_com_ee1a6bd72e7d",
+      "display_name": "Computer Futures",
+      "evidence": "Two previously validated jobs; complete-catalog route and pagination must be re-proven."
+    },
+    {
+      "source_id": "cert_capgroup_wd1_myworkdayjobs_com_2d07c72da5d7",
+      "display_name": "Capital Group Workday",
+      "evidence": "Three previously validated jobs; use the deterministic Workday acquisition lane first."
+    },
+    {
+      "source_id": "cert_www_helpmates_com_23c208136a17",
+      "display_name": "Helpmates",
+      "evidence": "Two previously validated jobs and an earlier bounded ten-job success."
+    },
+    {
+      "source_id": "cert_www_extensionrecruiting_com_100521083f46",
+      "display_name": "Extension Recruiting",
+      "evidence": "Two previously validated jobs; complete-catalog discovery remains unproven."
+    },
+    {
+      "source_id": "cert_www_thebestirs_com_f4d7a04bc7fc",
+      "display_name": "TheBestIRS",
+      "evidence": "Two previously validated jobs; complete-catalog discovery remains unproven."
+    },
+    {
+      "source_id": "cert_www_comphealth_com_609ddbde172d",
+      "display_name": "CompHealth",
+      "evidence": "Five previously validated jobs; complete-catalog discovery remains unproven."
+    },
+    {
+      "source_id": "cert_careers_ctg_com_67ea01487d21",
+      "display_name": "CTG",
+      "evidence": "Earlier iCIMS certification extracted ten valid jobs from twenty-six discovered URLs."
+    },
+    {
+      "source_id": "cert_www_abrjobs_com_e535eb3dd92a",
+      "display_name": "ABR Jobs",
+      "evidence": "Earlier bounded certification extracted ten valid jobs."
+    }
+  ],
+  "recurring_policy": {
+    "cadence_hours": 72,
+    "complete_catalog_sources": {
+      "upsert_new_and_changed_jobs": true,
+      "missing_from_listing_reconciliation_enabled": false,
+      "enable_reconciliation_only_after_two_clean_complete_cycles": true
+    },
+    "partial_safe_sources": {
+      "upsert_new_and_changed_jobs": true,
+      "missing_from_listing_reconciliation_enabled": false,
+      "deactivation_from_incomplete_discovery_enabled": false,
+      "direct_detail_closure_requires_two_confirmations": true
+    }
+  },
+  "execution_limits": {
+    "source_concurrency": 1,
+    "detail_concurrency": 1,
+    "gpu_llm_concurrency": 1,
+    "requests_per_minute": 30,
+    "source_timeout_seconds": 1800,
+    "acquisition_timeout_seconds": 25,
+    "page_safety_cap": 500
+  }
+}
