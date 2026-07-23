@@ -989,13 +989,46 @@ def _icims_match(url: str) -> ProviderMatch | None:
     hostname = str(parsed.hostname or "").lower().rstrip(".")
     if hostname != "icims.com" and not hostname.endswith(".icims.com"):
         return None
-    path = re.sub(r"/{2,}", "/", parsed.path or "/jobs").rstrip("/") or "/jobs"
+    original_path = re.sub(r"/{2,}", "/", parsed.path or "/jobs").rstrip("/") or "/jobs"
+    path = original_path
     detail_match = re.match(r"^(?P<listing_path>/.+?/jobs|/jobs)/\d+(?:/|$)", path, flags=re.IGNORECASE)
     if detail_match:
         path = detail_match.group("listing_path")
     if not re.search(r"(?:^|/)jobs$", path, flags=re.IGNORECASE):
         path = "/jobs"
-    listing_url = urlunsplit((parsed.scheme.lower() or "https", hostname, path, parsed.query, ""))
+    query = parsed.query
+    if re.search(
+        r"(?:^|/)(?:auth|login|oauth|signin|signup|sso)(?:/|$)",
+        original_path,
+        flags=re.IGNORECASE,
+    ):
+        query = ""
+    else:
+        query = urlencode(
+            [
+                (key, value)
+                for key, values in parse_qs(
+                    parsed.query,
+                    keep_blank_values=True,
+                ).items()
+                if key.lower()
+                not in {
+                    "auth",
+                    "authorize",
+                    "login",
+                    "loginonly",
+                    "oauth",
+                    "signin",
+                    "signup",
+                    "sso",
+                }
+                for value in values
+            ],
+            doseq=True,
+        )
+    listing_url = urlunsplit(
+        (parsed.scheme.lower() or "https", hostname, path, query, "")
+    )
     return ProviderMatch(
         platform="icims",
         token=hostname,

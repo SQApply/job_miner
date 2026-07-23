@@ -171,6 +171,41 @@ def _listing_candidate_score(
 
     path = re.sub(r"/{2,}", "/", parsed.path or "/")
     lowered_path = path.lower().rstrip("/") or "/"
+    path_tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", lowered_path)
+        if token
+    }
+    query_keys = {
+        key.lower() for key in parse_qs(parsed.query, keep_blank_values=True)
+    }
+    if (
+        hostname.startswith(("auth.", "login.", "sso."))
+        or path_tokens
+        & {
+            "auth",
+            "authenticate",
+            "authentication",
+            "authorize",
+            "login",
+            "oauth",
+            "signin",
+            "signup",
+            "sso",
+        }
+        or query_keys
+        & {
+            "auth",
+            "authorize",
+            "login",
+            "loginonly",
+            "oauth",
+            "signin",
+            "signup",
+            "sso",
+        }
+    ):
+        return None
     normalized_label = " ".join(str(label or "").lower().split())
     numeric_detail = bool(re.search(r"/jobs?/\d+(?:/|$)", lowered_path))
     if numeric_detail:

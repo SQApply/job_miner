@@ -262,6 +262,7 @@ class CertificationOptions:
         "bounded_certification"
     )
     max_jobs: int | None = 10
+    detail_budget: int | None = None
     max_pages: int = 3
     detail_concurrency: int = 1
     detail_retry_attempts: int = 1
@@ -275,8 +276,14 @@ class CertificationOptions:
         if self.catalog_mode == "bounded_certification":
             if self.max_jobs is None or not 1 <= self.max_jobs <= 10:
                 raise ValueError("Bounded certification max_jobs must be between 1 and 10")
+            if self.detail_budget is not None:
+                raise ValueError(
+                    "Bounded certification uses max_jobs and cannot also set detail_budget"
+                )
         elif self.max_jobs is not None:
             raise ValueError("Complete-catalog acquisition cannot set max_jobs")
+        if self.detail_budget is not None and not 1 <= self.detail_budget <= 100:
+            raise ValueError("detail_budget must be between 1 and 100")
         if self.max_pages < 1:
             raise ValueError("max_pages must be at least 1")
         if self.max_pages > 500:
@@ -473,6 +480,51 @@ def _owned_sibling_hosts(hostname: str) -> list[str]:
     ]
 
 
+def _acquisition_evidence_hosts(outcome: AcquisitionOutcome) -> tuple[str, ...]:
+    """Collect only hosts explicitly validated by an acquisition lane.
+
+    Empty and incomplete acquisition results can still contain a validated
+    public redirect or an evidence-bound listing handoff. Retaining those
+    concrete hosts lets the browser lane continue safely without enabling
+    arbitrary cross-domain crawling.
+    """
+
+    hosts: list[str] = []
+
+    def add(value: Any) -> None:
+        raw = str(value or "").strip().lower().rstrip(".")
+        if not raw or raw.startswith("*."):
+            return
+        if "://" in raw:
+            try:
+                raw = str(urlsplit(raw).hostname or "").lower().rstrip(".")
+            except ValueError:
+                return
+        if not raw or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", raw):
+            return
+        if raw not in hosts:
+            hosts.append(raw)
+
+    if outcome.selected is not None:
+        for value in outcome.selected.trusted_hosts:
+            add(value)
+    for attempt in outcome.attempts:
+        if str(attempt.get("status") or "") not in {"empty", "incomplete", "selected"}:
+            continue
+        for value in list(attempt.get("trusted_hosts") or []):
+            add(value)
+        metadata = attempt.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        for bucket in ("route_resolution_chain", "redirect_evidence"):
+            for item in list(metadata.get(bucket) or []):
+                if not isinstance(item, dict):
+                    continue
+                for value in list(item.get("trusted_hosts") or []):
+                    add(value)
+    return tuple(hosts)
+
+
 def _empty_acquisition_listing_handoff(
     outcome: AcquisitionOutcome,
     *,
@@ -490,18 +542,7 @@ def _empty_acquisition_listing_handoff(
         raw = str(metadata.get("listing_url") or "").strip()
         if not raw or canonicalize_candidate_url(raw) == canonicalize_candidate_url(source_url):
             continue
-        trusted = {
-            str(value).lower().rstrip(".")
-            for value in list(attempt.get("trusted_hosts") or [])
-            if str(value).strip()
-        }
-        for item in list(metadata.get("route_resolution_chain") or []):
-            if isinstance(item, dict):
-                trusted.update(
-                    str(value).lower().rstrip(".")
-                    for value in list(item.get("trusted_hosts") or [])
-                    if str(value).strip()
-                )
+        trusted = set(_acquisition_evidence_hosts(outcome))
         candidate_host = str(urlsplit(raw).hostname or "").lower().rstrip(".")
         known_ats = bool(known_browser_ats_platform(raw))
         if (
@@ -818,9 +859,7 @@ class PortalFleetCertifier:
                 detection=detection,
             )
             selected_hosts = (
-                list(shell_outcome.selected.trusted_hosts)
-                if shell_outcome.selected is not None
-                else []
+                list(_acquisition_evidence_hosts(shell_outcome))
             )
             return _ProbeResult(
                 effective_listing_url=final_checked.normalized_url,
@@ -873,7 +912,7 @@ class PortalFleetCertifier:
                     *route_resolution.trusted_hosts,
                     *_approved_hosts_for_url(final_checked.normalized_url),
                     *_approved_hosts_for_url(effective_url),
-                    *inferred_outcome.selected.trusted_hosts,
+                    *_acquisition_evidence_hosts(inferred_outcome),
                 ]
                 return _ProbeResult(
                     effective_listing_url=effective_url,
@@ -943,6 +982,7 @@ class PortalFleetCertifier:
         ]
         if acquisition_outcome.selected is not None:
             approved_hosts.extend(acquisition_outcome.selected.trusted_hosts)
+        approved_hosts.extend(_acquisition_evidence_hosts(acquisition_outcome))
         return _ProbeResult(
             effective_listing_url=effective_url,
             detection=detection,
@@ -1049,6 +1089,7 @@ class PortalFleetCertifier:
                         detail_retry_attempts=self.options.detail_retry_attempts,
                         requests_per_minute=self.options.requests_per_minute,
                         max_jobs=self.options.max_jobs,
+                        max_detail_urls=self.options.detail_budget,
                         # Certification must retain the adaptive acquisition
                         # diagnostics even when no candidate survives. The
                         # explicit classification below still marks the source
@@ -1192,6 +1233,13 @@ class PortalFleetCertifier:
                     "linkless_candidates": linkless_candidate_count,
                     "discovery_complete": discovery_complete,
                     "catalog_complete": catalog_complete,
+                    "detail_budget": self.options.detail_budget,
+                    "detail_budget_applied": bool(
+                        orchestration.rescrape_plan.get("detail_budget_applied")
+                    ),
+                    "detail_urls_deferred": int(
+                        orchestration.rescrape_plan.get("detail_urls_deferred") or 0
+                    ),
                 }
             )
             sampled_jobs = orchestration.jobs

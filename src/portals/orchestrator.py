@@ -73,6 +73,28 @@ def _plan_all_urls(urls: list[str]) -> tuple[list[str], dict[str, Any]]:
     }
 
 
+def _stratified_detail_sample(urls: list[str], limit: int) -> list[str]:
+    """Select a stable catalog-wide sample without changing discovery truth."""
+
+    values = list(urls)
+    if limit >= len(values):
+        return values
+    if limit <= 1:
+        return values[:1]
+    last = len(values) - 1
+    indices = [
+        round(position * last / (limit - 1))
+        for position in range(limit)
+    ]
+    selected = [values[index] for index in dict.fromkeys(indices)]
+    if len(selected) < limit:
+        selected_set = set(selected)
+        selected.extend(
+            value for value in values if value not in selected_set
+        )
+    return selected[:limit]
+
+
 def _preserve_discovery_order(urls: list[str]) -> tuple[list[str], dict[str, Any]]:
     return list(urls), {
         "strategy": "disabled",
@@ -179,6 +201,7 @@ class ScrapeExecutionOptions:
     detail_retry_attempts: int = 0
     requests_per_minute: int | None = None
     max_jobs: int | None = None
+    max_detail_urls: int | None = None
     fail_on_zero_discovery: bool = True
     session_prefix: str = "detail"
     prefer_platform_api: bool = True
@@ -199,6 +222,8 @@ class ScrapeExecutionOptions:
             raise ValueError("requests_per_minute must be at least 1 when provided")
         if self.max_jobs is not None and self.max_jobs < 1:
             raise ValueError("max_jobs must be at least 1 when provided")
+        if self.max_detail_urls is not None and self.max_detail_urls < 1:
+            raise ValueError("max_detail_urls must be at least 1 when provided")
         if not self.session_prefix.strip():
             raise ValueError("session_prefix cannot be empty")
         if self.max_acquisition_pages < 1:
@@ -670,7 +695,6 @@ class ScrapeOrchestrator:
         rescrape_plan["linkless_candidates_deferred"] = len(linkless_candidates)
         rescrape_plan["urls_to_extract_count"] = len(attempted_urls)
         rescrape_plan["url_ranking"] = dict(discovery_ranking)
-        self._emit(hooks, "rescrape_plan_complete", **rescrape_plan)
 
         if options.max_jobs is not None:
             attempted_urls = attempted_urls[: options.max_jobs]
@@ -681,6 +705,25 @@ class ScrapeOrchestrator:
                     "bounded_urls_to_extract_count": len(attempted_urls),
                 }
             )
+        if options.max_detail_urls is not None and len(attempted_urls) > options.max_detail_urls:
+            total_planned_urls = len(attempted_urls)
+            attempted_urls = _stratified_detail_sample(
+                attempted_urls,
+                options.max_detail_urls,
+            )
+            rescrape_plan.update(
+                {
+                    "detail_budget_applied": True,
+                    "detail_budget": options.max_detail_urls,
+                    "detail_budget_selection": (
+                        "deterministic_stratified_catalog_sample"
+                    ),
+                    "detail_urls_planned_before_budget": total_planned_urls,
+                    "detail_urls_deferred": total_planned_urls - len(attempted_urls),
+                    "budgeted_urls_to_extract_count": len(attempted_urls),
+                }
+            )
+        self._emit(hooks, "rescrape_plan_complete", **rescrape_plan)
 
         candidate_by_url = {
             candidate.detail_url: candidate

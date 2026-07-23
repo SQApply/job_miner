@@ -56,6 +56,29 @@ _NEGATIVE_ROUTE_TOKENS = {
     "terms",
 }
 
+_AUTH_ROUTE_TOKENS = {
+    "auth",
+    "authenticate",
+    "authentication",
+    "authorize",
+    "login",
+    "oauth",
+    "signin",
+    "signup",
+    "sso",
+}
+
+_AUTH_QUERY_KEYS = {
+    "auth",
+    "authorize",
+    "login",
+    "loginonly",
+    "oauth",
+    "signin",
+    "signup",
+    "sso",
+}
+
 _NON_ROUTE_HOSTS = (
     "doubleclick.net",
     "facebook.com",
@@ -190,6 +213,26 @@ def _non_route_host(hostname: str) -> bool:
     return any(_host_matches(hostname, suffix) for suffix in _NON_ROUTE_HOSTS)
 
 
+def is_authentication_route(value: str) -> bool:
+    """Reject authentication surfaces even when they are hosted by a known ATS."""
+
+    try:
+        parsed = urlsplit(str(value or ""))
+    except ValueError:
+        return True
+    hostname = _normalized_host(parsed.hostname or "")
+    path_tokens = _tokens(parsed.path)
+    query_keys = {
+        key.lower() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
+    }
+    auth_host = hostname.startswith(("auth.", "login.", "sso."))
+    return bool(
+        auth_host
+        or path_tokens & _AUTH_ROUTE_TOKENS
+        or query_keys & _AUTH_QUERY_KEYS
+    )
+
+
 def _provider_platform(url: str) -> str | None:
     try:
         parsed = urlsplit(url)
@@ -239,7 +282,10 @@ def _normalize_route_url(source_url: str, value: Any) -> str:
     fragment = parsed.fragment.strip().rstrip("/")
     if fragment and not (_tokens(fragment) & {"career", "careers", "job", "jobs", "openings"}):
         fragment = ""
-    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, query, fragment))
+    normalized = urlunsplit(
+        (parsed.scheme.lower(), parsed.netloc.lower(), path, query, fragment)
+    )
+    return "" if is_authentication_route(normalized) else normalized
 
 
 class _RouteEvidenceParser(HTMLParser):
@@ -468,7 +514,11 @@ def _score_candidate(
         return None
     source_host = _normalized_host(source.hostname or "")
     hostname = _normalized_host(parsed.hostname or "")
-    if not hostname or _is_pagination_only(source_url, accumulator.url):
+    if (
+        not hostname
+        or is_authentication_route(accumulator.url)
+        or _is_pagination_only(source_url, accumulator.url)
+    ):
         return None
 
     path = parsed.path or "/"

@@ -379,12 +379,19 @@ def assess_job_candidate_url(
     requisition_slug_detail = bool(
         re.search(r"/jobs?/[^/?#]+-\d{4,}(?:/|$)", path)
     )
+    embedded_board_requisition_detail = bool(
+        re.search(
+            r"/[a-z0-9_-]*jobs?/[^/?#]+-\d{4,}(?:/|$)",
+            path,
+        )
+    )
     strong_path_signature = bool(
         re.search(r"/jobs?/details?(?:/|$)", path)
         or re.search(r"/jobs?/\d+(?:/|$)", path)
         or re.search(r"/(?:job|position|requisition|posting)/[^/]+", path)
         or job_board_detail
         or requisition_slug_detail
+        or embedded_board_requisition_detail
     )
     if (
         str(platform_hint or "").strip().lower() == "icims"
@@ -439,6 +446,9 @@ def assess_job_candidate_url(
     elif requisition_slug_detail:
         score += 12
         reasons.append("requisition_slug_detail_path")
+    elif embedded_board_requisition_detail:
+        score += 12
+        reasons.append("embedded_board_requisition_detail_path")
     elif re.search(r"/(?:job|position|requisition|posting)/[^/]+", path):
         score += 8
         reasons.append("job_entity_path")
