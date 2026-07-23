@@ -106,6 +106,14 @@ _JOB_TOKENS = {
 }
 
 _DETAIL_TOKENS = {"apply", "detail", "details", "description", "view"}
+_JOB_ACTION_SEGMENTS = {
+    "apply",
+    "application",
+    "login",
+    "register",
+    "signin",
+    "signup",
+}
 _JOB_QUERY_KEYS = {
     "gh_jid",
     "job",
@@ -259,6 +267,43 @@ class CandidateAssessment:
         return payload
 
 
+def candidate_action_kind(value: str) -> str | None:
+    """Return a terminal job-action route that must not enter detail extraction."""
+
+    url = canonicalize_candidate_url(value)
+    if not url:
+        return None
+    try:
+        path = _logical_route_path(urlsplit(url).path, urlsplit(url).fragment)
+    except ValueError:
+        return None
+    segments = [segment for segment in path.lower().split("/") if segment]
+    return segments[-1] if segments and segments[-1] in _JOB_ACTION_SEGMENTS else None
+
+
+def candidate_job_route_identity(value: str) -> str | None:
+    """Extract a host-scoped stable job id shared by detail and action URLs."""
+
+    url = canonicalize_candidate_url(value)
+    if not url:
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    path = _logical_route_path(parsed.path, parsed.fragment)
+    match = re.search(
+        r"/(?:jobs?|positions?|requisitions?|postings?)/(?:details?/)?([a-z0-9._-]{3,})(?:/|$)",
+        path,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    host = str(parsed.hostname or "").lower().rstrip(".")
+    identity = str(match.group(1) or "").lower()
+    return f"{host}:{identity}" if host and identity else None
+
+
 def assess_job_candidate_url(
     value: str,
     *,
@@ -316,6 +361,16 @@ def assess_job_candidate_url(
             confidence="rejected",
             hard_reject=True,
             reasons=("same_as_listing",),
+        )
+
+    action_kind = candidate_action_kind(url)
+    if action_kind:
+        return CandidateAssessment(
+            url=url,
+            score=-60,
+            confidence="rejected",
+            hard_reject=True,
+            reasons=(f"job_action_route:{action_kind}",),
         )
 
     job_board_detail = bool(

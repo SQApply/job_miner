@@ -19,6 +19,10 @@ from .contracts import (
     ScrapeStrategy,
 )
 from .dom_discovery import DomCandidateDiscoverer, DomDiscoveryOptions
+from .dom_pagination import (
+    GeneralizedDomPaginationDriver,
+    GeneralizedDomPaginationOptions,
+)
 from .json_discovery import JsonCandidateDiscoverer, JsonDiscoveryOptions
 from .live_interaction import LinklessInteractionOptions, LiveLinklessResolver
 from .url_intelligence import assess_job_candidate_url
@@ -37,10 +41,11 @@ _LISTING_EXPANSION_REJECT = re.compile(
 
 
 class AdaptiveDomDiscoveryService:
-    """Capture one rendered listing and infer jobs from repeated DOM structure.
+    """Infer jobs from rendered DOM structure and bounded public interaction.
 
-    This is a bounded fallback lane. It does not persist XPath/CSS selectors,
-    reuse authenticated state, solve CAPTCHAs, or claim pagination completeness.
+    It does not persist XPath/CSS selectors, reuse authenticated state, or solve
+    CAPTCHAs. Complete-catalog callers may request generalized pagination; that
+    lane claims completeness only after observable UI exhaustion.
     """
 
     def __init__(
@@ -51,16 +56,20 @@ class AdaptiveDomDiscoveryService:
         discovery_options: DomDiscoveryOptions | None = None,
         structured_options: JsonDiscoveryOptions | None = None,
         interaction_options: LinklessInteractionOptions | None = None,
+        pagination_options: GeneralizedDomPaginationOptions | None = None,
         collector: Any | None = None,
         interaction_resolver: Any | None = None,
+        pagination_driver: Any | None = None,
     ) -> None:
         self.browser_settings = browser_settings
         self.evidence_options = evidence_options or BrowserEvidenceOptions()
         self.discovery_options = discovery_options or DomDiscoveryOptions()
         self.structured_options = structured_options or JsonDiscoveryOptions()
         self.interaction_options = interaction_options or LinklessInteractionOptions()
+        self.pagination_options = pagination_options or GeneralizedDomPaginationOptions()
         self.collector = collector
         self.interaction_resolver = interaction_resolver
+        self.pagination_driver = pagination_driver
 
     async def discover(
         self,
@@ -68,7 +77,11 @@ class AdaptiveDomDiscoveryService:
         *,
         allowed_hosts: Iterable[str],
         max_candidates: int,
+        max_pages: int = 50,
+        require_complete: bool = False,
     ) -> DiscoveryBatch:
+        if max_pages < 1:
+            raise ValueError("max_pages must be at least 1")
         collector = self.collector or BrowserEvidenceCollector(
             self.browser_settings,
             options=self.evidence_options,
@@ -80,12 +93,30 @@ class AdaptiveDomDiscoveryService:
                 listing_url,
                 allowed_hosts=approved_hosts,
             ) as session:
-                batch = await self._discover_report(
-                    session.report,
-                    listing_url=listing_url,
-                    max_candidates=max_candidates,
-                    session=session,
-                )
+                if require_complete:
+                    # Preserve the listing context while pagination is being
+                    # exhausted. Linkless card clicks are intentionally not run
+                    # between pages because they can navigate away from it.
+                    batch = await self._discover_report(
+                        session.report,
+                        listing_url=listing_url,
+                        max_candidates=max_candidates,
+                        session=None,
+                    )
+                    batch = await self._exhaust_live_listing(
+                        session,
+                        batch,
+                        listing_url=listing_url,
+                        max_candidates=max_candidates,
+                        max_pages=max_pages,
+                    )
+                else:
+                    batch = await self._discover_report(
+                        session.report,
+                        listing_url=listing_url,
+                        max_candidates=max_candidates,
+                        session=session,
+                    )
             return await self._expand_listing_routes(
                 collector,
                 batch,
@@ -101,12 +132,209 @@ class AdaptiveDomDiscoveryService:
             max_candidates=max_candidates,
             session=None,
         )
+        if require_complete:
+            reasons = list(batch.reasons)
+            reasons.append(
+                "Complete discovery requested, but the evidence collector did not expose "
+                "a live public browser session for pagination exhaustion."
+            )
+            batch = batch.model_copy(
+                update={
+                    "completeness": CompletenessState.PARTIAL,
+                    "pagination_complete": False,
+                    "reasons": list(dict.fromkeys(reasons)),
+                }
+            )
         return await self._expand_listing_routes(
             collector,
             batch,
             listing_url=listing_url,
             allowed_hosts=approved_hosts,
             max_candidates=max_candidates,
+        )
+
+    async def _exhaust_live_listing(
+        self,
+        session: BrowserEvidenceSession,
+        batch: DiscoveryBatch,
+        *,
+        listing_url: str,
+        max_candidates: int,
+        max_pages: int,
+    ) -> DiscoveryBatch:
+        if batch.completeness in {CompletenessState.BLOCKED, CompletenessState.FAILED}:
+            return batch
+
+        driver = self.pagination_driver or GeneralizedDomPaginationDriver(
+            self.pagination_options
+        )
+        selected = self._select_candidates(
+            list(batch.candidates),
+            max_candidates=max_candidates,
+        )
+        reasons = list(batch.reasons)
+        errors: list[str] = []
+        pages_captured = 1
+        actions: list[dict[str, Any]] = []
+        growth_rounds = 0
+        stable_rounds = 0
+        stalled_control_rounds = 0
+        previous_height = 0
+        terminal_reason: str | None = None
+        pagination_complete = False
+        candidate_cap_reached = len(selected) >= max_candidates
+
+        for round_number in range(1, max_pages):
+            try:
+                step = await driver.advance(session, requested_url=listing_url)
+            except Exception as exc:
+                errors.append(
+                    f"generalized_pagination_failed: {type(exc).__name__}: {exc}"[:1_000]
+                )
+                terminal_reason = "pagination_driver_failed"
+                break
+
+            pages_captured += 1
+            errors.extend(step.errors)
+            page_batch = await self._discover_report(
+                step.report,
+                listing_url=listing_url,
+                max_candidates=max_candidates,
+                session=None,
+            )
+            if page_batch.completeness in {
+                CompletenessState.BLOCKED,
+                CompletenessState.FAILED,
+            }:
+                reasons.extend(page_batch.reasons)
+                terminal_reason = "post_interaction_page_unavailable"
+                break
+
+            before_count = len(selected)
+            selected = self._select_candidates(
+                [*selected, *page_batch.candidates],
+                max_candidates=max_candidates,
+            )
+            reasons.extend(page_batch.reasons)
+            growth = len(selected) > before_count
+            if growth:
+                growth_rounds += 1
+
+            state = dict(step.state)
+            height = int(state.get("height") or 0)
+            enabled_controls = int(state.get("enabled_controls") or 0)
+            disabled_controls = int(state.get("disabled_controls") or 0)
+            at_bottom = state.get("at_bottom") is True
+            actions.append(
+                {
+                    "round": round_number,
+                    "action": step.action,
+                    "label": step.label,
+                    "candidate_growth": len(selected) - before_count,
+                    "candidate_count": len(selected),
+                    "height": height,
+                    "at_bottom": at_bottom,
+                    "enabled_controls": enabled_controls,
+                    "disabled_controls": disabled_controls,
+                }
+            )
+
+            candidate_cap_reached = len(selected) >= max_candidates
+            if candidate_cap_reached:
+                terminal_reason = "candidate_safety_cap_reached"
+                break
+
+            stable_surface = (
+                not growth
+                and at_bottom
+                and enabled_controls == 0
+                and (previous_height == 0 or height <= previous_height)
+            )
+            stable_rounds = stable_rounds + 1 if stable_surface else 0
+            stalled_control_rounds = (
+                stalled_control_rounds + 1
+                if not growth and enabled_controls > 0
+                else 0
+            )
+
+            if disabled_controls > 0 and enabled_controls == 0:
+                pagination_complete = True
+                terminal_reason = "terminal_pagination_control_disabled"
+                break
+            if stable_rounds >= self.pagination_options.stable_rounds_required:
+                pagination_complete = True
+                terminal_reason = "stable_bottom_without_pagination_control"
+                break
+            if stalled_control_rounds >= self.pagination_options.stalled_control_rounds:
+                terminal_reason = "enabled_pagination_control_stalled"
+                break
+            if step.action in {"interaction_failed", "click_failed", "unknown"}:
+                terminal_reason = "pagination_interaction_failed"
+                break
+            previous_height = height
+        else:
+            terminal_reason = "page_safety_cap_reached"
+
+        unresolved_linkless = sum(candidate.detail_url is None for candidate in selected)
+        complete = bool(
+            pagination_complete
+            and selected
+            and not unresolved_linkless
+            and not candidate_cap_reached
+        )
+        if complete:
+            reasons = [
+                reason
+                for reason in reasons
+                if reason
+                != "Adaptive DOM discovery is bounded and cannot confirm complete pagination."
+            ]
+            reasons.append(
+                "Generalized DOM discovery observed listing exhaustion without persisted selectors."
+            )
+        elif unresolved_linkless:
+            reasons.append(
+                f"{unresolved_linkless} linkless candidates remain unresolved across pagination."
+            )
+        elif terminal_reason:
+            reasons.append(
+                f"Generalized DOM pagination remained partial: {terminal_reason}."
+            )
+
+        metrics = dict(batch.metrics)
+        metrics.update(
+            {
+                "candidates": len(selected),
+                "url_candidates": sum(
+                    candidate.detail_url is not None for candidate in selected
+                ),
+                "linkless_candidates": unresolved_linkless,
+                "generalized_pagination": {
+                    "contract_version": "1.0",
+                    "requested_complete": True,
+                    "pages_captured": pages_captured,
+                    "max_pages": max_pages,
+                    "growth_rounds": growth_rounds,
+                    "stable_rounds": stable_rounds,
+                    "candidate_cap_reached": candidate_cap_reached,
+                    "terminal_reason": terminal_reason,
+                    "pagination_complete": complete,
+                    "actions": actions[:50],
+                    "errors": errors[:20],
+                },
+            }
+        )
+        return batch.model_copy(
+            update={
+                "completeness": (
+                    CompletenessState.COMPLETE if complete else CompletenessState.PARTIAL
+                ),
+                "candidates": selected,
+                "pages_visited": pages_captured,
+                "pagination_complete": complete,
+                "metrics": metrics,
+                "reasons": list(dict.fromkeys(reasons)),
+            }
         )
 
     async def _discover_report(

@@ -13,10 +13,13 @@ from src.portals.production_guarded_execution import (
     PHASE_7D3B_WRITE_CONFIRMATION,
     Phase7D3BSourceSnapshot,
     ProductionGuardedExecutionError,
+    _canonical_sha256,
     batch_checkpoint_path,
     build_phase7d3b_batch_report,
+    can_defer_phase7d3b_quality_shortfall,
     load_phase7d3b_authorization,
     read_phase7d3b_report,
+    reclassify_phase7d3b_deferred_quality_checkpoint,
     require_phase7d3b_checkpoint_state,
     require_phase7d3b_write_confirmation,
     write_phase7d3b_report,
@@ -189,7 +192,7 @@ def test_clean_complete_batch_report_passes_and_round_trips() -> None:
     assert loaded["blockers"] == []
 
 
-def test_incomplete_catalog_blocks_next_batch_even_after_partial_writes() -> None:
+def test_expected_incomplete_catalog_is_deferred_without_enabling_deactivation() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         _, authorization = _authorization(root)
@@ -199,9 +202,134 @@ def test_incomplete_catalog_blocks_next_batch_even_after_partial_writes() -> Non
             before=_snapshot(authorization.source_ids, count=0),
             after=_snapshot(authorization.source_ids, count=1),
         )
+    assert report["status"] == "passed_with_deferred"
+    assert report["ready_for_next_batch_or_closeout"] is True
+    assert report["deferred_source_count"] == 1
+    assert report["deferred_reasons"][authorization.source_ids[0]] == "catalog_incomplete"
+    assert report["controls"]["lifecycle_reconciliation_enabled"] is False
+    assert report["controls"]["deactivation_enabled"] is False
+
+
+def test_unexpected_source_failure_still_blocks_later_batches() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        _, authorization = _authorization(root)
+        manifest = _manifest(authorization, complete=False)
+        first = manifest.source_results[0].model_copy(
+            update={"error_type": "unsafe_url"}
+        )
+        manifest = manifest.model_copy(
+            update={"source_results": [first, *manifest.source_results[1:]]}
+        )
+        report = build_phase7d3b_batch_report(
+            authorization=authorization,
+            manifest=manifest,
+            before=_snapshot(authorization.source_ids, count=0),
+            after=_snapshot(authorization.source_ids, count=1),
+        )
     assert report["status"] == "failed"
     assert report["ready_for_next_batch_or_closeout"] is False
-    assert any("source_catalog_incomplete" in item for item in report["blockers"])
+    assert any("source_unexpected_terminal_state" in item for item in report["blockers"])
+
+
+def test_incomplete_source_with_isolated_quarantine_is_safely_deferred() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        _, authorization = _authorization(root)
+        manifest = _manifest(authorization, complete=False)
+        first = manifest.source_results[0].model_copy(
+            update={"quarantined_count": 2}
+        )
+        manifest = manifest.model_copy(
+            update={
+                "quarantined_job_count": 2,
+                "source_results": [first, *manifest.source_results[1:]],
+            }
+        )
+        report = build_phase7d3b_batch_report(
+            authorization=authorization,
+            manifest=manifest,
+            before=_snapshot(authorization.source_ids, count=0),
+            after=_snapshot(authorization.source_ids, count=1),
+        )
+    assert can_defer_phase7d3b_quality_shortfall(first) is True
+    assert report["status"] == "passed_with_deferred"
+    assert report["blockers"] == []
+    assert report["counters"]["quarantined"] == 2
+    assert report["controls"]["lifecycle_reconciliation_enabled"] is False
+    assert report["controls"]["deactivation_enabled"] is False
+
+
+def test_rejected_record_is_not_offline_deferrable() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        _, authorization = _authorization(root)
+        manifest = _manifest(authorization, complete=False)
+        first = manifest.source_results[0].model_copy(
+            update={"quarantined_count": 1, "rejected_count": 1}
+        )
+        manifest = manifest.model_copy(
+            update={
+                "quarantined_job_count": 1,
+                "source_results": [first, *manifest.source_results[1:]],
+            }
+        )
+        report = build_phase7d3b_batch_report(
+            authorization=authorization,
+            manifest=manifest,
+            before=_snapshot(authorization.source_ids, count=0),
+            after=_snapshot(authorization.source_ids, count=1),
+        )
+    assert can_defer_phase7d3b_quality_shortfall(first) is False
+    assert report["status"] == "failed"
+    assert any("source_quality_shortfall" in item for item in report["blockers"])
+
+
+def test_legacy_quality_only_checkpoint_is_reclassified_without_rerun() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        _, authorization = _authorization(root)
+        manifest = _manifest(authorization, complete=False)
+        first = manifest.source_results[0].model_copy(
+            update={"quarantined_count": 2}
+        )
+        manifest = manifest.model_copy(
+            update={
+                "quarantined_job_count": 2,
+                "source_results": [first, *manifest.source_results[1:]],
+            }
+        )
+        current = build_phase7d3b_batch_report(
+            authorization=authorization,
+            manifest=manifest,
+            before=_snapshot(authorization.source_ids, count=0),
+            after=_snapshot(authorization.source_ids, count=1),
+        )
+
+    legacy = dict(current)
+    legacy.pop("report_sha256")
+    blocker = f"source_quality_shortfall:{authorization.source_ids[0]}"
+    legacy.update(
+        {
+            "status": "failed",
+            "ready_for_next_batch_or_closeout": False,
+            "blockers": [blocker],
+            "checkpoint_reclassification": None,
+        }
+    )
+    legacy["report_sha256"] = _canonical_sha256(legacy)
+    revised = reclassify_phase7d3b_deferred_quality_checkpoint(
+        legacy,
+        reclassified_at=datetime(2026, 7, 22, 18, 0, tzinfo=timezone.utc),
+    )
+
+    assert revised["status"] == "passed_with_deferred"
+    assert revised["ready_for_next_batch_or_closeout"] is True
+    assert revised["blockers"] == []
+    assert revised["checkpoint_reclassification"]["removed_blockers"] == [blocker]
+    assert revised["checkpoint_reclassification"]["mongodb_writes"] is False
+    assert revised["controls"]["lifecycle_reconciliation_enabled"] is False
+    assert revised["controls"]["deactivation_enabled"] is False
 
 
 def test_checkpoint_order_and_resume_guards() -> None:

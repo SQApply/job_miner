@@ -193,6 +193,8 @@ def main() -> None:
             f"batch={authorization.batch_ordinal}/{authorization.batch_count}",
             f"sources={manifest.successful_source_count}/{manifest.requested_source_count}",
             f"catalog_complete={report['complete_catalog_source_count']}/{authorization.source_count}",
+            f"productive={report['productive_source_count']}/{authorization.source_count}",
+            f"deferred={report['deferred_source_count']}",
             f"discovered={report['counters']['discovered']}",
             f"accepted={manifest.accepted_job_count}",
             f"inserted={manifest.inserted_job_count}",
@@ -207,7 +209,16 @@ def main() -> None:
             f"checkpoint={checkpoint}",
             flush=True,
         )
-        if report["status"] != "passed":
+        if report["status"] == "passed_with_deferred":
+            print(
+                "PHASE_7D3B_DEFERRED_SOURCES",
+                json.dumps(report["deferred_reasons"], separators=(",", ":")),
+                "next_batch_allowed=true",
+                "reconciliation=false",
+                "deactivation=false",
+                flush=True,
+            )
+        elif report["status"] != "passed":
             print(
                 "PHASE_7D3B_BLOCKERS",
                 json.dumps(report["blockers"], separators=(",", ":")),

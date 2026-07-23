@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -34,7 +35,12 @@ from .contracts import (
 )
 from .page_quality import assess_page_quality
 from .rendered_detail import RenderedDetailExtractionService
-from .url_intelligence import canonicalize_candidate_url, promote_trusted_detail_url
+from .url_intelligence import (
+    candidate_action_kind,
+    candidate_job_route_identity,
+    canonicalize_candidate_url,
+    promote_trusted_detail_url,
+)
 
 
 EventCallback = Callable[[str, dict[str, Any]], None]
@@ -516,12 +522,22 @@ class ScrapeOrchestrator:
         rejected_urls += rejected
         discovered_urls, discovery_ranking = hooks.rank_discovered_urls(discovered_urls)
         discovery_batch = self._rank_candidate_batch(discovery_batch, discovered_urls)
-        if options.enable_adaptive_dom_fallback and not discovered_urls:
+        discovery_is_complete = (
+            discovery_batch.completeness == CompletenessState.COMPLETE
+            and discovery_batch.pagination_complete
+        )
+        needs_adaptive_completion = (
+            options.require_complete_acquisition and not discovery_is_complete
+        )
+        if options.enable_adaptive_dom_fallback and (
+            not discovered_urls or needs_adaptive_completion
+        ):
             self._emit(
                 hooks,
                 "adaptive_dom_discovery_start",
                 page_url=self.blueprint.listing.page_url,
                 retained_linkless_candidates=len(discovery_batch.linkless_candidates),
+                completion_repair=needs_adaptive_completion,
             )
             try:
                 raw_adaptive_batch = await self._discover_adaptive_dom_candidates(options)
@@ -563,7 +579,7 @@ class ScrapeOrchestrator:
                         preextracted_methods[candidate.detail_url] = str(
                             candidate.evidence.get("origin") or "adaptive_structured_evidence"
                         )
-                if adaptive_batch.candidates:
+                if adaptive_batch.candidates or needs_adaptive_completion:
                     discovery_batch = self._merge_adaptive_candidate_batch(
                         discovery_batch,
                         adaptive_batch,
@@ -584,7 +600,11 @@ class ScrapeOrchestrator:
                 acquisition = dict(acquisition)
                 acquisition["adaptive_dom"] = adaptive_metrics
                 discovery_ranking = {
-                    "strategy": "adaptive_dom_fallback",
+                    "strategy": (
+                        "adaptive_dom_completion_repair"
+                        if needs_adaptive_completion
+                        else "adaptive_dom_fallback"
+                    ),
                     "initial": dict(discovery_ranking),
                     "adaptive": dict(adaptive_ranking),
                     **preservation,
@@ -1350,10 +1370,23 @@ class ScrapeOrchestrator:
             from .adaptive_dom import AdaptiveDomDiscoveryService
 
             service = AdaptiveDomDiscoveryService(self.system_config.browser)
-        batch = await service.discover(
+        discover = service.discover
+        parameters = inspect.signature(discover).parameters
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        kwargs: dict[str, Any] = {
+            "allowed_hosts": tuple(self.blueprint.allowed_hosts),
+            "max_candidates": options.adaptive_dom_max_candidates,
+        }
+        if accepts_kwargs or "max_pages" in parameters:
+            kwargs["max_pages"] = options.max_acquisition_pages
+        if accepts_kwargs or "require_complete" in parameters:
+            kwargs["require_complete"] = options.require_complete_acquisition
+        batch = await discover(
             str(self.blueprint.listing.page_url),
-            allowed_hosts=tuple(self.blueprint.allowed_hosts),
-            max_candidates=options.adaptive_dom_max_candidates,
+            **kwargs,
         )
         if not isinstance(batch, DiscoveryBatch):
             raise TypeError("adaptive DOM discover() must return DiscoveryBatch")
@@ -1439,10 +1472,22 @@ class ScrapeOrchestrator:
             for candidate in batch.candidates
             if candidate.detail_url is not None
         }
-        ranked_candidates = [
-            candidate_by_url.get(url) or DiscoveryCandidate.from_url(url)
-            for url in ranked_urls
-        ]
+        action_urls_by_identity: dict[str, str] = {}
+        for candidate in batch.candidates:
+            if not candidate.detail_url or not candidate_action_kind(candidate.detail_url):
+                continue
+            identity = candidate_job_route_identity(candidate.detail_url)
+            if identity:
+                action_urls_by_identity.setdefault(identity, candidate.detail_url)
+
+        ranked_candidates: list[DiscoveryCandidate] = []
+        for url in ranked_urls:
+            candidate = candidate_by_url.get(url) or DiscoveryCandidate.from_url(url)
+            identity = candidate_job_route_identity(url)
+            apply_url = action_urls_by_identity.get(identity or "")
+            if apply_url and candidate.apply_url is None:
+                candidate = candidate.model_copy(update={"apply_url": apply_url})
+            ranked_candidates.append(candidate)
         ranked_candidates.extend(batch.linkless_candidates)
         has_candidates = bool(ranked_candidates)
         completeness = batch.completeness if has_candidates else CompletenessState.PARTIAL
@@ -1471,23 +1516,29 @@ class ScrapeOrchestrator:
     ) -> DiscoveryBatch:
         candidates: list[DiscoveryCandidate] = []
         identities: set[str] = set()
-        for candidate in [*adaptive_batch.candidates, *retained_batch.linkless_candidates]:
+        for candidate in [*adaptive_batch.candidates, *retained_batch.candidates]:
             identity = candidate.identity_key
             if identity in identities:
                 continue
             identities.add(identity)
             candidates.append(candidate)
         metrics = dict(adaptive_batch.metrics)
-        metrics["retained_prior_linkless_candidates"] = len(
-            retained_batch.linkless_candidates
+        metrics["retained_prior_candidates"] = len(retained_batch.candidates)
+        metrics["retained_prior_linkless_candidates"] = len(retained_batch.linkless_candidates)
+        complete = (
+            adaptive_batch.completeness == CompletenessState.COMPLETE
+            and adaptive_batch.pagination_complete
+            and bool(candidates)
         )
         return DiscoveryBatch(
             batch_version=adaptive_batch.batch_version,
             strategy=adaptive_batch.strategy,
-            completeness=CompletenessState.PARTIAL,
+            completeness=(
+                CompletenessState.COMPLETE if complete else CompletenessState.PARTIAL
+            ),
             candidates=candidates,
             pages_visited=adaptive_batch.pages_visited,
-            pagination_complete=False,
+            pagination_complete=complete,
             reasons=list(dict.fromkeys([*retained_batch.reasons, *adaptive_batch.reasons])),
             metrics=metrics,
         )

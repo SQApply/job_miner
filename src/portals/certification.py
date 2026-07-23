@@ -1064,7 +1064,11 @@ class PortalFleetCertifier:
                         prefer_static_detail_html=True,
                         enable_adaptive_dom_fallback=True,
                         enable_rendered_detail_fallback=True,
-                        adaptive_dom_max_candidates=1_000,
+                        adaptive_dom_max_candidates=(
+                            10_000
+                            if self.options.catalog_mode == "complete_catalog"
+                            else 1_000
+                        ),
                     ),
                     hooks=ScrapeOrchestratorHooks(
                         normalize_discovered_urls=lambda urls: _safe_discovered_urls(urls, approved_hosts),
@@ -1096,13 +1100,18 @@ class PortalFleetCertifier:
             extracted = len(orchestration.jobs)
             failures = len(orchestration.detail_failures)
             discovery_payload = dict(orchestration.discovery_batch or {})
-            if orchestration.acquisition.get("selected") is True:
-                discovery_complete = orchestration.acquisition.get("complete") is True
-            else:
-                discovery_complete = (
-                    discovery_payload.get("completeness") == "complete"
-                    and discovery_payload.get("pagination_complete") is True
-                )
+            acquisition_complete = (
+                orchestration.acquisition.get("selected") is True
+                and orchestration.acquisition.get("complete") is True
+            )
+            rendered_discovery_complete = (
+                discovery_payload.get("completeness") == "complete"
+                and discovery_payload.get("pagination_complete") is True
+            )
+            # An incomplete HTTP acquisition may be repaired by the live
+            # generalized DOM lane. Conversely, a selected but partial API/HTML
+            # response must never override a proven rendered exhaustion result.
+            discovery_complete = acquisition_complete or rendered_discovery_complete
             raw_extracted = int(
                 orchestration.rescrape_plan.get("raw_extracted_jobs") or extracted
             )

@@ -20,6 +20,22 @@ if TYPE_CHECKING:
 PHASE_7D3B_CONTRACT_VERSION = "1.0"
 PHASE_7D3B = "7D3B"
 PHASE_7D3B_WRITE_CONFIRMATION = "ENABLE_PHASE_7D3B_COMPLETE_BATCH_WRITE"
+PHASE_7D3B_QUALITY_DEFERRAL_CONFIRMATION = (
+    "ACKNOWLEDGE_PHASE_7D3B_DEFER_QUARANTINED_INCOMPLETE_SOURCES"
+)
+_PROGRESSING_BATCH_STATUSES = {"passed", "passed_with_deferred"}
+_DEFERRED_SOURCE_ERROR_TYPES = {
+    "access_blocked",
+    "catalog_incomplete",
+    "cross_domain_redirect_review",
+    "detail_extraction_shortfall",
+    "javascript_shell",
+    "linkless_interaction_unresolved",
+    "network_error",
+    "source_timeout",
+    "zero_discovery",
+    "zero_valid_jobs",
+}
 
 
 class ProductionGuardedExecutionError(RuntimeError):
@@ -90,10 +106,32 @@ class Phase7D3BSourceSnapshot(ContractModel):
         return self
 
 
+class Phase7D3BCheckpointReclassification(ContractModel):
+    contract_version: Literal["1.0"] = "1.0"
+    reclassified_at: datetime
+    reason: Literal["deferred_quarantined_records_from_incomplete_sources"] = (
+        "deferred_quarantined_records_from_incomplete_sources"
+    )
+    original_report_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    removed_blockers: list[str] = Field(min_length=1)
+    network_accessed: Literal[False] = False
+    mongodb_reads: Literal[False] = False
+    mongodb_writes: Literal[False] = False
+    lifecycle_reconciliation_enabled: Literal[False] = False
+    deactivation_enabled: Literal[False] = False
+
+    @field_validator("reclassified_at")
+    @classmethod
+    def require_aware_reclassified_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("reclassified_at must be timezone-aware")
+        return value
+
+
 class Phase7D3BBatchReportBody(ContractModel):
     contract_version: Literal["1.0"] = PHASE_7D3B_CONTRACT_VERSION
     phase: Literal["7D3B"] = PHASE_7D3B
-    status: Literal["passed", "failed"]
+    status: Literal["passed", "passed_with_deferred", "failed"]
     ready_for_next_batch_or_closeout: bool
     generated_at: datetime
     rollout_id: str = Field(min_length=1)
@@ -108,12 +146,17 @@ class Phase7D3BBatchReportBody(ContractModel):
     source_ids: list[str] = Field(min_length=1)
     successful_source_count: int = Field(ge=0)
     complete_catalog_source_count: int = Field(ge=0)
+    productive_source_count: int = Field(default=0, ge=0)
+    deferred_source_count: int = Field(default=0, ge=0)
+    deferred_source_ids: list[str] = Field(default_factory=list)
+    deferred_reasons: dict[str, str] = Field(default_factory=dict)
     counters: dict[str, int]
     before: Phase7D3BSourceSnapshot
     after: Phase7D3BSourceSnapshot
     source_results: list[dict[str, Any]]
     blockers: list[str]
     controls: dict[str, Any]
+    checkpoint_reclassification: Phase7D3BCheckpointReclassification | None = None
 
     @field_validator("generated_at")
     @classmethod
@@ -130,16 +173,35 @@ class Phase7D3BBatchReportBody(ContractModel):
             raise ValueError("Report snapshots do not match the authorized source order")
         if len(self.source_results) != self.source_count:
             raise ValueError("Report must retain one terminal result per source")
-        passed = self.status == "passed"
-        if passed != (not self.blockers):
-            raise ValueError("Report status and blockers disagree")
-        if self.ready_for_next_batch_or_closeout is not passed:
-            raise ValueError("Only a passed batch can authorize progression")
-        if passed and (
+        progressing = self.status in _PROGRESSING_BATCH_STATUSES
+        if progressing != (not self.blockers):
+            raise ValueError("Report progression status and blockers disagree")
+        if self.ready_for_next_batch_or_closeout is not progressing:
+            raise ValueError("Only a safe terminal batch can authorize progression")
+        if self.deferred_source_count != len(self.deferred_source_ids):
+            raise ValueError("Deferred source count is inconsistent")
+        if set(self.deferred_reasons) != set(self.deferred_source_ids):
+            raise ValueError("Deferred reasons do not cover deferred source ids")
+        if len(self.deferred_source_ids) != len(set(self.deferred_source_ids)):
+            raise ValueError("Deferred source ids must be unique")
+        if self.status == "passed" and (
             self.successful_source_count != self.source_count
             or self.complete_catalog_source_count != self.source_count
+            or self.deferred_source_count
         ):
             raise ValueError("Passed report does not contain complete successful sources")
+        if self.status == "passed_with_deferred":
+            if not self.deferred_source_count:
+                raise ValueError("passed_with_deferred requires deferred sources")
+            if self.complete_catalog_source_count + self.deferred_source_count != self.source_count:
+                raise ValueError("Progressing report does not classify every source")
+        if self.status == "failed" and not self.blockers:
+            raise ValueError("Failed report must retain at least one safety blocker")
+        if self.checkpoint_reclassification is not None:
+            if self.status != "passed_with_deferred" or self.blockers:
+                raise ValueError(
+                    "A reclassified checkpoint must be passed_with_deferred without blockers"
+                )
         required_controls = {
             "production_writes_enabled": True,
             "catalog_mode": "complete_catalog",
@@ -179,6 +241,43 @@ def _load_json(path: Path, *, label: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ProductionGuardedExecutionError(f"{label} must contain a JSON object")
     return payload
+
+
+def _result_value(result: Any, name: str, default: Any = None) -> Any:
+    if isinstance(result, Mapping):
+        return result.get(name, default)
+    return getattr(result, name, default)
+
+
+def can_defer_phase7d3b_quality_shortfall(result: Any) -> bool:
+    """Allow only isolated quarantine from an already incomplete source.
+
+    Quarantined candidates never enter jobs_current. Rejected candidates are
+    deliberately excluded from this policy because they may represent an
+    unexpected persistence exception rather than a normal quality decision.
+    """
+
+    error_type = str(_result_value(result, "error_type", "") or "").strip()
+    quarantined = int(_result_value(result, "quarantined_count", 0) or 0)
+    rejected = int(_result_value(result, "rejected_count", 0) or 0)
+    accepted = int(_result_value(result, "accepted_count", 0) or 0)
+    persisted = sum(
+        int(_result_value(result, field, 0) or 0)
+        for field in (
+            "inserted_count",
+            "updated_count",
+            "unchanged_count",
+            "reactivated_count",
+        )
+    )
+    return bool(
+        error_type in _DEFERRED_SOURCE_ERROR_TYPES
+        and str(_result_value(result, "status", "") or "") != "success"
+        and _result_value(result, "catalog_complete", False) is not True
+        and quarantined > 0
+        and rejected == 0
+        and persisted == accepted
+    )
 
 
 def load_phase7d3b_authorization(
@@ -285,7 +384,7 @@ def require_phase7d3b_checkpoint_state(
             )
         report = read_phase7d3b_report(previous)
         require_same_rollout(report, ordinal)
-        if report.get("status") != "passed":
+        if report.get("status") not in _PROGRESSING_BATCH_STATUSES:
             raise ProductionGuardedExecutionError(
                 f"Batch {ordinal:02d} is not passed; later batches are blocked"
             )
@@ -295,7 +394,7 @@ def require_phase7d3b_checkpoint_state(
         return
     report = read_phase7d3b_report(current)
     require_same_rollout(report, batch_ordinal)
-    if report.get("status") == "passed":
+    if report.get("status") in _PROGRESSING_BATCH_STATUSES:
         raise ProductionGuardedExecutionError(
             f"Batch {batch_ordinal:02d} already passed and cannot be written again"
         )
@@ -337,6 +436,7 @@ def build_phase7d3b_batch_report(
     generated_at: datetime | None = None,
 ) -> dict[str, Any]:
     blockers: list[str] = []
+    deferred_reasons: dict[str, str] = {}
 
     def block(value: str) -> None:
         if value not in blockers:
@@ -375,18 +475,6 @@ def build_phase7d3b_batch_report(
         if result is None:
             block(f"missing_source_result:{source_id}")
             continue
-        if result.status != "success":
-            block(f"source_not_successful:{source_id}:{result.status}")
-        if result.catalog_mode != "complete_catalog" or not result.catalog_complete:
-            block(f"source_catalog_incomplete:{source_id}")
-        if not result.discovery_complete:
-            block(f"source_discovery_incomplete:{source_id}")
-        if result.discovered_count != result.attempted_count:
-            block(f"source_detail_scope_incomplete:{source_id}")
-        if result.quarantined_count or result.rejected_count:
-            block(f"source_quality_shortfall:{source_id}")
-        if result.accepted_count < 1:
-            block(f"source_zero_accepted_jobs:{source_id}")
         outcomes = (
             result.inserted_count
             + result.updated_count
@@ -395,6 +483,34 @@ def build_phase7d3b_batch_report(
         )
         if outcomes != result.accepted_count:
             block(f"source_write_accounting_mismatch:{source_id}")
+        complete = bool(
+            result.status == "success"
+            and result.catalog_mode == "complete_catalog"
+            and result.catalog_complete
+            and result.discovery_complete
+            and result.discovered_count == result.attempted_count
+            and result.accepted_count >= 1
+            and result.quarantined_count == 0
+            and result.rejected_count == 0
+        )
+        if complete:
+            continue
+        error_type = str(result.error_type or "").strip()
+        if error_type in _DEFERRED_SOURCE_ERROR_TYPES:
+            deferred_reasons[source_id] = error_type
+            if result.rejected_count:
+                block(f"source_quality_shortfall:{source_id}")
+            elif result.quarantined_count and not can_defer_phase7d3b_quality_shortfall(
+                result
+            ):
+                block(f"source_quality_shortfall:{source_id}")
+            continue
+        if result.quarantined_count or result.rejected_count:
+            block(f"source_quality_shortfall:{source_id}")
+        block(
+            f"source_unexpected_terminal_state:{source_id}:"
+            f"{result.status}:{error_type or 'missing_error_type'}"
+        )
 
     current_delta = after.current_total - before.current_total
     active_delta = after.active_total - before.active_total
@@ -404,7 +520,14 @@ def build_phase7d3b_batch_report(
         block("database_active_delta_mismatch")
     if manifest.completed_source_count != authorization.source_count:
         block("manifest_incomplete_source_execution")
-    if manifest.successful_source_count != authorization.source_count:
+    complete_catalog_source_count = sum(
+        result.status == "success"
+        and result.catalog_mode == "complete_catalog"
+        and result.catalog_complete
+        and result.discovery_complete
+        for result in manifest.source_results
+    )
+    if manifest.successful_source_count != complete_catalog_source_count:
         block("manifest_successful_source_count_mismatch")
 
     counters = {
@@ -421,10 +544,17 @@ def build_phase7d3b_batch_report(
         "active_jobs_before": before.active_total,
         "active_jobs_after": after.active_total,
     }
-    passed = not blockers
+    progressing = not blockers
+    status = (
+        "failed"
+        if blockers
+        else "passed_with_deferred"
+        if deferred_reasons
+        else "passed"
+    )
     body = Phase7D3BBatchReportBody(
-        status="passed" if passed else "failed",
-        ready_for_next_batch_or_closeout=passed,
+        status=status,
+        ready_for_next_batch_or_closeout=progressing,
         generated_at=generated_at or datetime.now(timezone.utc),
         rollout_id=authorization.rollout_id,
         rollout_plan_sha256=authorization.rollout_plan_sha256,
@@ -437,10 +567,17 @@ def build_phase7d3b_batch_report(
         source_count=authorization.source_count,
         source_ids=authorization.source_ids,
         successful_source_count=manifest.successful_source_count,
-        complete_catalog_source_count=sum(
-            result.catalog_mode == "complete_catalog" and result.catalog_complete
-            for result in manifest.source_results
+        complete_catalog_source_count=complete_catalog_source_count,
+        productive_source_count=sum(
+            result.accepted_count > 0 for result in manifest.source_results
         ),
+        deferred_source_count=len(deferred_reasons),
+        deferred_source_ids=[
+            source_id
+            for source_id in authorization.source_ids
+            if source_id in deferred_reasons
+        ],
+        deferred_reasons=deferred_reasons,
         counters=counters,
         before=before,
         after=after,
@@ -462,6 +599,101 @@ def build_phase7d3b_batch_report(
     payload = body.model_dump(mode="json")
     payload["report_sha256"] = _canonical_sha256(payload)
     return payload
+
+
+def reclassify_phase7d3b_deferred_quality_checkpoint(
+    payload: Mapping[str, Any],
+    *,
+    reclassified_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Re-sign a failed checkpoint when quarantine is its only blocker.
+
+    This performs no network or database operation. The original run report
+    remains untouched; callers should preserve a copy of the original signed
+    checkpoint before replacing it.
+    """
+
+    candidate = dict(payload)
+    original_sha256 = str(candidate.get("report_sha256") or "").strip().lower()
+    unsigned = dict(candidate)
+    unsigned.pop("report_sha256", None)
+    if not original_sha256 or original_sha256 != _canonical_sha256(unsigned):
+        raise ProductionGuardedExecutionError(
+            "Phase 7D3B checkpoint checksum is invalid"
+        )
+    try:
+        body = Phase7D3BBatchReportBody.model_validate(unsigned)
+    except (TypeError, ValueError) as exc:
+        raise ProductionGuardedExecutionError(
+            f"Invalid Phase 7D3B checkpoint: {exc}"
+        ) from exc
+    if body.status != "failed":
+        raise ProductionGuardedExecutionError(
+            "Only a failed Phase 7D3B checkpoint can be reclassified"
+        )
+    if body.checkpoint_reclassification is not None:
+        raise ProductionGuardedExecutionError(
+            "Phase 7D3B checkpoint was already reclassified"
+        )
+
+    blockers = list(body.blockers)
+    quality_prefix = "source_quality_shortfall:"
+    if not blockers or any(not blocker.startswith(quality_prefix) for blocker in blockers):
+        raise ProductionGuardedExecutionError(
+            "Checkpoint contains a blocker that cannot be deferred offline"
+        )
+    result_by_id = {
+        str(result.get("source_id") or ""): result for result in body.source_results
+    }
+    removed: list[str] = []
+    for blocker in blockers:
+        source_id = blocker[len(quality_prefix) :]
+        result = result_by_id.get(source_id)
+        if (
+            not source_id
+            or source_id not in body.deferred_reasons
+            or result is None
+            or not can_defer_phase7d3b_quality_shortfall(result)
+        ):
+            raise ProductionGuardedExecutionError(
+                f"Quality blocker is not safely deferrable: {source_id or '-'}"
+            )
+        removed.append(blocker)
+
+    quarantined_total = sum(
+        int(result.get("quarantined_count") or 0) for result in body.source_results
+    )
+    if quarantined_total != int(body.counters.get("quarantined") or 0):
+        raise ProductionGuardedExecutionError(
+            "Checkpoint quarantine counters are inconsistent"
+        )
+    if body.complete_catalog_source_count + body.deferred_source_count != body.source_count:
+        raise ProductionGuardedExecutionError(
+            "Checkpoint does not classify every source as complete or deferred"
+        )
+
+    revised = body.model_dump(mode="json")
+    revised.update(
+        {
+            "status": "passed_with_deferred",
+            "ready_for_next_batch_or_closeout": True,
+            "blockers": [],
+            "checkpoint_reclassification": Phase7D3BCheckpointReclassification(
+                reclassified_at=reclassified_at or datetime.now(timezone.utc),
+                original_report_sha256=original_sha256,
+                removed_blockers=removed,
+            ).model_dump(mode="json"),
+        }
+    )
+    try:
+        validated = Phase7D3BBatchReportBody.model_validate(revised)
+    except (TypeError, ValueError) as exc:
+        raise ProductionGuardedExecutionError(
+            f"Reclassified Phase 7D3B checkpoint is invalid: {exc}"
+        ) from exc
+    result = validated.model_dump(mode="json")
+    result["report_sha256"] = _canonical_sha256(result)
+    return result
 
 
 def read_phase7d3b_report(path: Path) -> dict[str, Any]:
