@@ -1,0 +1,65 @@
+{
+  "contract_version": "1.0",
+  "phase": "7D4A",
+  "policy_status": "truthful_23_source_rollout_policy",
+  "expected_inventory_count": 102,
+  "expected_current_complete_count": 5,
+  "expected_current_partial_safe_count": 11,
+  "expected_candidate_complete_count": 2,
+  "expected_candidate_partial_safe_count": 5,
+  "expected_failed_candidate_count": 2,
+  "expected_final_complete_count": 7,
+  "expected_final_partial_safe_count": 16,
+  "expected_final_recurring_count": 23,
+  "expected_promoted_backfill_count": 7,
+  "expected_deferred_count": 79,
+  "execution_limits": {
+    "source_concurrency": 1,
+    "detail_concurrency": 1,
+    "gpu_llm_concurrency": 1,
+    "requests_per_minute": 30,
+    "source_timeout_seconds": 1800,
+    "acquisition_timeout_seconds": 25,
+    "page_safety_cap": 500,
+    "batch_size": 4
+  },
+  "initial_backfill_policy": {
+    "source_scope": "newly_promoted_sources_only",
+    "catalog_mode": "complete_catalog",
+    "max_jobs_per_source": null,
+    "upsert_new_and_changed_jobs": true,
+    "skip_unchanged_jobs": true,
+    "changed_only_downstream_processing": true
+  },
+  "recurring_policy": {
+    "cadence_hours": 72,
+    "include_all_frozen_sources": true,
+    "catalog_mode": "complete_catalog",
+    "max_jobs_per_source": null,
+    "upsert_new_and_changed_jobs": true,
+    "skip_unchanged_jobs": true,
+    "changed_only_downstream_processing": true
+  },
+  "lifecycle_policy": {
+    "complete_catalog": {
+      "missing_reconciliation_enabled": false,
+      "deactivation_enabled": false,
+      "clean_complete_cycles_required_before_reconciliation": 2
+    },
+    "partial_safe": {
+      "missing_reconciliation_enabled": false,
+      "deactivation_enabled": false,
+      "incomplete_cycles_may_increment_missing_count": false,
+      "promotion_requires_two_clean_complete_cycles": true
+    }
+  },
+  "safety": {
+    "plan_only": true,
+    "network_requests_performed": false,
+    "mongodb_reads_performed": false,
+    "mongodb_writes_performed": false,
+    "lifecycle_reconciliation_enabled": false,
+    "deactivation_enabled": false,
+    "anti_bot_bypass_enabled": false
+  }
+}
