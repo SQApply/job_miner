@@ -1,0 +1,48 @@
+{
+  "contract_version": "1.0",
+  "phase": "7D4C",
+  "cohort_name": "phase7d4c_active22",
+  "expected_source_count": 22,
+  "source_ids": [
+    "cert_jobs_insightglobal_com_330d59f76c15",
+    "cert_www_apexsystems_com_6761b6c4c427",
+    "cert_www_opensystemstech_com_402e559f173f",
+    "cert_www_chiptonross_com_eee811cc9443",
+    "cert_careerportal_compri_com_14c916f4f442",
+    "cert_capgroup_wd1_myworkdayjobs_com_2d07c72da5d7",
+    "cert_careers_freddiemac_com_2737fb29b49e",
+    "cert_careers_strategicstaff_com_61ca8a37fa4f",
+    "cert_www_teksystems_com_8e76f673ffe3",
+    "cert_www_rwr_com_1dbb3cc54d8b",
+    "cert_www_planet_pharma_com_1fd0712a51ac",
+    "cert_www_rxrelief_com_ed90067ac16a",
+    "cert_www_wsitalent_com_30782bffe73d",
+    "cert_www_tristarrjobs_com_2c22e383f32f",
+    "cert_www_helpmates_com_23c208136a17",
+    "cert_www_edgelink_com_f74b6df22ab1",
+    "cert_www_abrjobs_com_e535eb3dd92a",
+    "cert_www_extensionrecruiting_com_100521083f46",
+    "cert_www_thebestirs_com_f4d7a04bc7fc",
+    "cert_www_optechus_com_1eb1427b3bfb",
+    "cert_www_daviscos_com_1ae5a01589e8",
+    "cert_www_comphealth_com_609ddbde172d"
+  ],
+  "deactivation": {
+    "reason": "phase7d4c_non_cohort_cutover",
+    "delete_normalized_jobs": false,
+    "delete_job_history": false,
+    "delete_raw_evidence": false,
+    "delete_derived_job_towers": true,
+    "delete_derived_candidate_matches": true,
+    "delete_qdrant_index_state": true,
+    "qdrant_collection_rebuild_required": true
+  },
+  "controls": {
+    "automatic_scheduler_enabled": false,
+    "lifecycle_reconciliation_enabled": false,
+    "missing_count_updates_enabled": false,
+    "physical_job_deletion_enabled": false,
+    "mongo_backup_required": true,
+    "explicit_confirmation_required": true
+  }
+}
