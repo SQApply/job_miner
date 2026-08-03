@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import tempfile
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -325,6 +326,90 @@ def test_write_mode_persists_job_and_finalizes_mixed_fleet() -> None:
     assert fleet["failed_source_count"] == 1
     assert fleet["controls"]["lifecycle_reconciliation_enabled"] is False
     assert fleet["controls"]["deactivation_enabled"] is False
+
+
+def test_complete_write_exposes_snapshot_and_changed_job_ids() -> None:
+    plan = _plan()
+    db = _FakeDatabase()
+
+    def complete_record(source: Phase6ASource, attempt: int) -> PortalCertificationRecord:
+        record = _record(source, attempt=attempt)
+        url = str(record.sample_jobs[0]["job_url"])
+        return replace(
+            record,
+            catalog_mode="complete_catalog",
+            discovery_complete=True,
+            catalog_complete=True,
+            discovered_job_urls=[url],
+        )
+
+    manifest = asyncio.run(
+        Phase6EProductionRunner(
+            plan=plan,
+            db=db,
+            executor=_SequenceExecutor({"source_a": [complete_record]}),
+            config=Phase6ERunnerConfig(
+                execution_mode="write",
+                normalized_job_writes_enabled=True,
+                catalog_mode="complete_catalog",
+                max_jobs=None,
+                max_source_concurrency=1,
+                retry_backoff_seconds=0,
+            ),
+        ).run(requested_source_ids=["source_a"], run_id="complete-write")
+    )
+    result = manifest.source_results[0]
+    assert result.reconciliation_safe is True
+    assert result.discovered_job_urls == [
+        "https://source_a.example/jobs/123"
+    ]
+    assert len(result.changed_job_ids) == 1
+    assert result.inserted_count == 1
+
+
+def test_incremental_complete_snapshot_succeeds_when_no_details_are_due() -> None:
+    plan = _plan()
+
+    def unchanged_snapshot(
+        source: Phase6ASource,
+        attempt: int,
+    ) -> PortalCertificationRecord:
+        record = _record(source, attempt=attempt)
+        return replace(
+            record,
+            status="success",
+            certification_status="unchanged_complete_snapshot",
+            discovered_urls=1,
+            attempted_urls=0,
+            extracted_jobs=0,
+            sample_jobs=[],
+            catalog_mode="complete_catalog",
+            discovery_complete=True,
+            catalog_complete=False,
+            discovered_job_urls=[f"https://{source.source_id}.example/jobs/123"],
+        )
+
+    manifest = asyncio.run(
+        Phase6EProductionRunner(
+            plan=plan,
+            db=_FakeDatabase(),
+            executor=_SequenceExecutor({"source_a": [unchanged_snapshot]}),
+            config=Phase6ERunnerConfig(
+                execution_mode="write",
+                normalized_job_writes_enabled=True,
+                catalog_mode="complete_catalog",
+                incremental_rescrape=True,
+                max_jobs=None,
+                max_source_concurrency=1,
+                retry_backoff_seconds=0,
+            ),
+        ).run(requested_source_ids=["source_a"], run_id="unchanged-snapshot")
+    )
+    result = manifest.source_results[0]
+    assert result.status == "success"
+    assert result.accepted_count == 0
+    assert result.reconciliation_safe is True
+    assert result.changed_job_ids == []
 
 
 def test_successful_scrape_with_all_jobs_quarantined_is_failed() -> None:

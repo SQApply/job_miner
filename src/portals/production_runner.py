@@ -73,6 +73,7 @@ class Phase6ERunnerConfig(ContractModel):
     source_timeout_seconds: int = Field(default=600, ge=30, le=86400)
     acquisition_timeout_seconds: float = Field(default=20.0, gt=0, le=300)
     allow_llm_fallback: bool = False
+    incremental_rescrape: bool = False
     normalized_job_writes_enabled: bool = False
     lifecycle_reconciliation_enabled: bool = False
     deactivation_enabled: bool = False
@@ -92,6 +93,10 @@ class Phase6ERunnerConfig(ContractModel):
                 raise ValueError("Bounded certification requires max_jobs")
         elif self.max_jobs is not None:
             raise ValueError("Complete-catalog execution cannot set max_jobs")
+        if self.incremental_rescrape and self.catalog_mode != "complete_catalog":
+            raise ValueError(
+                "Incremental recurring execution requires complete-catalog discovery"
+            )
         return self
 
     def certification_options(self) -> CertificationOptions:
@@ -106,6 +111,7 @@ class Phase6ERunnerConfig(ContractModel):
             acquisition_timeout_seconds=self.acquisition_timeout_seconds,
             allow_unknown_cross_domain_redirects=False,
             allow_llm_fallback=self.allow_llm_fallback,
+            incremental_rescrape=self.incremental_rescrape,
         )
 
 
@@ -141,6 +147,9 @@ class Phase6ESourceResult(ContractModel):
     error_type: str | None = None
     error_message: str | None = None
     elapsed_seconds: float = Field(default=0, ge=0)
+    discovered_job_urls: list[str] = Field(default_factory=list)
+    reconciliation_safe: bool = False
+    changed_job_ids: list[str] = Field(default_factory=list)
 
 
 class Phase6ERunManifest(ContractModel):
@@ -207,10 +216,15 @@ class CertificationPhase6ESourceExecutor:
         root: Path,
         output_dir: Path,
         options: CertificationOptions,
+        detail_planner: Callable[
+            [list[str]], tuple[list[str], dict[str, Any]]
+        ]
+        | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         self.output_dir = Path(output_dir).resolve()
         self.options = options
+        self.detail_planner = detail_planner
 
     async def execute(
         self,
@@ -223,6 +237,7 @@ class CertificationPhase6ESourceExecutor:
             root=self.root,
             output_dir=self.output_dir,
             options=self.options,
+            detail_planner=self.detail_planner,
         )
         return await certifier.certify(
             PortalInventoryEntry(
@@ -474,6 +489,7 @@ class Phase6EProductionRunner:
                 "bounded_pilot_execution": (
                     self.config.catalog_mode == "bounded_certification"
                 ),
+                "incremental_rescrape": self.config.incremental_rescrape,
             },
         )
         return manifest
@@ -585,6 +601,7 @@ class Phase6EProductionRunner:
 
         accepted = quarantined = rejected = 0
         outcome_counts: Counter[str] = Counter()
+        changed_job_ids: list[str] = []
         trusted_hosts = _trusted_hosts(source, record)
         for payload_value in record.sample_jobs:
             if not isinstance(payload_value, Mapping):
@@ -624,6 +641,8 @@ class Phase6EProductionRunner:
                     if processed.status == "accepted" and processed.upsert is not None:
                         accepted += 1
                         outcome_counts[processed.upsert.outcome] += 1
+                        if processed.upsert.outcome != "unchanged":
+                            changed_job_ids.append(processed.upsert.job_id)
                     else:
                         quarantined += 1
                 except Exception:
@@ -642,11 +661,19 @@ class Phase6EProductionRunner:
                     quarantined += 1
 
         terminal_status = _record_terminal_status(record, accepted=accepted)
+        if (
+            self.config.incremental_rescrape
+            and record.status == "success"
+            and record.discovery_complete
+            and record.discovered_urls > 0
+            and record.attempted_urls == 0
+        ):
+            terminal_status = "success"
         error_type = record.error_type
         error_message = record.error_message
         if self.config.catalog_mode == "complete_catalog" and (
             record.catalog_mode != "complete_catalog" or not record.catalog_complete
-        ):
+        ) and not self.config.incremental_rescrape:
             terminal_status = "failed"
             error_type = error_type or "catalog_incomplete"
             error_message = error_message or (
@@ -705,4 +732,16 @@ class Phase6EProductionRunner:
             error_type=error_type if terminal_status != "success" else None,
             error_message=error_message if terminal_status != "success" else None,
             elapsed_seconds=round(time.perf_counter() - started, 3),
+            discovered_job_urls=list(record.discovered_job_urls),
+            reconciliation_safe=bool(
+                record.catalog_mode == "complete_catalog"
+                and record.discovery_complete
+                and record.discovered_urls > 0
+                and len(record.discovered_job_urls) == record.discovered_urls
+                and (
+                    record.catalog_complete
+                    or self.config.incremental_rescrape
+                )
+            ),
+            changed_job_ids=sorted(set(changed_job_ids)),
         )

@@ -196,9 +196,13 @@ class JobCurrentDocument(MongoDocument):
     last_source_run_id: str | None = None
     raw_evidence_id: str | None = None
     missing_count: int = 0
+    missing_complete_run_count: int = 0
+    missing_since: datetime | None = None
     freshness_status: str = "active"
     inactive_reason: str | None = None
     deactivated_at: datetime | None = None
+    deactivation_run_id: str | None = None
+    reactivated_at: datetime | None = None
     is_active: bool = True
     version: int = 1
     raw_payload: dict[str, Any] = Field(default_factory=dict)

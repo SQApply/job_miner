@@ -191,10 +191,16 @@ class WarehouseRepository:
                         "last_run_session_id": run_session_id,
                         "freshness_status": "active",
                         "missing_count": 0,
+                        "missing_complete_run_count": 0,
                         "is_active": True,
                         "updated_at": now,
                     },
-                    "$unset": {"inactive_reason": "", "deactivated_at": ""},
+                    "$unset": {
+                        "inactive_reason": "",
+                        "deactivated_at": "",
+                        "deactivation_run_id": "",
+                        "missing_since": "",
+                    },
                 },
             )
 
@@ -253,7 +259,18 @@ class WarehouseRepository:
 
         normalized_set = set(normalized_urls)
         seen_ids: list[str] = []
-        for doc in self._jobs_current().find({"target_id": target_id, "is_active": True}, {"job_id": 1, "job_url": 1, "source_url": 1, "apply_url": 1, "canonical_job_url": 1}):
+        reactivated_ids: list[str] = []
+        for doc in self._jobs_current().find(
+            {"target_id": target_id},
+            {
+                "job_id": 1,
+                "job_url": 1,
+                "source_url": 1,
+                "apply_url": 1,
+                "canonical_job_url": 1,
+                "is_active": 1,
+            },
+        ):
             doc_keys = {
                 canonical_job_url(doc.get("canonical_job_url")),
                 canonical_job_url(doc.get("job_url")),
@@ -261,15 +278,72 @@ class WarehouseRepository:
                 canonical_job_url(doc.get("apply_url")),
             }
             if normalized_set.intersection({key for key in doc_keys if key}):
-                seen_ids.append(str(doc.get("job_id") or doc.get("_id")))
+                job_id = str(doc.get("job_id") or doc.get("_id") or "").strip()
+                if job_id:
+                    seen_ids.append(job_id)
+                    if doc.get("is_active") is False:
+                        reactivated_ids.append(job_id)
+
+        if seen_ids:
+            self._jobs_current().update_many(
+                {"target_id": target_id, "job_id": {"$in": sorted(set(seen_ids))}},
+                {
+                    "$set": {
+                        "last_seen_at": now,
+                        "last_run_session_id": run_session_id,
+                        "freshness_status": "active",
+                        "missing_count": 0,
+                        "missing_complete_run_count": 0,
+                        "is_active": True,
+                        "updated_at": now,
+                    },
+                    "$unset": {
+                        "inactive_reason": "",
+                        "deactivated_at": "",
+                        "deactivation_run_id": "",
+                        "missing_since": "",
+                    },
+                },
+            )
+        if reactivated_ids:
+            self._jobs_current().update_many(
+                {"target_id": target_id, "job_id": {"$in": sorted(set(reactivated_ids))}},
+                {"$set": {"reactivated_at": now, "updated_at": now}},
+            )
+
         missing_filter: dict[str, Any] = {"target_id": target_id, "is_active": True}
         if seen_ids:
             missing_filter["job_id"] = {"$nin": sorted(set(seen_ids))}
 
+        missing_documents = list(
+            self._jobs_current().find(
+                missing_filter,
+                {"job_id": 1, "missing_count": 1, "missing_since": 1},
+            )
+        )
+        missing_ids = sorted(
+            {
+                str(doc.get("job_id") or doc.get("_id") or "").strip()
+                for doc in missing_documents
+                if str(doc.get("job_id") or doc.get("_id") or "").strip()
+            }
+        )
+        first_missing_ids = sorted(
+            {
+                str(doc.get("job_id") or doc.get("_id") or "").strip()
+                for doc in missing_documents
+                if not doc.get("missing_since")
+                and str(doc.get("job_id") or doc.get("_id") or "").strip()
+            }
+        )
+
         missing_result = self._jobs_current().update_many(
             missing_filter,
             {
-                "$inc": {"missing_count": 1},
+                "$inc": {
+                    "missing_count": 1,
+                    "missing_complete_run_count": 1,
+                },
                 "$set": {
                     "freshness_status": "missing_in_latest_scrape",
                     "last_missing_at": now,
@@ -277,11 +351,21 @@ class WarehouseRepository:
                 },
             },
         )
+        if first_missing_ids:
+            self._jobs_current().update_many(
+                {
+                    "target_id": target_id,
+                    "job_id": {"$in": first_missing_ids},
+                },
+                {"$set": {"missing_since": now, "updated_at": now}},
+            )
+
+        threshold = max(1, int(deactivate_after_misses))
         deactivate_result = self._jobs_current().update_many(
             {
                 "target_id": target_id,
                 "is_active": True,
-                "missing_count": {"$gte": max(1, int(deactivate_after_misses))},
+                "missing_complete_run_count": {"$gte": threshold},
             },
             {
                 "$set": {
@@ -289,17 +373,39 @@ class WarehouseRepository:
                     "freshness_status": "inactive",
                     "inactive_reason": "not_seen_in_successive_scrapes",
                     "deactivated_at": now,
+                    "deactivation_run_id": run_session_id,
                     "updated_at": now,
                 }
             },
+        )
+        deactivation_candidates = list(
+            self._jobs_current().find(
+                {
+                    "target_id": target_id,
+                    "is_active": False,
+                    "deactivation_run_id": run_session_id,
+                },
+                {"job_id": 1},
+            )
+        )
+        deactivated_ids = sorted(
+            {
+                str(doc.get("job_id") or doc.get("_id") or "").strip()
+                for doc in deactivation_candidates
+                if str(doc.get("job_id") or doc.get("_id") or "").strip()
+            }
         )
         return {
             "status": "completed",
             "active_jobs_before_reconcile": active_count,
             "discovered_urls": len(normalized_urls),
             "missing_marked": int(missing_result.modified_count),
+            "missing_job_ids": missing_ids,
             "deactivated": int(deactivate_result.modified_count),
-            "deactivate_after_misses": int(deactivate_after_misses),
+            "deactivated_job_ids": deactivated_ids,
+            "reactivated": len(reactivated_ids),
+            "reactivated_job_ids": sorted(set(reactivated_ids)),
+            "deactivate_after_misses": threshold,
         }
 
     def record_recommendation_refresh_requests(
@@ -467,6 +573,15 @@ class WarehouseRepository:
             first_seen_at=(existing or {}).get("first_seen_at") or now,
             last_seen_at=now,
             last_run_session_id=run_session_id,
+            missing_count=0,
+            missing_complete_run_count=0,
+            missing_since=None,
+            deactivation_run_id=None,
+            reactivated_at=(
+                now
+                if existing is not None and existing.get("is_active") is False
+                else (existing or {}).get("reactivated_at")
+            ),
             is_active=True,
             version=version,
             raw_payload=payload,
@@ -476,10 +591,13 @@ class WarehouseRepository:
         data.update({
             "canonical_job_url": canonical_source_url,
             "missing_count": 0,
+            "missing_complete_run_count": 0,
+            "missing_since": None,
             "freshness_status": "active",
             "last_deep_scraped_at": now,
             "inactive_reason": None,
             "deactivated_at": None,
+            "deactivation_run_id": None,
         })
 
         self.db[JobCurrentDocument.collection_name].update_one(
@@ -902,10 +1020,16 @@ class WarehouseRepository:
                     "last_run_session_id": run_session_id,
                     "freshness_status": "active",
                     "missing_count": 0,
+                    "missing_complete_run_count": 0,
                     "is_active": True,
                     "updated_at": utc_now(),
                 },
-                "$unset": {"inactive_reason": "", "deactivated_at": ""},
+                "$unset": {
+                    "inactive_reason": "",
+                    "deactivated_at": "",
+                    "deactivation_run_id": "",
+                    "missing_since": "",
+                },
             },
         )
         return {"matched_existing": len(matched_ids), "modified_existing": int(result.modified_count)}

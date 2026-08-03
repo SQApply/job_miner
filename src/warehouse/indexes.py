@@ -165,6 +165,32 @@ INDEXES: dict[str, list[IndexModel]] = {
         IndexModel([("review_status", ASCENDING), ("created_at", DESCENDING)]),
         IndexModel([("reason_codes", ASCENDING)]),
     ],
+    "production_recurring_cycles": [
+        IndexModel([("cycle_id", ASCENDING)], unique=True),
+        IndexModel([("status", ASCENDING), ("started_at", DESCENDING)]),
+        IndexModel([("cohort_name", ASCENDING), ("started_at", DESCENDING)]),
+        IndexModel([("next_due_at", ASCENDING)]),
+    ],
+    "production_recurring_source_checkpoints": [
+        IndexModel(
+            [("cycle_id", ASCENDING), ("source_id", ASCENDING)],
+            unique=True,
+        ),
+        IndexModel([("source_id", ASCENDING), ("completed_at", DESCENDING)]),
+        IndexModel([("status", ASCENDING), ("updated_at", DESCENDING)]),
+    ],
+    "production_recurring_source_snapshots": [
+        IndexModel(
+            [("cycle_id", ASCENDING), ("source_id", ASCENDING)],
+            unique=True,
+        ),
+        IndexModel([("source_id", ASCENDING), ("captured_at", DESCENDING)]),
+        IndexModel([("snapshot_sha256", ASCENDING)]),
+    ],
+    "production_recurring_leases": [
+        IndexModel([("lease_key", ASCENDING)], unique=True),
+        IndexModel([("lease_until", ASCENDING)]),
+    ],
     "job_raw_extractions": [IndexModel([("raw_id", ASCENDING)], unique=True), IndexModel([("target_id", ASCENDING), ("source_url", ASCENDING)])],
     "jobs_current": [
         IndexModel([("job_id", ASCENDING)], unique=True),
@@ -184,6 +210,7 @@ INDEXES: dict[str, list[IndexModel]] = {
         IndexModel([("target_id", ASCENDING), ("job_url", ASCENDING)], unique=True, sparse=True),
         IndexModel([("is_active", ASCENDING)]),
         IndexModel([("target_id", ASCENDING), ("is_active", ASCENDING), ("missing_count", ASCENDING)]),
+        IndexModel([("target_id", ASCENDING), ("is_active", ASCENDING), ("missing_complete_run_count", ASCENDING)]),
         IndexModel([("target_id", ASCENDING), ("canonical_job_url", ASCENDING)], sparse=True),
         IndexModel([("target_id", ASCENDING), ("freshness_status", ASCENDING)]),
         IndexModel([("last_seen_at", DESCENDING)]),

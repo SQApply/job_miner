@@ -271,6 +271,7 @@ class CertificationOptions:
     acquisition_timeout_seconds: float = 20.0
     allow_unknown_cross_domain_redirects: bool = False
     allow_llm_fallback: bool = False
+    incremental_rescrape: bool = False
 
     def __post_init__(self) -> None:
         if self.catalog_mode == "bounded_certification":
@@ -339,6 +340,7 @@ class PortalCertificationRecord:
     catalog_mode: str = "bounded_certification"
     discovery_complete: bool = False
     catalog_complete: bool = False
+    discovered_job_urls: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -678,12 +680,17 @@ class PortalFleetCertifier:
         output_dir: Path,
         options: CertificationOptions,
         acquisition_registry: AcquisitionRegistry | None = None,
+        detail_planner: Callable[
+            [list[str]], tuple[list[str], dict[str, Any]]
+        ]
+        | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         self.output_dir = Path(output_dir).resolve()
         self.options = options
         self.hub = BlueprintHub(self.root)
         self.acquisition_registry = acquisition_registry or default_acquisition_registry()
+        self.detail_planner = detail_planner
 
     async def _acquire(
         self,
@@ -1122,6 +1129,19 @@ class PortalFleetCertifier:
                             listing_url=probe.effective_listing_url,
                             platform_hint=probe.detection.source_platform,
                         ),
+                        plan_detail_urls=(
+                            self.detail_planner
+                            if self.detail_planner is not None
+                            else lambda urls: (
+                                list(urls),
+                                {
+                                    "status": "disabled",
+                                    "discovered_urls": len(urls),
+                                    "urls_to_extract_count": len(urls),
+                                    "known_skipped": 0,
+                                },
+                            )
+                        ),
                         validate_detail_url=lambda url: validate_public_http_url(
                             url,
                             allowed_hosts=approved_hosts,
@@ -1156,6 +1176,14 @@ class PortalFleetCertifier:
             raw_extracted = int(
                 orchestration.rescrape_plan.get("raw_extracted_jobs") or extracted
             )
+            incremental_plan = bool(
+                self.options.incremental_rescrape
+                and orchestration.rescrape_plan.get("status") == "planned"
+            )
+            incremental_detail_complete = bool(
+                failures == 0
+                and raw_extracted == len(orchestration.attempted_job_urls)
+            )
             catalog_complete = (
                 discovery_complete
                 and failures == 0
@@ -1171,7 +1199,15 @@ class PortalFleetCertifier:
             linkless_candidate_count = orchestration.linkless_candidate_count
             error_type: str | None = None
             error_message: str | None = None
-            if extracted == 0:
+            if (
+                incremental_plan
+                and discovery_complete
+                and orchestration.discovered_job_urls
+                and not orchestration.attempted_job_urls
+            ):
+                status = "success"
+                certification_status = "unchanged_complete_snapshot"
+            elif extracted == 0:
                 status = "failed"
                 certification_status = "needs_repair"
                 if discovered_candidate_count == 0:
@@ -1198,6 +1234,13 @@ class PortalFleetCertifier:
                             else "but deterministic extraction produced no certifiable jobs; LLM fallback was disabled"
                         )
                     )
+            elif (
+                incremental_plan
+                and discovery_complete
+                and incremental_detail_complete
+            ):
+                status = "success"
+                certification_status = "incremental_complete_snapshot"
             elif self.options.catalog_mode == "complete_catalog" and not catalog_complete:
                 status = "partial"
                 certification_status = "catalog_incomplete"
@@ -1233,6 +1276,8 @@ class PortalFleetCertifier:
                     "linkless_candidates": linkless_candidate_count,
                     "discovery_complete": discovery_complete,
                     "catalog_complete": catalog_complete,
+                    "incremental_rescrape": incremental_plan,
+                    "incremental_detail_complete": incremental_detail_complete,
                     "detail_budget": self.options.detail_budget,
                     "detail_budget_applied": bool(
                         orchestration.rescrape_plan.get("detail_budget_applied")
@@ -1288,6 +1333,7 @@ class PortalFleetCertifier:
                 catalog_mode=self.options.catalog_mode,
                 discovery_complete=discovery_complete,
                 catalog_complete=catalog_complete,
+                discovered_job_urls=list(orchestration.discovered_job_urls),
             )
         except Exception as exc:
             error_type, certification_status = _classify_error(exc)

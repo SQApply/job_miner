@@ -202,6 +202,30 @@ class QdrantVectorStore:
 
         return point_ids
 
+    def delete_points(
+        self,
+        collection_name: str,
+        *,
+        point_ids: list[str],
+    ) -> int:
+        """Delete exact points and wait for Qdrant to apply the mutation."""
+        normalized = sorted(
+            {str(point_id).strip() for point_id in point_ids if str(point_id).strip()}
+        )
+        if not normalized:
+            return 0
+        self.client.delete(
+            collection_name=collection_name,
+            points_selector=models.PointIdsList(points=normalized),
+            wait=True,
+        )
+        logger.info(
+            "Deleted %s points from Qdrant collection=%s",
+            len(normalized),
+            collection_name,
+        )
+        return len(normalized)
+
     def search(
         self,
         collection_name: str,

@@ -388,9 +388,17 @@ class ProductionJobUpsertRepository:
             last_source_run_id=source_run_id,
             raw_evidence_id=raw_evidence_id,
             missing_count=0,
+            missing_complete_run_count=0,
+            missing_since=None,
             freshness_status="active",
             inactive_reason=None,
             deactivated_at=None,
+            deactivation_run_id=None,
+            reactivated_at=(
+                observed
+                if was_inactive
+                else (existing or {}).get("reactivated_at")
+            ),
             is_active=True,
             version=version,
             raw_payload={
