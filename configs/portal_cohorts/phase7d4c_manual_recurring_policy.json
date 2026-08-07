@@ -1,0 +1,46 @@
+{
+  "contract_version": "1.0",
+  "phase": "7D4C",
+  "policy_status": "manual_recurring_cycle_enabled",
+  "cohort_policy_path": "configs/portal_cohorts/phase7d4c_active22_cutover_policy.json",
+  "source_manifest_path": "configs/portal_cohorts/phase7d_truthful_production_cohort.json",
+  "expected_source_count": 22,
+  "cadence_hours": 72,
+  "failure_retry_hours": 6,
+  "batch_size": 4,
+  "execution": {
+    "automatic_scheduler_enabled": false,
+    "manual_command_required": true,
+    "catalog_mode": "complete_catalog",
+    "incremental_detail_rescrape": true,
+    "deep_refresh_days": 14,
+    "max_jobs_per_source": null,
+    "max_pages_per_source": 500,
+    "source_concurrency": 1,
+    "detail_concurrency": 1,
+    "gpu_llm_concurrency": 1,
+    "max_attempts": 2,
+    "detail_retry_attempts": 1,
+    "requests_per_minute": 30,
+    "source_timeout_seconds": 1800,
+    "acquisition_timeout_seconds": 25.0,
+    "allow_llm_fallback": true,
+    "lease_seconds": 21600
+  },
+  "lifecycle": {
+    "enabled": true,
+    "require_successful_complete_snapshot": true,
+    "failed_or_partial_runs_increment_missing_count": false,
+    "deactivate_after_complete_misses": 2,
+    "min_discovery_coverage_ratio": 0.25,
+    "allow_empty_discovery": false,
+    "physical_job_deletion_enabled": false
+  },
+  "downstream": {
+    "changed_only": true,
+    "build_job_towers": true,
+    "index_qdrant": true,
+    "remove_inactive_vectors": true,
+    "rebuild_full_catalog": false
+  }
+}
