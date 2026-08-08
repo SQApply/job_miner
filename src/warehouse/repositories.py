@@ -115,7 +115,9 @@ class WarehouseRepository:
         that are new, inactive/reactivated, incomplete, previously failed, or due
         for a periodic deep refresh.
         """
-        from datetime import timedelta
+        from datetime import datetime, timedelta
+
+        from .job_dates import ensure_utc
 
         now = utc_now()
         normalized_urls = canonical_job_urls(discovered_urls)
@@ -171,7 +173,12 @@ class WarehouseRepository:
             }
             incomplete = not str(existing.get("title") or "").strip() or not str(existing.get("company") or "").strip()
             last_deep = existing.get("last_deep_scraped_at") or existing.get("last_seen_at")
-            due = bool(last_deep and last_deep < refresh_cutoff)
+            last_deep_utc = (
+                ensure_utc(last_deep)
+                if isinstance(last_deep, datetime)
+                else None
+            )
+            due = bool(last_deep_utc and last_deep_utc < refresh_cutoff)
 
             if force_detail_refresh or inactive or failed_or_missing or incomplete or due:
                 urls_to_extract.append(url)
@@ -447,7 +454,14 @@ class WarehouseRepository:
                 {"candidate_id": candidate_id, "status": {"$in": ["pending", "queued", "running"]}},
                 {
                     "$setOnInsert": {
-                        "request_id": stable_hash("recommendation_refresh_request", portal_id, run_session_id, candidate_id)[:32],
+                        "request_id": stable_hash(
+                            {
+                                "kind": "recommendation_refresh_request",
+                                "portal_id": portal_id,
+                                "run_session_id": run_session_id,
+                                "candidate_id": candidate_id,
+                            }
+                        )[:32],
                         "candidate_id": candidate_id,
                         "resume_id": candidate.get("resume_id"),
                         "email": candidate.get("email"),

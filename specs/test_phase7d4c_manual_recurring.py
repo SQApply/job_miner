@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,6 +16,7 @@ from src.portals.production_manual_recurring import (
     Phase7D4CManualRecurringRunner,
     build_phase7d4c_manual_plan,
     build_phase7d4c_runner_config,
+    ensure_manual_cycle_is_due,
     load_phase7d4c_manual_policy,
     process_changed_only_downstream,
     require_phase7d4c_manual_confirmation,
@@ -272,6 +273,65 @@ def test_complete_catalog_runner_is_gpu_serial_and_unbounded() -> None:
     assert config.normalized_job_writes_enabled is True
     assert config.lifecycle_reconciliation_enabled is False
     assert config.deactivation_enabled is False
+
+
+def test_incremental_planner_normalizes_naive_mongo_datetimes() -> None:
+    source_id = "source-a"
+    job_url = "https://example.com/jobs/1"
+    database = _Database(
+        {
+            "jobs_current": [
+                {
+                    "job_id": "job-1",
+                    "target_id": source_id,
+                    "canonical_job_url": job_url,
+                    "title": "Data Engineer",
+                    "company": "Example",
+                    "is_active": True,
+                    # PyMongo returns BSON UTC values without tzinfo unless
+                    # the client is explicitly configured with tz_aware=True.
+                    "last_seen_at": (
+                        datetime.now(timezone.utc).replace(tzinfo=None)
+                        - timedelta(days=30)
+                    ),
+                }
+            ]
+        }
+    )
+    result = WarehouseRepository(database).plan_detail_rescrape(  # type: ignore[arg-type]
+        target_id=source_id,
+        run_session_id="naive-mongo-date",
+        discovered_urls=[job_url],
+        deep_refresh_days=14,
+    )
+    assert result["urls_to_extract"] == [job_url]
+    assert result["due_for_refresh"] == 1
+
+
+def test_due_guard_normalizes_naive_mongo_next_due_at() -> None:
+    naive_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    next_due = naive_now + timedelta(hours=1)
+    database = _Database(
+        {
+            "production_recurring_cycles": [
+                {
+                    "cycle_id": "previous-cycle",
+                    "cohort_name": "phase7d4c_active22",
+                    "selected_source_count": 22,
+                    "status": "completed",
+                    "completed_at": naive_now,
+                    "next_due_at": next_due,
+                }
+            ]
+        }
+    )
+    with pytest.raises(ProductionManualRecurringError, match="not due until"):
+        ensure_manual_cycle_is_due(
+            database,  # type: ignore[arg-type]
+            expected_source_count=22,
+            force=False,
+            now=datetime.now(timezone.utc),
+        )
 
 
 def test_two_complete_misses_deactivate_and_reappearance_reactivates() -> None:
@@ -693,3 +753,153 @@ def test_resume_retries_downstream_without_repeating_scrape(tmp_path: Path) -> N
     assert resumed["status_counts"] == {"complete": 1}
     assert source_calls == 1
     assert downstream_calls == 1
+
+
+def test_failed_scrape_resume_uses_a_new_phase6e_run_id(tmp_path: Path) -> None:
+    root, policy = _policy()
+    source_id = policy["source_ids"][0]
+    job_url = "https://example.com/jobs/1"
+    database = _Database()
+    run_ids: list[str] = []
+
+    async def source_run(
+        source: Phase6ASource,
+        run_id: str,
+    ) -> Phase6ESourceResult:
+        run_ids.append(run_id)
+        if len(run_ids) == 1:
+            return Phase6ESourceResult(
+                source_id=source.source_id,
+                display_name=source.display_name,
+                status="failed",
+                error_type="temporary_failure",
+                error_message="retry me",
+                catalog_mode="complete_catalog",
+            )
+        return Phase6ESourceResult(
+            source_id=source.source_id,
+            display_name=source.display_name,
+            status="success",
+            discovered_count=1,
+            catalog_mode="complete_catalog",
+            discovery_complete=True,
+            discovered_job_urls=[job_url],
+            reconciliation_safe=True,
+        )
+
+    first = asyncio.run(
+        Phase7D4CManualRecurringRunner(
+            root=root,
+            output_dir=tmp_path,
+            database=database,  # type: ignore[arg-type]
+            plan=_one_source_plan(source_id),
+            policy=policy,
+            source_run_callable=source_run,
+            downstream_callable=lambda *args, **kwargs: {
+                "status": "skipped_no_changes"
+            },
+        ).run()
+    )
+    assert first["status_counts"] == {"failed": 1}
+
+    resumed = asyncio.run(
+        Phase7D4CManualRecurringRunner(
+            root=root,
+            output_dir=tmp_path,
+            database=database,  # type: ignore[arg-type]
+            plan=_one_source_plan(source_id),
+            policy=policy,
+            source_run_callable=source_run,
+            downstream_callable=lambda *args, **kwargs: {
+                "status": "skipped_no_changes"
+            },
+        ).run(resume_cycle_id=first["cycle_id"])
+    )
+    assert resumed["status"] == "completed"
+    assert len(run_ids) == 2
+    assert run_ids[0] != run_ids[1]
+    assert run_ids[0].endswith("_a001")
+    assert run_ids[1].endswith("_a002")
+    checkpoint = database["production_recurring_source_checkpoints"].rows[0]
+    assert checkpoint["attempt_number"] == 2
+    assert checkpoint["source_run_id"] == run_ids[1]
+    assert checkpoint["attempt_run_ids"] == run_ids
+
+
+def test_legacy_failed_checkpoint_resumes_as_unique_attempt_three(
+    tmp_path: Path,
+) -> None:
+    root, policy = _policy()
+    source_id = policy["source_ids"][0]
+    cycle_id = "phase7d4c_manual_legacy_cycle"
+    legacy_run_id = cycle_id + "_01_legacy"
+    database = _Database(
+        {
+            "production_recurring_cycles": [
+                {
+                    "_id": cycle_id,
+                    "cycle_id": cycle_id,
+                    "cohort_sha256": "a" * 64,
+                    "selected_source_ids": [source_id],
+                    "selected_source_count": 1,
+                    "status": "completed_with_failures",
+                }
+            ],
+            "production_recurring_source_checkpoints": [
+                {
+                    "_id": f"{cycle_id}:{source_id}",
+                    "cycle_id": cycle_id,
+                    "source_id": source_id,
+                    "attempt_number": 2,
+                    "source_run_id": legacy_run_id,
+                    "status": "failed",
+                    "error_type": "ProductionPersistenceError",
+                    "error_message": (
+                        "Cannot start a source under a terminal fleet run"
+                    ),
+                    "result": {"error_type": "stale_first_attempt"},
+                }
+            ],
+        }
+    )
+    run_ids: list[str] = []
+
+    async def source_run(
+        source: Phase6ASource,
+        run_id: str,
+    ) -> Phase6ESourceResult:
+        run_ids.append(run_id)
+        return Phase6ESourceResult(
+            source_id=source.source_id,
+            display_name=source.display_name,
+            status="success",
+            discovered_count=1,
+            catalog_mode="complete_catalog",
+            discovery_complete=True,
+            discovered_job_urls=["https://example.com/jobs/1"],
+            reconciliation_safe=True,
+        )
+
+    report = asyncio.run(
+        Phase7D4CManualRecurringRunner(
+            root=root,
+            output_dir=tmp_path,
+            database=database,  # type: ignore[arg-type]
+            plan=_one_source_plan(source_id),
+            policy=policy,
+            source_run_callable=source_run,
+            downstream_callable=lambda *args, **kwargs: {
+                "status": "skipped_no_changes"
+            },
+        ).run(resume_cycle_id=cycle_id)
+    )
+    assert report["status"] == "completed"
+    assert len(run_ids) == 1
+    assert run_ids[0].endswith("_a003")
+    assert run_ids[0] != legacy_run_id
+    checkpoint = database["production_recurring_source_checkpoints"].rows[0]
+    assert checkpoint["attempt_number"] == 3
+    assert checkpoint["source_run_id"] == run_ids[0]
+    assert checkpoint["attempt_run_ids"] == [legacy_run_id, run_ids[0]]
+    assert checkpoint.get("error_type") is None
+    assert checkpoint.get("error_message") is None

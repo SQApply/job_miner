@@ -53,6 +53,33 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _mongo_datetime_as_utc(value: datetime | None) -> datetime | None:
+    """Normalize BSON UTC datetimes returned by a non-tz-aware PyMongo client."""
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _source_attempt_run_id(
+    *,
+    cycle_id: str,
+    position: int,
+    source_id: str,
+    attempt_number: int,
+) -> str:
+    """Return an immutable Phase 6E fleet id for one scrape attempt."""
+    if attempt_number < 1:
+        raise ProductionManualRecurringError(
+            "Recurring source attempt_number must be at least 1"
+        )
+    return (
+        f"{cycle_id}_{position:02d}_{source_id[-12:]}"
+        f"_a{attempt_number:03d}"
+    )
+
+
 def _canonical_sha256(payload: Any) -> str:
     encoded = json.dumps(
         payload,
@@ -451,7 +478,7 @@ def ensure_manual_cycle_is_due(
     """Refuse an accidental early full-cohort rerun unless --force is explicit."""
     if force or expected_source_count != 22:
         return {"due": True, "forced": bool(force), "last_cycle_id": None}
-    current = now or _utc_now()
+    current = _mongo_datetime_as_utc(now or _utc_now()) or _utc_now()
     last = database["production_recurring_cycles"].find_one(
         {
             "cohort_name": PHASE_7D4C_COHORT_NAME,
@@ -468,8 +495,8 @@ def ensure_manual_cycle_is_due(
     )
     if not last:
         return {"due": True, "forced": False, "last_cycle_id": None}
-    next_due = last.get("next_due_at")
-    if isinstance(next_due, datetime) and next_due > current:
+    next_due = _mongo_datetime_as_utc(last.get("next_due_at"))
+    if next_due is not None and next_due > current:
         raise ProductionManualRecurringError(
             "The 22-source recurring cycle is not due until "
             + next_due.astimezone(timezone.utc).isoformat()
@@ -904,24 +931,74 @@ class Phase7D4CManualRecurringRunner:
                         on_progress(progress_payload, position, total)
                     continue
                 now = _utc_now()
-                source_run_id = (
-                    cycle_id + "_" + f"{position:02d}_" + source_id[-12:]
+                try:
+                    prior_attempt_number = int(
+                        prior_checkpoint.get("attempt_number") or 0
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ProductionManualRecurringError(
+                        "Stored recurring source attempt_number is invalid for "
+                        + source_id
+                    ) from exc
+                if prior_attempt_number < 0:
+                    raise ProductionManualRecurringError(
+                        "Stored recurring source attempt_number is invalid for "
+                        + source_id
+                    )
+                attempt_number = prior_attempt_number + 1
+                source_run_id = _source_attempt_run_id(
+                    cycle_id=cycle_id,
+                    position=position,
+                    source_id=source_id,
+                    attempt_number=attempt_number,
                 )
+                attempt_run_ids = [
+                    str(value)
+                    for value in prior_checkpoint.get("attempt_run_ids") or []
+                    if str(value).strip()
+                ]
+                prior_source_run_id = str(
+                    prior_checkpoint.get("source_run_id") or ""
+                ).strip()
+                if (
+                    prior_source_run_id
+                    and prior_source_run_id not in attempt_run_ids
+                ):
+                    attempt_run_ids.append(prior_source_run_id)
+                if source_run_id in attempt_run_ids:
+                    raise ProductionManualRecurringError(
+                        "Recurring source attempt generated a duplicate run id: "
+                        + source_run_id
+                    )
+                attempt_run_ids.append(source_run_id)
                 checkpoints.update_one(
                     {"cycle_id": cycle_id, "source_id": source_id},
                     {
                         "$set": {
                             "status": "running",
+                            "attempt_number": attempt_number,
                             "source_run_id": source_run_id,
+                            "attempt_run_ids": attempt_run_ids,
                             "started_at": now,
                             "updated_at": now,
                         },
-                        "$inc": {"attempt_number": 1},
                         "$setOnInsert": {
                             "_id": f"{cycle_id}:{source_id}",
                             "cycle_id": cycle_id,
                             "source_id": source_id,
                             "created_at": now,
+                        },
+                        "$unset": {
+                            "result": "",
+                            "snapshot": "",
+                            "lifecycle": "",
+                            "downstream": "",
+                            "changed_job_ids": "",
+                            "deactivated_job_ids": "",
+                            "desired_terminal_status": "",
+                            "completed_at": "",
+                            "error_type": "",
+                            "error_message": "",
                         },
                     },
                     upsert=True,
